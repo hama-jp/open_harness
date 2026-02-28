@@ -1,0 +1,77 @@
+# Open Harness Configuration
+
+llm:
+  # Default provider
+  default_provider: "lm_studio"
+
+  providers:
+    lm_studio:
+      base_url: "http://192.168.11.3:1234/v1"
+      api_key: "lm-studio"
+
+    ollama:
+      base_url: "http://localhost:11434/v1"
+      api_key: "ollama"
+
+  # Model tiers for routing (small → medium → large)
+  models:
+    small:
+      provider: "lm_studio"
+      model: "qwen/qwen3-4b-2507"
+      max_tokens: 4096
+      description: "Fast, simple tasks"
+
+    medium:
+      provider: "lm_studio"
+      model: "qwen/qwen3.5-35b-a3b"
+      max_tokens: 8192
+      description: "Balanced performance"
+
+    large:
+      provider: "lm_studio"
+      model: "qwen/qwen3-next-80b-a3b"
+      max_tokens: 16384
+      description: "Complex reasoning"
+
+    vision:
+      provider: "lm_studio"
+      model: "qwen/qwen3-vl-30b"
+      max_tokens: 8192
+      description: "Image understanding"
+
+  # Default model tier
+  default_tier: "medium"
+
+# Compensation engine settings
+compensation:
+  max_retries: 3
+  retry_strategies:
+    - "refine_prompt"
+    - "add_examples"
+    - "escalate_model"
+  parse_fallback: true
+  thinking_mode: "auto"  # auto, always, never
+
+# Tool settings
+tools:
+  shell:
+    timeout: 30
+    allowed_commands: []  # empty = all allowed
+    blocked_commands: ["rm -rf /", "mkfs", "dd if="]
+  file:
+    max_read_size: 100000  # bytes
+
+# External agents
+external_agents:
+  codex:
+    enabled: true
+    command: "codex"
+  gemini:
+    enabled: true
+    command: "gemini"
+
+# Memory
+memory:
+  backend: "sqlite"
+  db_path: "~/.open_harness/memory.db"
+  max_conversation_turns: 50
