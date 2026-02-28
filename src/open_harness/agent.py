@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import subprocess
 import time
 from dataclasses import dataclass, field
 from typing import Any, Generator
@@ -113,6 +114,11 @@ class Agent:
 
         yield AgentEvent("status", f"Goal: {goal}")
         yield AgentEvent("status", f"Project: {self.project.info['type']} @ {self.project.info['root']}")
+
+        # Safety: create a checkpoint before autonomous work
+        checkpoint = self._create_checkpoint()
+        if checkpoint:
+            yield AgentEvent("status", f"Checkpoint: {checkpoint}")
 
         messages: list[dict[str, Any]] = [
             {"role": "system", "content": self.autonomous_prompt},
@@ -229,6 +235,28 @@ class Agent:
             content.strip().startswith("{") and '"tool_call"' in content,
         ]
         return any(indicators) and len(content) < 500
+
+    def _create_checkpoint(self) -> str | None:
+        """Create a git checkpoint before autonomous work."""
+        if not self.project.info.get("has_git"):
+            return None
+        cwd = str(self.project.root)
+        try:
+            r = subprocess.run(
+                "git status --porcelain", shell=True,
+                capture_output=True, text=True, timeout=10, cwd=cwd,
+            )
+            if r.stdout.strip():
+                stash_r = subprocess.run(
+                    "git stash push -m 'open-harness: auto-checkpoint before goal'",
+                    shell=True, capture_output=True, text=True, timeout=10, cwd=cwd,
+                )
+                if stash_r.returncode == 0 and "No local changes" not in stash_r.stdout:
+                    return "stashed uncommitted changes"
+            return "clean working tree"
+        except Exception as e:
+            logger.warning(f"Failed to create checkpoint: {e}")
+            return None
 
 
 def _safe_json(obj: Any) -> str:
