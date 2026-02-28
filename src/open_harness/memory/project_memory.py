@@ -60,7 +60,11 @@ class ProjectMemoryStore:
     def __init__(self, db_path: str = "~/.open_harness/memory.db"):
         self.db_path = Path(db_path).expanduser()
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
-        self._conn = sqlite3.connect(str(self.db_path))
+        self._conn = sqlite3.connect(
+            str(self.db_path), check_same_thread=False)
+        # WAL mode for better concurrent read/write performance
+        self._conn.execute("PRAGMA journal_mode=WAL")
+        self._conn.execute("PRAGMA busy_timeout=5000")
         self._init_schema()
 
     def _init_schema(self):
@@ -235,7 +239,9 @@ class ProjectMemoryEngine:
     def __init__(self, store: ProjectMemoryStore, project_root: str):
         self.store = store
         self.project_root = project_root
-        self._pending: dict[str, dict[str, Any]] = {}  # track patterns before committing
+        # Promotion buffer: accumulate observations before persisting
+        # Key: (kind, key) -> {"value": str, "score": float, "count": int}
+        self._pending: dict[tuple[str, str], dict[str, Any]] = {}
 
     def on_tool_result(self, tool_name: str, args: dict[str, Any],
                        result_success: bool, result_output: str):
@@ -244,38 +250,45 @@ class ProjectMemoryEngine:
         if tool_name == "run_tests" and result_success:
             cmd = args.get("command", "") or args.get("target", "")
             if cmd:
-                self.store.upsert(
-                    self.project_root, "pattern",
-                    "test_command", f"Tests run with: {cmd}",
-                    score=0.7,
+                self._observe(
+                    "pattern", "test_command",
+                    f"Tests run with: {cmd}", score=0.7,
                 )
 
-        # Learn shell patterns
+        # Learn shell patterns (match first word as the actual tool)
         if tool_name == "shell" and result_success:
             cmd = args.get("command", "")
-            if cmd and any(k in cmd for k in ["npm", "yarn", "pip", "cargo", "make", "gradle"]):
-                key = f"build_tool:{cmd.split()[0]}"
-                self.store.upsert(
-                    self.project_root, "pattern",
-                    key, f"Build/package command: {cmd[:100]}",
-                    score=0.5,
-                )
+            if cmd:
+                parts = cmd.split()
+                # Find the actual tool name (skip python -m, env vars, etc.)
+                tool_word = None
+                build_tools = {"npm", "yarn", "pip", "pip3", "cargo",
+                               "make", "gradle", "mvn", "go", "uv"}
+                for p in parts:
+                    if p in build_tools:
+                        tool_word = p
+                        break
+                if tool_word:
+                    key = f"build_tool:{tool_word}"
+                    self._observe(
+                        "pattern", key,
+                        f"Build/package tool: {tool_word} (e.g. {cmd[:80]})",
+                        score=0.5,
+                    )
 
         # Learn file structure from read/write operations
         if tool_name in ("read_file", "write_file", "edit_file") and result_success:
             path = args.get("path", "")
             if path:
-                dir_path = str(Path(path).parent)
-                # Normalize to relative if within project
                 try:
                     rel = str(Path(path).resolve().relative_to(
                         Path(self.project_root).resolve()))
                     dir_rel = str(Path(rel).parent)
                     if dir_rel and dir_rel != ".":
                         key = f"dir:{dir_rel}"
-                        self.store.upsert(
-                            self.project_root, "structure",
-                            key, f"Active directory: {dir_rel}",
+                        self._observe(
+                            "structure", key,
+                            f"Active directory: {dir_rel}",
                             score=0.3,
                         )
                 except ValueError:
@@ -286,14 +299,34 @@ class ProjectMemoryEngine:
             error_hint = _extract_error_pattern(result_output)
             if error_hint:
                 key = f"error:{error_hint['type']}"
-                self.store.upsert(
-                    self.project_root, "error",
-                    key, error_hint["hint"],
-                    score=0.4,
+                self._observe(
+                    "error", key, error_hint["hint"], score=0.4,
                 )
 
+    def _observe(self, kind: str, key: str, value: str, score: float):
+        """Buffer an observation. Only persist after PROMOTION_THRESHOLD sightings."""
+        buf_key = (kind, key)
+        if buf_key in self._pending:
+            self._pending[buf_key]["count"] += 1
+            self._pending[buf_key]["score"] = max(
+                self._pending[buf_key]["score"], score)
+        else:
+            self._pending[buf_key] = {
+                "value": value, "score": score, "count": 1}
+
+        # Promote to persistent storage once threshold is met
+        entry = self._pending[buf_key]
+        if entry["count"] >= PROMOTION_THRESHOLD:
+            self.store.upsert(
+                self.project_root, kind, key,
+                entry["value"], entry["score"],
+            )
+
     def on_session_end(self):
-        """Run cleanup at session end."""
+        """Flush remaining observations and prune."""
+        # Persist any remaining pending items that met threshold
+        # (already handled in _observe, but clear buffer)
+        self._pending.clear()
         self.store.prune(self.project_root)
 
 
@@ -318,7 +351,9 @@ def build_memory_block(store: ProjectMemoryStore, project_root: str,
 
     for m in memories:
         if m.kind in sections:
-            sections[m.kind].append(f"- {m.value}")
+            # Sanitize: strip control chars, limit length, prevent prompt injection
+            safe_value = _sanitize_memory_value(m.value)
+            sections[m.kind].append(f"- {safe_value}")
 
     parts = ["PROJECT MEMORY (auto-learned):"]
     if sections["pattern"]:
@@ -345,6 +380,20 @@ def build_memory_block(store: ProjectMemoryStore, project_root: str,
 # -------------------------------------------------------------------
 # Helpers
 # -------------------------------------------------------------------
+
+def _sanitize_memory_value(value: str, max_len: int = 150) -> str:
+    """Sanitize a memory value for safe prompt injection."""
+    # Remove control characters and excessive whitespace
+    import re
+    value = re.sub(r'[\x00-\x1f\x7f-\x9f]', '', value)
+    # Strip potential prompt injection patterns
+    value = value.replace("SYSTEM:", "").replace("USER:", "")
+    value = value.replace("```", "").replace("---", "")
+    # Truncate
+    if len(value) > max_len:
+        value = value[:max_len] + "..."
+    return value.strip()
+
 
 _ERROR_PATTERNS = [
     ("ModuleNotFoundError", "ModuleNotFoundError — check imports, __init__.py, or install missing package"),

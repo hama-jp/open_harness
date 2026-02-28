@@ -67,6 +67,7 @@ class Agent:
             self.project_memory_store, str(self.project.root))
         self._interactive_prompt: str | None = None
         self._autonomous_prompt: str | None = None
+        self._interaction_count: int = 0
 
     @property
     def interactive_prompt(self) -> str:
@@ -106,6 +107,10 @@ class Agent:
         self.compensator.reset()
         self.policy.begin_goal()  # reset budgets per turn
         self.memory.add_turn("user", user_message)
+        # Periodic memory prune (every 20 interactions)
+        self._interaction_count += 1
+        if self._interaction_count % 20 == 0:
+            self.project_memory.on_session_end()
         messages = [
             {"role": "system", "content": self.interactive_prompt},
             *self.memory.get_messages(),
