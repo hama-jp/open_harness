@@ -1,24 +1,24 @@
-"""CLI interface for Open Harness with streaming and goal mode."""
+"""CLI interface for Open Harness with streaming and task queue."""
 
 from __future__ import annotations
 
 import logging
 import os
 import sys
-import threading
 import time
-import uuid
 from pathlib import Path
 
 import click
 from rich.console import Console
 from rich.markdown import Markdown
 from rich.panel import Panel
+from rich.table import Table
 
 from open_harness.agent import Agent, AgentEvent
 from open_harness.config import HarnessConfig, load_config
 from open_harness.memory.store import MemoryStore
 from open_harness.project import ProjectContext
+from open_harness.tasks.queue import TaskQueueManager, TaskRecord, TaskStatus, TaskStore
 from open_harness.tools.base import ToolRegistry
 from open_harness.tools.external import CodexTool, GeminiCliTool
 from open_harness.tools.file_ops import (
@@ -68,6 +68,18 @@ def setup_tools(config: HarnessConfig, project: ProjectContext) -> ToolRegistry:
                 registry.register(tool)
 
     return registry
+
+
+def create_agent_factory(config: HarnessConfig, project: ProjectContext):
+    """Factory that creates isolated Agent instances for background tasks."""
+    def factory() -> Agent:
+        tools = setup_tools(config, project)
+        memory = MemoryStore(
+            config.memory.db_path,
+            max_turns=config.memory.max_conversation_turns,
+        )
+        return Agent(config, tools, memory, project)
+    return factory
 
 
 class StreamingDisplay:
@@ -128,68 +140,29 @@ class StreamingDisplay:
 
 
 # ---------------------------------------------------------------------------
-# Background goal runner
-# ---------------------------------------------------------------------------
-
-class BackgroundGoal:
-    """Runs a goal in a background thread with logging."""
-
-    def __init__(self, agent: Agent, goal: str, log_path: Path):
-        self.agent = agent
-        self.goal = goal
-        self.log_path = log_path
-        self.thread: threading.Thread | None = None
-        self.running = False
-        self.completed = False
-        self.result = ""
-
-    def start(self):
-        self.thread = threading.Thread(target=self._run, daemon=True)
-        self.running = True
-        self.thread.start()
-
-    def _run(self):
-        with open(self.log_path, "w") as f:
-            f.write(f"=== Goal: {self.goal} ===\n")
-            f.write(f"=== Started: {time.strftime('%Y-%m-%d %H:%M:%S')} ===\n\n")
-            try:
-                for event in self.agent.run_goal(self.goal):
-                    ts = time.strftime("%H:%M:%S")
-                    if event.type == "status":
-                        f.write(f"[{ts}] {event.data}\n")
-                    elif event.type == "tool_call":
-                        f.write(f"[{ts}] TOOL: {event.metadata.get('tool')} {event.metadata.get('args', {})}\n")
-                    elif event.type == "tool_result":
-                        ok = "OK" if event.metadata.get("success") else "FAIL"
-                        f.write(f"[{ts}] RESULT ({ok}): {event.data[:500]}\n")
-                    elif event.type == "thinking":
-                        f.write(f"[{ts}] THINKING: {event.data[:200]}...\n")
-                    elif event.type == "text":
-                        f.write(event.data)
-                    elif event.type == "compensation":
-                        f.write(f"[{ts}] COMPENSATE: {event.data}\n")
-                    elif event.type == "done":
-                        f.write(f"\n\n=== DONE ===\n{event.data}\n")
-                        self.result = event.data
-                    f.flush()
-            except Exception as e:
-                f.write(f"\n\n=== ERROR ===\n{e}\n")
-                self.result = f"[Error: {e}]"
-            finally:
-                self.running = False
-                self.completed = True
-                f.write(f"\n=== Finished: {time.strftime('%Y-%m-%d %H:%M:%S')} ===\n")
-
-
-# ---------------------------------------------------------------------------
 # Command handlers
 # ---------------------------------------------------------------------------
 
-_bg_goals: list[BackgroundGoal] = []
+# Module-level task queue (set up in main)
+_task_queue: TaskQueueManager | None = None
+
+
+def _on_task_complete(task: TaskRecord):
+    """Callback when a background task finishes."""
+    icon = "[green]OK[/green]" if task.status == TaskStatus.SUCCEEDED else "[red]FAIL[/red]"
+    console.print(f"\n{icon} Task {task.id} complete: {task.goal[:50]}")
+    if task.result_text:
+        console.print(f"[dim]{task.result_text[:100]}[/dim]")
+    elif task.error_text:
+        console.print(f"[red]{task.error_text[:100]}[/red]")
+    console.print("[bold green]> [/bold green]", end="")
+    # Terminal bell
+    print("\a", end="", flush=True)
 
 
 def handle_command(cmd: str, agent: Agent, config: HarnessConfig, display: StreamingDisplay) -> bool | str:
     """Handle /commands. Returns True if handled, 'quit' to exit."""
+    global _task_queue
     parts = cmd.strip().split(maxsplit=1)
     command = parts[0].lower()
     arg = parts[1] if len(parts) > 1 else ""
@@ -225,6 +198,10 @@ def handle_command(cmd: str, agent: Agent, config: HarnessConfig, display: Strea
         if not arg:
             console.print("[red]Usage: /goal <description of what you want to achieve>[/red]")
             return True
+        # Warn if background task is running (LLM concurrency)
+        if _task_queue and _task_queue.is_busy():
+            console.print("[yellow]Warning: a background task is running. "
+                          "LLM requests may queue.[/yellow]")
         start = time.monotonic()
         for event in agent.run_goal(arg):
             display.handle(event)
@@ -232,31 +209,76 @@ def handle_command(cmd: str, agent: Agent, config: HarnessConfig, display: Strea
         console.print(f"\n[dim]Goal completed in {elapsed:.1f}s[/dim]\n")
         return True
 
-    elif command == "/bg":
+    elif command in ("/submit", "/bg"):
         if not arg:
-            console.print("[red]Usage: /bg <goal>[/red]")
+            console.print("[red]Usage: /submit <goal>[/red]")
             return True
-        log_dir = Path.home() / ".open_harness" / "logs"
-        log_dir.mkdir(parents=True, exist_ok=True)
-        log_path = log_dir / f"goal_{int(time.time())}_{uuid.uuid4().hex[:6]}.log"
-        bg = BackgroundGoal(agent, arg, log_path)
-        bg.start()
-        _bg_goals.append(bg)
-        console.print(f"[green]Background goal #{len(_bg_goals)} started[/green]")
-        console.print(f"[dim]Log: {log_path}[/dim]")
-        console.print(f"[dim]Check status: /status[/dim]")
+        if not _task_queue:
+            console.print("[red]Task queue not initialized.[/red]")
+            return True
+        task = _task_queue.submit(arg)
+        console.print(f"[green]Task {task.id} queued: {task.goal[:60]}[/green]")
+        console.print(f"[dim]Log: {task.log_path}[/dim]")
+        console.print(f"[dim]Check: /tasks | /result {task.id}[/dim]")
         return True
 
-    elif command == "/status":
-        if not _bg_goals:
-            console.print("[dim]No background goals.[/dim]")
-        for i, bg in enumerate(_bg_goals, 1):
-            status = "running" if bg.running else ("done" if bg.completed else "unknown")
-            icon = {"running": "[yellow]...[/yellow]", "done": "[green]OK[/green]"}.get(status, "?")
-            console.print(f"  #{i} {icon} {bg.goal[:60]}")
-            if bg.completed and bg.result:
-                console.print(f"      [dim]{bg.result[:100]}[/dim]")
-            console.print(f"      [dim]{bg.log_path}[/dim]")
+    elif command in ("/tasks", "/status"):
+        if not _task_queue:
+            console.print("[dim]Task queue not initialized.[/dim]")
+            return True
+        tasks = _task_queue.list_tasks(limit=15)
+        if not tasks:
+            console.print("[dim]No tasks submitted yet. Use /submit <goal>[/dim]")
+            return True
+
+        table = Table(title="Tasks", show_lines=False, border_style="dim")
+        table.add_column("ID", style="bold", width=10)
+        table.add_column("Status", width=10)
+        table.add_column("Goal", max_width=50)
+        table.add_column("Time", width=8)
+
+        status_styles = {
+            TaskStatus.QUEUED: "[dim]queued[/dim]",
+            TaskStatus.RUNNING: "[yellow]running[/yellow]",
+            TaskStatus.SUCCEEDED: "[green]OK[/green]",
+            TaskStatus.FAILED: "[red]FAIL[/red]",
+            TaskStatus.CANCELED: "[dim]canceled[/dim]",
+        }
+
+        for t in tasks:
+            elapsed = ""
+            if t.elapsed is not None:
+                elapsed = f"{t.elapsed:.0f}s"
+            table.add_row(
+                t.id,
+                status_styles.get(t.status, str(t.status)),
+                t.goal[:50],
+                elapsed,
+            )
+        console.print(table)
+        return True
+
+    elif command == "/result":
+        if not _task_queue:
+            console.print("[dim]Task queue not initialized.[/dim]")
+            return True
+        if not arg:
+            console.print("[red]Usage: /result <task_id>[/red]")
+            return True
+        task = _task_queue.get_task(arg)
+        if not task:
+            console.print(f"[red]Task '{arg}' not found.[/red]")
+            return True
+        console.print(f"[bold]Task {task.id}[/bold]: {task.goal}")
+        console.print(f"Status: {task.status.value}")
+        if task.elapsed is not None:
+            console.print(f"[dim]Time: {task.elapsed:.1f}s[/dim]")
+        if task.result_text:
+            console.print(Panel(task.result_text, title="Result", border_style="green"))
+        if task.error_text:
+            console.print(Panel(task.error_text, title="Error", border_style="red"))
+        if task.log_path:
+            console.print(f"[dim]Log: {task.log_path}[/dim]")
         return True
 
     elif command == "/policy":
@@ -316,8 +338,9 @@ def handle_command(cmd: str, agent: Agent, config: HarnessConfig, display: Strea
 
 [bold]Autonomous:[/bold]
   /goal <task>     - Agent works autonomously until task is complete
-  /bg <task>       - Run goal in background (check with /status)
-  /status          - Check background goal status
+  /submit <task>   - Submit goal to background queue
+  /tasks           - List all tasks and their status
+  /result <id>     - Show detailed result of a task
 
 [bold]Settings:[/bold]
   /tier [name]     - Show or set model tier (small/medium/large)
@@ -340,13 +363,15 @@ def handle_command(cmd: str, agent: Agent, config: HarnessConfig, display: Strea
 @click.option("--verbose", "-v", is_flag=True, help="Verbose logging")
 def main(config_path: str | None, tier: str | None, goal_text: str | None, verbose: bool):
     """Open Harness - self-driving AI agent for local LLMs."""
+    global _task_queue
+
     if verbose:
         logging.basicConfig(level=logging.DEBUG)
     else:
         logging.basicConfig(level=logging.WARNING)
 
     console.print(Panel(
-        "[bold]Open Harness[/bold] v0.1.0\n"
+        "[bold]Open Harness[/bold] v0.2.0\n"
         "Self-driving AI agent for local LLMs\n"
         "[dim]Type /help for commands, /goal <task> for autonomous mode[/dim]",
         border_style="blue",
@@ -370,6 +395,7 @@ def main(config_path: str | None, tier: str | None, goal_text: str | None, verbo
     except Exception:
         pass
 
+    # Main agent for interactive use
     tools = setup_tools(config, project)
     memory = MemoryStore(config.memory.db_path, max_turns=config.memory.max_conversation_turns)
     agent = Agent(config, tools, memory, project)
@@ -377,6 +403,14 @@ def main(config_path: str | None, tier: str | None, goal_text: str | None, verbo
 
     tool_names = [t.name for t in tools.list_tools()]
     console.print(f"[dim]Tools ({len(tool_names)}): {', '.join(tool_names)}[/dim]")
+
+    # Task queue with isolated agent factory
+    task_store = TaskStore(config.memory.db_path)
+    agent_factory = create_agent_factory(config, project)
+    _task_queue = TaskQueueManager(
+        task_store, agent_factory, on_complete=_on_task_complete)
+    _task_queue.start()
+    console.print(f"[dim]Task queue: ready[/dim]")
     console.print()
 
     # Non-interactive goal mode
@@ -385,6 +419,7 @@ def main(config_path: str | None, tier: str | None, goal_text: str | None, verbo
         for event in agent.run_goal(goal_text):
             display.handle(event)
         console.print(f"\n[dim]({time.monotonic() - start:.1f}s)[/dim]")
+        _task_queue.shutdown()
         agent.router.close()
         memory.close()
         return
@@ -419,6 +454,8 @@ def main(config_path: str | None, tier: str | None, goal_text: str | None, verbo
                 if verbose:
                     console.print_exception()
     finally:
+        _task_queue.shutdown()
+        task_store.close()
         agent.router.close()
         memory.close()
 
