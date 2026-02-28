@@ -19,6 +19,7 @@ from open_harness.llm.compensator import (
 )
 from open_harness.llm.router import ModelRouter
 from open_harness.memory.store import MemoryStore
+from open_harness.planner import Plan, PlanCritic, PlanStep, Planner, StepResult
 from open_harness.policy import PolicyEngine, load_policy
 from open_harness.project import ProjectContext
 from open_harness.tools.base import ToolRegistry, ToolResult
@@ -55,6 +56,8 @@ class Agent:
         self.compensator = Compensator(config.compensation)
         self.policy = PolicyEngine(load_policy(config.policy))
         self.policy.set_project_root(self.project.root)
+        self.planner = Planner(self.router)
+        self.plan_critic = PlanCritic()
         self._interactive_prompt: str | None = None
         self._autonomous_prompt: str | None = None
 
@@ -111,8 +114,8 @@ class Agent:
     def run_goal(self, goal: str) -> Generator[AgentEvent, None, None]:
         """Run autonomously toward a goal.
 
-        The agent keeps working (calling tools, reasoning, fixing errors)
-        until the goal is achieved or the step budget is exhausted.
+        Attempts to plan first (break into steps), then execute each step.
+        Falls back to direct execution if planning fails.
         """
         self.compensator.reset()
         self.policy.begin_goal()
@@ -128,18 +131,157 @@ class Agent:
         ckpt_status = ckpt.begin()
         yield AgentEvent("status", f"Checkpoint: {ckpt_status}")
 
-        messages: list[dict[str, Any]] = [
-            {"role": "system", "content": self.autonomous_prompt},
-            {"role": "user", "content": f"GOAL: {goal}\n\nWork autonomously to achieve this goal. Do not ask me questions — just do it."},
-        ]
-
         try:
-            yield from self._agent_loop(messages, MAX_GOAL_STEPS, checkpoint=ckpt)
+            # Phase 1: Try to create a plan
+            yield AgentEvent("status", "Planning...")
+            plan, err = self.planner.create_plan(
+                goal, context=self.project.to_prompt(),
+            )
+
+            if plan:
+                issues = self.plan_critic.validate(plan)
+                if issues:
+                    yield AgentEvent("status", f"Plan rejected: {'; '.join(issues)}")
+                    plan = None
+
+            if plan:
+                yield AgentEvent("status", plan.summary())
+                yield from self._run_planned_goal(goal, plan, ckpt)
+            else:
+                # Fallback: direct execution without planning
+                reason = err.reason if err else "critic rejected"
+                yield AgentEvent("compensation",
+                    f"Planning failed ({reason}); switching to direct mode")
+                yield from self._run_direct_goal(goal, ckpt)
+
         finally:
             yield AgentEvent("status", f"Budget: {self.policy.budget.summary()}")
             finish_status = ckpt.finish(keep_changes=True)
             if finish_status:
                 yield AgentEvent("status", f"Finish: {finish_status}")
+
+    def _run_direct_goal(
+        self, goal: str, ckpt: CheckpointEngine,
+    ) -> Generator[AgentEvent, None, None]:
+        """Direct autonomous execution without planning (fallback)."""
+        messages: list[dict[str, Any]] = [
+            {"role": "system", "content": self.autonomous_prompt},
+            {"role": "user", "content": (
+                f"GOAL: {goal}\n\n"
+                "Work autonomously to achieve this goal. "
+                "Do not ask me questions — just do it."
+            )},
+        ]
+        yield from self._agent_loop(messages, MAX_GOAL_STEPS, checkpoint=ckpt)
+
+    def _run_planned_goal(
+        self, goal: str, plan: Plan, ckpt: CheckpointEngine,
+    ) -> Generator[AgentEvent, None, None]:
+        """Execute a planned goal step by step with checkpoints."""
+        completed: list[PlanStep] = []
+        results: list[StepResult] = []
+        steps_per_step = MAX_GOAL_STEPS // max(len(plan.steps), 1)
+
+        for i, step in enumerate(plan.steps):
+            yield AgentEvent("status",
+                f"Step {i+1}/{len(plan.steps)}: {step.title}")
+
+            # Execute this step
+            step_result = yield from self._execute_plan_step(
+                goal, step, completed, ckpt, steps_per_step,
+            )
+            results.append(step_result)
+
+            if step_result.success:
+                completed.append(step)
+                # Snapshot after each successful step
+                snap = ckpt.snapshot(f"step {i+1} complete: {step.title}")
+                if snap:
+                    yield AgentEvent("status", f"Snapshot: {snap.commit_hash}")
+            else:
+                # Step failed — try replanning once
+                yield AgentEvent("compensation",
+                    f"Step '{step.title}' failed: {step_result.summary}")
+
+                # Rollback to last successful snapshot
+                if ckpt.snapshots:
+                    rb = ckpt.rollback(ckpt.snapshots[-1])
+                    yield AgentEvent("status", f"Rollback: {rb}")
+
+                new_plan, err = self.planner.replan_remaining(
+                    goal, completed, step, step_result.summary,
+                )
+
+                if new_plan and not self.plan_critic.validate(new_plan):
+                    yield AgentEvent("status",
+                        f"Replanned: {new_plan.summary()}")
+                    # Continue with new plan
+                    yield from self._run_planned_goal(
+                        goal, new_plan, ckpt)
+                    return
+                else:
+                    # Replanning failed — fall back to direct execution
+                    reason = err.reason if err else "critic rejected replan"
+                    yield AgentEvent("compensation",
+                        f"Replan failed ({reason}); switching to direct mode")
+                    remaining_context = (
+                        f"GOAL: {goal}\n\n"
+                        f"Completed steps so far:\n"
+                        + "\n".join(f"  - {s.title}" for s in completed)
+                        + f"\n\nFailed step: {step.title} ({step_result.summary})\n"
+                        f"Continue working to achieve the goal."
+                    )
+                    messages: list[dict[str, Any]] = [
+                        {"role": "system", "content": self.autonomous_prompt},
+                        {"role": "user", "content": remaining_context},
+                    ]
+                    yield from self._agent_loop(
+                        messages, MAX_GOAL_STEPS, checkpoint=ckpt)
+                    return
+
+        # All steps completed
+        yield AgentEvent("status",
+            f"Plan completed: {len(completed)}/{len(plan.steps)} steps succeeded")
+
+    def _execute_plan_step(
+        self,
+        goal: str,
+        step: PlanStep,
+        completed: list[PlanStep],
+        ckpt: CheckpointEngine,
+        max_steps: int,
+    ) -> Generator[AgentEvent, None, StepResult]:
+        """Execute a single plan step using the agent loop."""
+        context_parts = [f"Overall goal: {goal}"]
+        if completed:
+            context_parts.append("Completed steps:")
+            for s in completed:
+                context_parts.append(f"  - {s.title}")
+        context_parts.append(f"\nCurrent task:\n{step.to_prompt()}")
+
+        messages: list[dict[str, Any]] = [
+            {"role": "system", "content": self.autonomous_prompt},
+            {"role": "user", "content": "\n".join(context_parts)},
+        ]
+
+        # Collect events from the agent loop
+        final_text = ""
+        had_errors = False
+        for event in self._agent_loop(messages, max_steps, checkpoint=ckpt):
+            yield event
+            if event.type == "done":
+                final_text = event.data
+            elif event.type == "tool_result" and not event.metadata.get("success"):
+                had_errors = True
+
+        # Determine success: the step "succeeded" if the agent completed
+        # without hitting the step limit and produced output
+        success = bool(final_text) and "[Reached" not in final_text
+        return StepResult(
+            step_id=step.step_id,
+            success=success,
+            summary=final_text[:200] if final_text else "No output",
+        )
 
     # ------------------------------------------------------------------
     # Shared agent loop
