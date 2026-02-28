@@ -4,13 +4,12 @@ from __future__ import annotations
 
 import json
 import logging
-import time
 from dataclasses import dataclass, field
 from typing import Any, Generator
 
 from open_harness.checkpoint import CheckpointEngine
 from open_harness.config import HarnessConfig
-from open_harness.llm.client import LLMResponse, ToolCall
+from open_harness.llm.client import LLMResponse
 from open_harness.llm.compensator import (
     Compensator,
     build_autonomous_prompt,
@@ -175,22 +174,31 @@ class Agent:
         yield from self._agent_loop(messages, MAX_GOAL_STEPS, checkpoint=ckpt)
 
     def _run_planned_goal(
-        self, goal: str, plan: Plan, ckpt: CheckpointEngine,
+        self,
+        goal: str,
+        plan: Plan,
+        ckpt: CheckpointEngine,
+        completed: list[PlanStep] | None = None,
+        _replan_depth: int = 0,
     ) -> Generator[AgentEvent, None, None]:
         """Execute a planned goal step by step with checkpoints."""
-        completed: list[PlanStep] = []
-        results: list[StepResult] = []
-        steps_per_step = MAX_GOAL_STEPS // max(len(plan.steps), 1)
+        if completed is None:
+            completed = []
+        # Track the snapshot taken after the last successful step
+        last_good_snapshot = ckpt.snapshots[-1] if ckpt.snapshots else None
 
         for i, step in enumerate(plan.steps):
             yield AgentEvent("status",
                 f"Step {i+1}/{len(plan.steps)}: {step.title}")
 
+            # Use step's max_agent_steps if set, otherwise divide budget
+            max_steps = step.max_agent_steps or (
+                MAX_GOAL_STEPS // max(len(plan.steps), 1))
+
             # Execute this step
             step_result = yield from self._execute_plan_step(
-                goal, step, completed, ckpt, steps_per_step,
+                goal, step, completed, ckpt, max_steps,
             )
-            results.append(step_result)
 
             if step_result.success:
                 completed.append(step)
@@ -198,15 +206,24 @@ class Agent:
                 snap = ckpt.snapshot(f"step {i+1} complete: {step.title}")
                 if snap:
                     yield AgentEvent("status", f"Snapshot: {snap.commit_hash}")
+                    last_good_snapshot = snap
             else:
-                # Step failed — try replanning once
+                # Step failed — try replanning (capped at 1 retry)
                 yield AgentEvent("compensation",
                     f"Step '{step.title}' failed: {step_result.summary}")
 
-                # Rollback to last successful snapshot
-                if ckpt.snapshots:
-                    rb = ckpt.rollback(ckpt.snapshots[-1])
+                # Rollback to last SUCCESSFUL step snapshot (not latest)
+                if last_good_snapshot:
+                    rb = ckpt.rollback(last_good_snapshot)
                     yield AgentEvent("status", f"Rollback: {rb}")
+
+                if _replan_depth >= 1:
+                    # Already replanned once — fall back to direct mode
+                    yield AgentEvent("compensation",
+                        "Max replan attempts reached; switching to direct mode")
+                    yield from self._fallback_to_direct(
+                        goal, completed, step, step_result, ckpt)
+                    return
 
                 new_plan, err = self.planner.replan_remaining(
                     goal, completed, step, step_result.summary,
@@ -215,33 +232,49 @@ class Agent:
                 if new_plan and not self.plan_critic.validate(new_plan):
                     yield AgentEvent("status",
                         f"Replanned: {new_plan.summary()}")
-                    # Continue with new plan
                     yield from self._run_planned_goal(
-                        goal, new_plan, ckpt)
+                        goal, new_plan, ckpt,
+                        completed=completed,
+                        _replan_depth=_replan_depth + 1,
+                    )
                     return
                 else:
-                    # Replanning failed — fall back to direct execution
                     reason = err.reason if err else "critic rejected replan"
                     yield AgentEvent("compensation",
                         f"Replan failed ({reason}); switching to direct mode")
-                    remaining_context = (
-                        f"GOAL: {goal}\n\n"
-                        f"Completed steps so far:\n"
-                        + "\n".join(f"  - {s.title}" for s in completed)
-                        + f"\n\nFailed step: {step.title} ({step_result.summary})\n"
-                        f"Continue working to achieve the goal."
-                    )
-                    messages: list[dict[str, Any]] = [
-                        {"role": "system", "content": self.autonomous_prompt},
-                        {"role": "user", "content": remaining_context},
-                    ]
-                    yield from self._agent_loop(
-                        messages, MAX_GOAL_STEPS, checkpoint=ckpt)
+                    yield from self._fallback_to_direct(
+                        goal, completed, step, step_result, ckpt)
                     return
 
-        # All steps completed
-        yield AgentEvent("status",
-            f"Plan completed: {len(completed)}/{len(plan.steps)} steps succeeded")
+        # All steps completed — emit a final summary done event
+        summary = (
+            f"Plan completed: {len(completed)}/{len(plan.steps)} steps succeeded.\n"
+            + "\n".join(f"  - {s.title}" for s in completed)
+        )
+        yield AgentEvent("done", summary, {"steps": len(completed), "planned": True})
+
+    def _fallback_to_direct(
+        self,
+        goal: str,
+        completed: list[PlanStep],
+        failed_step: PlanStep,
+        step_result: StepResult,
+        ckpt: CheckpointEngine,
+    ) -> Generator[AgentEvent, None, None]:
+        """Fall back to direct execution after plan/replan failure."""
+        completed_text = "\n".join(f"  - {s.title}" for s in completed)
+        remaining_context = (
+            f"GOAL: {goal}\n\n"
+            f"Completed steps so far:\n{completed_text}\n\n"
+            f"Failed step: {failed_step.title} ({step_result.summary})\n"
+            f"Continue working to achieve the goal."
+        )
+        messages: list[dict[str, Any]] = [
+            {"role": "system", "content": self.autonomous_prompt},
+            {"role": "user", "content": remaining_context},
+        ]
+        yield from self._agent_loop(
+            messages, MAX_GOAL_STEPS, checkpoint=ckpt)
 
     def _execute_plan_step(
         self,
@@ -251,7 +284,11 @@ class Agent:
         ckpt: CheckpointEngine,
         max_steps: int,
     ) -> Generator[AgentEvent, None, StepResult]:
-        """Execute a single plan step using the agent loop."""
+        """Execute a single plan step using the agent loop.
+
+        Filters internal 'done' events (emits them as 'status' instead)
+        so only the top-level run_planned_goal emits the final 'done'.
+        """
         context_parts = [f"Overall goal: {goal}"]
         if completed:
             context_parts.append("Completed steps:")
@@ -266,21 +303,26 @@ class Agent:
 
         # Collect events from the agent loop
         final_text = ""
-        had_errors = False
+        last_tool_ok = True  # tracks most recent tool result
         for event in self._agent_loop(messages, max_steps, checkpoint=ckpt):
-            yield event
             if event.type == "done":
+                # Don't forward step-level done — it would confuse consumers
                 final_text = event.data
-            elif event.type == "tool_result" and not event.metadata.get("success"):
-                had_errors = True
+                yield AgentEvent("status", f"Step '{step.title}' finished")
+            else:
+                yield event
+                if event.type == "tool_result":
+                    last_tool_ok = event.metadata.get("success", True)
 
-        # Determine success: the step "succeeded" if the agent completed
-        # without hitting the step limit and produced output
-        success = bool(final_text) and "[Reached" not in final_text
+        # Step succeeds if it completed without step limit AND last tool
+        # didn't fail (agent may have recovered from earlier errors)
+        hit_limit = "[Reached" in final_text
+        success = bool(final_text) and not hit_limit and last_tool_ok
         return StepResult(
             step_id=step.step_id,
             success=success,
             summary=final_text[:200] if final_text else "No output",
+            attempts=1,
         )
 
     # ------------------------------------------------------------------
