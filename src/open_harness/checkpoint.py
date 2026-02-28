@@ -172,8 +172,26 @@ class CheckpointEngine:
         parts = []
 
         if keep_changes and self._snapshots:
+            # Commit any uncommitted changes on work branch before switching
+            status = _git("status --porcelain", self.cwd)
+            if status.stdout.strip():
+                _git("add -A", self.cwd)
+                _git("commit -m 'harness-snapshot: uncommitted changes at finish'", self.cwd)
+
+            # Switch back to original branch
+            checkout = _git(f"checkout {self._original_branch}", self.cwd)
+            if checkout.returncode != 0:
+                # Force checkout as last resort (changes are saved in work branch commits)
+                checkout = _git(f"checkout -f {self._original_branch}", self.cwd)
+                if checkout.returncode != 0:
+                    parts.append(f"checkout failed: {checkout.stderr.strip()[:100]}")
+                    # Still on work branch — skip merge, just clean up
+                    self._cleanup_stash(parts)
+                    self._snapshots.clear()
+                    self._work_branch = None
+                    return ", ".join(parts) if parts else "finish failed"
+
             # Squash-merge work into original branch
-            _git(f"checkout {self._original_branch}", self.cwd)
             merge = _git(f"merge --squash {self._work_branch}", self.cwd)
             if merge.returncode == 0:
                 # Check if there's anything to commit
@@ -187,12 +205,18 @@ class CheckpointEngine:
             # Clean up work branch
             _git(f"branch -D {self._work_branch}", self.cwd)
         elif self._work_branch:
-            # Discard work branch
-            _git(f"checkout {self._original_branch}", self.cwd)
+            # Discard work branch — force checkout to discard uncommitted changes
+            _git(f"checkout -f {self._original_branch}", self.cwd)
             _git(f"branch -D {self._work_branch}", self.cwd)
             parts.append("discarded goal changes")
 
-        # Restore stashed changes
+        self._cleanup_stash(parts)
+        self._snapshots.clear()
+        self._work_branch = None
+        return ", ".join(parts) if parts else "clean finish"
+
+    def _cleanup_stash(self, parts: list[str]):
+        """Restore stashed changes if any."""
         if self._stashed:
             pop = _git("stash pop", self.cwd)
             if pop.returncode == 0:
@@ -200,10 +224,6 @@ class CheckpointEngine:
             else:
                 parts.append(f"stash pop failed: {pop.stderr.strip()[:80]}")
             self._stashed = False
-
-        self._snapshots.clear()
-        self._work_branch = None
-        return ", ".join(parts) if parts else "clean finish"
 
     def get_diff_since_start(self) -> str:
         """Get a summary of all changes since goal started."""
