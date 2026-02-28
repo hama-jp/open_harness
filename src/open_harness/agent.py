@@ -125,7 +125,14 @@ class Agent:
             {"role": "user", "content": f"GOAL: {goal}\n\nWork autonomously to achieve this goal. Do not ask me questions — just do it."},
         ]
 
-        yield from self._agent_loop(messages, MAX_GOAL_STEPS)
+        try:
+            yield from self._agent_loop(messages, MAX_GOAL_STEPS)
+        finally:
+            # Restore stashed changes if we created a checkpoint
+            if checkpoint == "stashed uncommitted changes":
+                restored = self._restore_checkpoint()
+                if restored:
+                    yield AgentEvent("status", f"Restored: {restored}")
 
     # ------------------------------------------------------------------
     # Shared agent loop
@@ -135,9 +142,10 @@ class Agent:
         self,
         messages: list[dict[str, Any]],
         max_steps: int,
+        tier: str | None = None,
     ) -> Generator[AgentEvent, None, None]:
         """Core ReAct loop shared by interactive and goal modes."""
-        tier = self.router.current_tier
+        tier = tier or self.router.current_tier
         step = 0
 
         while step < max_steps:
@@ -201,7 +209,7 @@ class Agent:
             yield AgentEvent("compensation", comp.notes)
             messages = comp.modified_messages or messages
             tier = comp.escalated_tier or tier
-            yield from self._agent_loop(messages, max_steps)
+            yield from self._agent_loop(messages, max_steps, tier=tier)
             return
 
         yield AgentEvent("done",
@@ -256,6 +264,29 @@ class Agent:
             return "clean working tree"
         except Exception as e:
             logger.warning(f"Failed to create checkpoint: {e}")
+            return None
+
+    def _restore_checkpoint(self) -> str | None:
+        """Restore stashed changes after goal completion."""
+        if not self.project.info.get("has_git"):
+            return None
+        cwd = str(self.project.root)
+        try:
+            r = subprocess.run(
+                "git stash list", shell=True,
+                capture_output=True, text=True, timeout=10, cwd=cwd,
+            )
+            if "open-harness: auto-checkpoint" in r.stdout:
+                pop_r = subprocess.run(
+                    "git stash pop", shell=True,
+                    capture_output=True, text=True, timeout=10, cwd=cwd,
+                )
+                if pop_r.returncode == 0:
+                    return "restored stashed changes"
+                return f"stash pop failed: {pop_r.stderr.strip()}"
+            return None
+        except Exception as e:
+            logger.warning(f"Failed to restore checkpoint: {e}")
             return None
 
 

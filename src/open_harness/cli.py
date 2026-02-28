@@ -7,6 +7,7 @@ import os
 import sys
 import threading
 import time
+import uuid
 from pathlib import Path
 
 import click
@@ -237,7 +238,7 @@ def handle_command(cmd: str, agent: Agent, config: HarnessConfig, display: Strea
             return True
         log_dir = Path.home() / ".open_harness" / "logs"
         log_dir.mkdir(parents=True, exist_ok=True)
-        log_path = log_dir / f"goal_{int(time.time())}.log"
+        log_path = log_dir / f"goal_{int(time.time())}_{uuid.uuid4().hex[:6]}.log"
         bg = BackgroundGoal(agent, arg, log_path)
         bg.start()
         _bg_goals.append(bg)
