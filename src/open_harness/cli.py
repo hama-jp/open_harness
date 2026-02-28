@@ -143,21 +143,34 @@ class StreamingDisplay:
 # Command handlers
 # ---------------------------------------------------------------------------
 
+import queue as _queue_mod
+
 # Module-level task queue (set up in main)
 _task_queue: TaskQueueManager | None = None
+# Thread-safe notification queue to avoid interleaving console output
+_notifications: _queue_mod.Queue[TaskRecord] = _queue_mod.Queue()
 
 
 def _on_task_complete(task: TaskRecord):
-    """Callback when a background task finishes."""
-    icon = "[green]OK[/green]" if task.status == TaskStatus.SUCCEEDED else "[red]FAIL[/red]"
-    console.print(f"\n{icon} Task {task.id} complete: {task.goal[:50]}")
-    if task.result_text:
-        console.print(f"[dim]{task.result_text[:100]}[/dim]")
-    elif task.error_text:
-        console.print(f"[red]{task.error_text[:100]}[/red]")
-    console.print("[bold green]> [/bold green]", end="")
-    # Terminal bell
+    """Callback when a background task finishes (called from worker thread)."""
+    _notifications.put(task)
+    # Terminal bell (safe from any thread)
     print("\a", end="", flush=True)
+
+
+def _drain_notifications():
+    """Show any pending task completion notifications (called from main thread)."""
+    while not _notifications.empty():
+        try:
+            task = _notifications.get_nowait()
+        except _queue_mod.Empty:
+            break
+        icon = "[green]OK[/green]" if task.status == TaskStatus.SUCCEEDED else "[red]FAIL[/red]"
+        console.print(f"\n{icon} Task {task.id} complete: {task.goal[:50]}")
+        if task.result_text:
+            console.print(f"[dim]{task.result_text[:100]}[/dim]")
+        elif task.error_text:
+            console.print(f"[red]{task.error_text[:100]}[/red]")
 
 
 def handle_command(cmd: str, agent: Agent, config: HarnessConfig, display: StreamingDisplay) -> bool | str:
@@ -420,6 +433,7 @@ def main(config_path: str | None, tier: str | None, goal_text: str | None, verbo
             display.handle(event)
         console.print(f"\n[dim]({time.monotonic() - start:.1f}s)[/dim]")
         _task_queue.shutdown()
+        task_store.close()
         agent.router.close()
         memory.close()
         return
@@ -434,7 +448,10 @@ def main(config_path: str | None, tier: str | None, goal_text: str | None, verbo
                 break
 
             if not user_input:
+                _drain_notifications()
                 continue
+
+            _drain_notifications()
 
             if user_input.startswith("/"):
                 result = handle_command(user_input, agent, config, display)
