@@ -255,6 +255,12 @@ class SearchFilesTool(Tool):
         ),
     ]
 
+    _SKIP_DIRS = {
+        ".git", ".venv", "venv", "node_modules", "__pycache__",
+        ".mypy_cache", ".ruff_cache", ".pytest_cache", "dist", "build",
+        ".eggs", ".tox", ".next", "target", ".cache",
+    }
+
     def execute(self, **kwargs: Any) -> ToolResult:
         import re as re_mod
 
@@ -278,6 +284,10 @@ class SearchFilesTool(Tool):
         try:
             for fp in p.glob(glob_pat):
                 if not fp.is_file():
+                    continue
+                # Skip common non-project directories
+                parts = fp.relative_to(p).parts
+                if any(part in self._SKIP_DIRS for part in parts):
                     continue
                 try:
                     text = fp.read_text(errors="replace")

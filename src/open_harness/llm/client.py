@@ -205,13 +205,14 @@ class LLMClient:
 
     def __init__(self, provider: ProviderConfig, timeout: float = 120):
         self.provider = provider
+        # Local LLMs can take a while for first token, but stream chunks quickly
         self.client = httpx.Client(
             base_url=provider.base_url,
             headers={
                 "Authorization": f"Bearer {provider.api_key}",
                 "Content-Type": "application/json",
             },
-            timeout=timeout,
+            timeout=httpx.Timeout(timeout, connect=30, read=300),
         )
 
     def chat(
