@@ -1,4 +1,4 @@
-"""Core agent loop - ReAct pattern with weak LLM compensation."""
+"""Core agent loop — interactive and autonomous goal-driven modes."""
 
 from __future__ import annotations
 
@@ -10,15 +10,21 @@ from typing import Any, Generator
 
 from open_harness.config import HarnessConfig
 from open_harness.llm.client import LLMResponse, ToolCall
-from open_harness.llm.compensator import Compensator, build_tool_prompt, truncate_tool_output
+from open_harness.llm.compensator import (
+    Compensator,
+    build_autonomous_prompt,
+    build_tool_prompt,
+    truncate_tool_output,
+)
 from open_harness.llm.router import ModelRouter
 from open_harness.memory.store import MemoryStore
+from open_harness.project import ProjectContext
 from open_harness.tools.base import ToolRegistry
 
 logger = logging.getLogger(__name__)
 
-MAX_AGENT_STEPS = 15  # Per-attempt limit
-TOOL_OUTPUT_LIMIT = 8000  # Chars — keeps context manageable for local LLMs
+MAX_INTERACTIVE_STEPS = 15
+MAX_GOAL_STEPS = 50  # Autonomous mode gets more room
 
 
 @dataclass
@@ -30,52 +36,116 @@ class AgentEvent:
 
 
 class Agent:
-    """ReAct agent with streaming and weak LLM compensation."""
+    """ReAct agent with interactive and autonomous goal-driven modes."""
 
     def __init__(
         self,
         config: HarnessConfig,
         tools: ToolRegistry,
         memory: MemoryStore,
+        project: ProjectContext | None = None,
     ):
         self.config = config
         self.tools = tools
         self.memory = memory
+        self.project = project or ProjectContext()
         self.router = ModelRouter(config)
         self.compensator = Compensator(config.compensation)
-        self._system_prompt: str | None = None
+        self._interactive_prompt: str | None = None
+        self._autonomous_prompt: str | None = None
 
     @property
-    def system_prompt(self) -> str:
-        if self._system_prompt is None:
-            self._system_prompt = build_tool_prompt(
+    def interactive_prompt(self) -> str:
+        if self._interactive_prompt is None:
+            self._interactive_prompt = build_tool_prompt(
                 self.tools.get_prompt_description(),
                 self.config.compensation.thinking_mode,
             )
-        return self._system_prompt
+        return self._interactive_prompt
+
+    @property
+    def autonomous_prompt(self) -> str:
+        if self._autonomous_prompt is None:
+            self._autonomous_prompt = build_autonomous_prompt(
+                self.tools.get_prompt_description(),
+                self.project.to_prompt(),
+                self.config.compensation.thinking_mode,
+            )
+        return self._autonomous_prompt
+
+    def invalidate_prompts(self):
+        """Call after tools or project context change."""
+        self._interactive_prompt = None
+        self._autonomous_prompt = None
+
+    # ------------------------------------------------------------------
+    # Interactive mode (existing behavior)
+    # ------------------------------------------------------------------
 
     def run_stream(self, user_message: str) -> Generator[AgentEvent, None, None]:
-        """Process a user message, yielding events as they happen."""
+        """Interactive single-turn with streaming."""
         self.compensator.reset()
         self.memory.add_turn("user", user_message)
-        messages = self._build_messages()
+        messages = [
+            {"role": "system", "content": self.interactive_prompt},
+            *self.memory.get_messages(),
+        ]
+        yield from self._agent_loop(messages, MAX_INTERACTIVE_STEPS)
+
+    def run(self, user_message: str) -> str:
+        final = ""
+        for ev in self.run_stream(user_message):
+            if ev.type == "done":
+                final = ev.data
+        return final
+
+    # ------------------------------------------------------------------
+    # Autonomous goal mode — the core of "self-driving"
+    # ------------------------------------------------------------------
+
+    def run_goal(self, goal: str) -> Generator[AgentEvent, None, None]:
+        """Run autonomously toward a goal.
+
+        The agent keeps working (calling tools, reasoning, fixing errors)
+        until the goal is achieved or the step budget is exhausted.
+        """
+        self.compensator.reset()
+
+        yield AgentEvent("status", f"Goal: {goal}")
+        yield AgentEvent("status", f"Project: {self.project.info['type']} @ {self.project.info['root']}")
+
+        messages: list[dict[str, Any]] = [
+            {"role": "system", "content": self.autonomous_prompt},
+            {"role": "user", "content": f"GOAL: {goal}\n\nWork autonomously to achieve this goal. Do not ask me questions — just do it."},
+        ]
+
+        yield from self._agent_loop(messages, MAX_GOAL_STEPS)
+
+    # ------------------------------------------------------------------
+    # Shared agent loop
+    # ------------------------------------------------------------------
+
+    def _agent_loop(
+        self,
+        messages: list[dict[str, Any]],
+        max_steps: int,
+    ) -> Generator[AgentEvent, None, None]:
+        """Core ReAct loop shared by interactive and goal modes."""
         tier = self.router.current_tier
-
         step = 0
-        while step < MAX_AGENT_STEPS:
-            step += 1
 
-            yield AgentEvent("status", f"[{step}] {tier} model...")
+        while step < max_steps:
+            step += 1
+            yield AgentEvent("status", f"[{step}/{max_steps}] {tier}")
 
             response = yield from self._stream_llm(messages, tier)
 
-            # --- API error → compensate ---
+            # API error
             if response.finish_reason == "error":
                 comp = self.compensator.next_strategy(
-                    messages, response.content, "API error", tier,
-                )
+                    messages, response.content, "API error", tier)
                 if comp and comp.success:
-                    yield AgentEvent("compensation", comp.notes, {"strategy": comp.strategy})
+                    yield AgentEvent("compensation", comp.notes)
                     if comp.modified_messages:
                         messages = comp.modified_messages
                     if comp.escalated_tier:
@@ -85,130 +155,71 @@ class Agent:
                 yield AgentEvent("done", response.content)
                 return
 
-            # --- tool call ---
+            # Tool call
             if response.has_tool_call:
                 tc = response.tool_calls[0]
                 yield AgentEvent("tool_call", tc.name, {"tool": tc.name, "args": tc.arguments})
 
                 result = self.tools.execute(tc.name, tc.arguments)
-                output = truncate_tool_output(result.to_message(), TOOL_OUTPUT_LIMIT)
+                output = truncate_tool_output(result.to_message(), 8000)
+                yield AgentEvent("tool_result", output,
+                                 {"success": result.success, "tool": tc.name})
 
-                yield AgentEvent(
-                    "tool_result", output,
-                    {"success": result.success, "tool": tc.name},
-                )
-
-                messages.append({
-                    "role": "assistant",
-                    "content": f'{{"tool": "{tc.name}", "args": {_safe_json(tc.arguments)}}}',
-                })
-                messages.append({
-                    "role": "user",
-                    "content": f"[Tool Result for {tc.name}]\n{output}",
-                })
+                messages.append({"role": "assistant",
+                    "content": f'{{"tool": "{tc.name}", "args": {_safe_json(tc.arguments)}}}'})
+                messages.append({"role": "user",
+                    "content": f"[Tool Result for {tc.name}]\n{output}"})
                 continue
 
-            # --- malformed tool call → compensate ---
+            # Malformed tool call
             if self._looks_like_failed_tool_call(response.content):
                 comp = self.compensator.next_strategy(
-                    messages, response.content, "Malformed tool call", tier,
-                )
+                    messages, response.content, "Malformed tool call", tier)
                 if comp and comp.success:
-                    yield AgentEvent("compensation", comp.notes, {"strategy": comp.strategy})
+                    yield AgentEvent("compensation", comp.notes)
                     if comp.modified_messages:
                         messages = comp.modified_messages
                     if comp.escalated_tier:
                         tier = comp.escalated_tier
                     continue
 
-            # --- normal text → done ---
+            # Text response — done
             self.memory.add_turn("assistant", response.content)
-            yield AgentEvent("done", response.content, {"latency_ms": response.latency_ms})
+            yield AgentEvent("done", response.content,
+                             {"latency_ms": response.latency_ms, "steps": step})
             return
 
-        # --- step limit reached → try escalation ---
+        # Step limit — try escalation
         comp = self.compensator.on_step_limit(messages, tier, step)
         if comp and comp.success:
-            yield AgentEvent(
-                "compensation",
-                comp.notes,
-                {"strategy": comp.strategy, "from_tier": tier, "to_tier": comp.escalated_tier},
-            )
-            # Restart with escalated model and condensed context
+            yield AgentEvent("compensation", comp.notes)
             messages = comp.modified_messages or messages
             tier = comp.escalated_tier or tier
-            step = 0  # Reset step counter for the new tier
+            yield from self._agent_loop(messages, max_steps)
+            return
 
-            # Run another loop with the escalated model
-            while step < MAX_AGENT_STEPS:
-                step += 1
-                yield AgentEvent("status", f"[{step}] {tier} model (escalated)...")
+        yield AgentEvent("done",
+            f"[Reached {max_steps} steps. Use /tier large or simplify the goal.]")
 
-                response = yield from self._stream_llm(messages, tier)
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
 
-                if response.has_tool_call:
-                    tc = response.tool_calls[0]
-                    yield AgentEvent("tool_call", tc.name, {"tool": tc.name, "args": tc.arguments})
-
-                    result = self.tools.execute(tc.name, tc.arguments)
-                    output = truncate_tool_output(result.to_message(), TOOL_OUTPUT_LIMIT)
-                    yield AgentEvent(
-                        "tool_result", output,
-                        {"success": result.success, "tool": tc.name},
-                    )
-                    messages.append({
-                        "role": "assistant",
-                        "content": f'{{"tool": "{tc.name}", "args": {_safe_json(tc.arguments)}}}',
-                    })
-                    messages.append({
-                        "role": "user",
-                        "content": f"[Tool Result for {tc.name}]\n{output}",
-                    })
-                    continue
-
-                self.memory.add_turn("assistant", response.content)
-                yield AgentEvent("done", response.content)
-                return
-
-        yield AgentEvent("done", "[Agent reached maximum steps. Try a simpler request or use /tier large.]")
-
-    def run(self, user_message: str) -> str:
-        """Non-streaming convenience wrapper."""
-        final = ""
-        for event in self.run_stream(user_message):
-            if event.type == "done":
-                final = event.data
-        return final
-
-    def _stream_llm(
-        self,
-        messages: list[dict[str, Any]],
-        tier: str,
-    ) -> Generator[AgentEvent, None, LLMResponse]:
-        """Stream LLM response, yielding thinking/text events."""
+    def _stream_llm(self, messages, tier) -> Generator[AgentEvent, None, LLMResponse]:
         gen = self.router.chat_stream(messages=messages, tier=tier, temperature=0.3)
-
         response: LLMResponse | None = None
         try:
             while True:
-                event_type, data = next(gen)
-                if event_type == "thinking":
+                etype, data = next(gen)
+                if etype == "thinking":
                     yield AgentEvent("thinking", data)
-                elif event_type == "text":
+                elif etype == "text":
                     yield AgentEvent("text", data)
         except StopIteration as e:
             response = e.value
-
         if response is None:
             response = LLMResponse(content="", finish_reason="error")
-
         return response
-
-    def _build_messages(self) -> list[dict[str, Any]]:
-        return [
-            {"role": "system", "content": self.system_prompt},
-            *self.memory.get_messages(),
-        ]
 
     @staticmethod
     def _looks_like_failed_tool_call(content: str) -> bool:

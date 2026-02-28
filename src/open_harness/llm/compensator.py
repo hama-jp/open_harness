@@ -1,11 +1,11 @@
-"""Weak LLM compensation engine.
+"""Weak LLM compensation engine and prompt builders.
 
-Strategies to help local LLMs succeed at tool calling and complex tasks:
+Strategies:
 1. Parse fallback - extract tool calls from messy output
-2. Prompt refinement - add examples, rephrase, add CoT
+2. Prompt refinement - add examples, rephrase
 3. Model escalation - try larger models
-4. Output truncation - reduce tool output size for weak models
-5. Step-limit escalation - auto-escalate when hitting step limits
+4. Output truncation - reduce tool output size
+5. Step-limit escalation - auto-escalate on step limits
 """
 
 from __future__ import annotations
@@ -23,7 +23,6 @@ TIER_ORDER = ["small", "medium", "large"]
 
 @dataclass
 class CompensationResult:
-    """Result of a compensation attempt."""
     strategy: str
     success: bool
     modified_messages: list[dict[str, Any]] | None = None
@@ -48,19 +47,12 @@ class Compensator:
         return max(0, self.config.max_retries - self._attempt_count)
 
     def next_strategy(
-        self,
-        messages: list[dict[str, Any]],
-        failed_response: str,
-        error_context: str,
-        current_tier: str,
+        self, messages, failed_response, error_context, current_tier,
     ) -> CompensationResult | None:
-        """Determine the next compensation strategy to try."""
         if self._attempt_count >= self.config.max_retries:
             return None
-
         self._attempt_count += 1
         strategies = self.config.retry_strategies
-
         if self._attempt_count <= len(strategies):
             strategy = strategies[self._attempt_count - 1]
         else:
@@ -73,198 +65,121 @@ class Compensator:
         elif strategy == "escalate_model":
             return self._escalate_model(current_tier)
         else:
-            logger.warning(f"Unknown compensation strategy: {strategy}")
             return None
 
-    def on_step_limit(
-        self,
-        messages: list[dict[str, Any]],
-        current_tier: str,
-        step_count: int,
-    ) -> CompensationResult | None:
-        """Called when agent reaches step limit. Tries model escalation.
-
-        Returns None if escalation is not possible.
-        """
+    def on_step_limit(self, messages, current_tier, step_count) -> CompensationResult | None:
         if self._step_escalation_used:
             return None
-
         next_tier = _next_tier(current_tier)
         if next_tier is None:
             return None
-
         self._step_escalation_used = True
-
-        # Summarize conversation so far to reduce context size
-        summary_msg = (
-            "The previous attempt used too many steps and could not complete. "
-            "You are now using a more capable model. "
-            "Please complete the original task efficiently, using fewer tool calls. "
-            "Combine operations where possible (e.g., use shell pipes)."
-        )
-        condensed = _condense_messages(messages, summary_msg)
-
+        condensed = _condense_messages(messages,
+            "Previous attempt hit the step limit. Use a more efficient approach.")
         return CompensationResult(
-            strategy="step_limit_escalation",
-            success=True,
-            modified_messages=condensed,
-            escalated_tier=next_tier,
-            notes=f"Step limit reached ({step_count} steps). Escalating {current_tier} -> {next_tier}",
+            strategy="step_limit_escalation", success=True,
+            modified_messages=condensed, escalated_tier=next_tier,
+            notes=f"Step limit ({step_count}). Escalating {current_tier} -> {next_tier}",
         )
 
-    def _refine_prompt(
-        self,
-        messages: list[dict[str, Any]],
-        failed_response: str,
-        error_context: str,
-    ) -> CompensationResult:
+    def _refine_prompt(self, messages, failed_response, error_context):
         correction = (
-            f"Your previous response could not be processed. "
-            f"Error: {error_context}\n\n"
-            f"Please try again. Remember:\n"
-            f"- To use a tool, respond with ONLY a JSON object: "
+            f"Your previous response could not be processed. Error: {error_context}\n\n"
+            f"Please try again. To use a tool, respond with ONLY:\n"
             f'{{"tool": "tool_name", "args": {{"param": "value"}}}}\n'
-            f"- To respond normally, just write text without any JSON tool calls.\n"
-            f"- Do NOT wrap tool calls in code blocks or add extra text around them."
+            f"To respond normally, just write text."
         )
         refined = list(messages)
         refined.append({"role": "assistant", "content": failed_response})
         refined.append({"role": "user", "content": correction})
+        return CompensationResult(strategy="refine_prompt", success=True,
+                                  modified_messages=refined, notes="Added correction")
 
-        return CompensationResult(
-            strategy="refine_prompt",
-            success=True,
-            modified_messages=refined,
-            notes="Added explicit correction message",
-        )
-
-    def _add_examples(
-        self,
-        messages: list[dict[str, Any]],
-        failed_response: str,
-        error_context: str,
-    ) -> CompensationResult:
+    def _add_examples(self, messages, failed_response, error_context):
         example_msg = (
-            f"Your previous response could not be processed. "
-            f"Error: {error_context}\n\n"
-            f"Here are examples of correct tool usage:\n\n"
-            f"Example 1 - Running a command:\n"
-            f'{{"tool": "shell", "args": {{"command": "ls -la"}}}}\n\n'
-            f"Example 2 - Reading a file:\n"
-            f'{{"tool": "read_file", "args": {{"path": "/home/user/code.py"}}}}\n\n'
-            f"Example 3 - Normal text response (no tool needed):\n"
-            f"The function calculates the factorial of a number using recursion.\n\n"
-            f"Now please try again with the correct format."
+            f"Error: {error_context}\n\nExamples of correct tool usage:\n"
+            f'{{"tool": "shell", "args": {{"command": "ls -la"}}}}\n'
+            f'{{"tool": "read_file", "args": {{"path": "src/main.py"}}}}\n'
+            f"Normal response (no tool): Just write text.\nTry again."
         )
         refined = list(messages)
         refined.append({"role": "assistant", "content": failed_response})
         refined.append({"role": "user", "content": example_msg})
+        return CompensationResult(strategy="add_examples", success=True,
+                                  modified_messages=refined, notes="Added examples")
 
-        return CompensationResult(
-            strategy="add_examples",
-            success=True,
-            modified_messages=refined,
-            notes="Added few-shot examples",
-        )
-
-    def _escalate_model(self, current_tier: str) -> CompensationResult:
-        next_tier = _next_tier(current_tier)
-        if next_tier:
-            return CompensationResult(
-                strategy="escalate_model",
-                success=True,
-                escalated_tier=next_tier,
-                notes=f"Escalating from {current_tier} to {next_tier}",
-            )
-        return CompensationResult(
-            strategy="escalate_model",
-            success=False,
-            notes=f"Already at highest tier ({current_tier}), cannot escalate",
-        )
+    def _escalate_model(self, current_tier):
+        nt = _next_tier(current_tier)
+        if nt:
+            return CompensationResult(strategy="escalate_model", success=True,
+                                      escalated_tier=nt, notes=f"{current_tier} -> {nt}")
+        return CompensationResult(strategy="escalate_model", success=False,
+                                  notes=f"Already at {current_tier}")
 
 
 def _next_tier(current: str) -> str | None:
-    """Get the next tier up, or None if already at max."""
     try:
         idx = TIER_ORDER.index(current)
     except ValueError:
         return None
-    if idx < len(TIER_ORDER) - 1:
-        return TIER_ORDER[idx + 1]
-    return None
+    return TIER_ORDER[idx + 1] if idx < len(TIER_ORDER) - 1 else None
 
 
-def _condense_messages(
-    messages: list[dict[str, Any]],
-    summary_prefix: str,
-) -> list[dict[str, Any]]:
-    """Condense a long message history, keeping system prompt and user request.
-
-    Truncates tool results to save context window for the larger model.
-    """
-    if not messages:
-        return messages
-
-    condensed: list[dict[str, Any]] = []
-
-    # Keep system prompt
-    if messages[0].get("role") == "system":
+def _condense_messages(messages, summary_prefix):
+    condensed = []
+    if messages and messages[0].get("role") == "system":
         condensed.append(messages[0])
-
-    # Find original user request (first user message)
-    original_request = ""
+    original = ""
     for m in messages:
         if m.get("role") == "user" and not m["content"].startswith("[Tool Result"):
-            original_request = m["content"]
+            original = m["content"]
             break
-
-    # Collect tool results summary
-    tool_summary_parts = []
+    tool_summaries = []
     for m in messages:
-        content = m.get("content", "")
-        if content.startswith("[Tool Result for "):
-            # Extract tool name and truncate result
-            first_line = content.split("\n")[0]
-            result_preview = content[len(first_line):].strip()
-            if len(result_preview) > 200:
-                result_preview = result_preview[:200] + "..."
-            tool_summary_parts.append(f"{first_line}\n{result_preview}")
-
-    # Build condensed user message
-    parts = [summary_prefix, "", f"Original request: {original_request}"]
-    if tool_summary_parts:
-        parts.append("")
-        parts.append("Previous tool results (summarized):")
-        for ts in tool_summary_parts[-5:]:  # Keep last 5 tool results
-            parts.append(ts)
-
+        c = m.get("content", "")
+        if c.startswith("[Tool Result for "):
+            first_line = c.split("\n")[0]
+            preview = c[len(first_line):].strip()[:200]
+            tool_summaries.append(f"{first_line}\n{preview}...")
+    parts = [summary_prefix, f"\nOriginal request: {original}"]
+    if tool_summaries:
+        parts.append("\nPrevious results (summarized):")
+        parts.extend(tool_summaries[-5:])
     condensed.append({"role": "user", "content": "\n".join(parts)})
     return condensed
 
 
 def truncate_tool_output(output: str, max_length: int = 5000) -> str:
-    """Truncate tool output to fit within context constraints.
-
-    Keeps the beginning and end for context.
-    """
     if len(output) <= max_length:
         return output
     half = max_length // 2
     return output[:half] + f"\n\n... [{len(output) - max_length} chars truncated] ...\n\n" + output[-half:]
 
 
-def build_tool_prompt(tools_description: str, thinking_mode: str = "auto") -> str:
-    """Build the system prompt for tool-calling with local LLMs."""
-    thinking_instruction = ""
-    if thinking_mode == "never":
-        thinking_instruction = "/no_think\n"
-    elif thinking_mode == "auto":
-        thinking_instruction = (
-            "Use <think>...</think> for complex reasoning. "
-            "Skip thinking for simple, direct tasks.\n"
-        )
+# ---------------------------------------------------------------------------
+# Prompt builders
+# ---------------------------------------------------------------------------
 
-    return f"""{thinking_instruction}You are a capable AI assistant with access to tools.
+_TOOL_FORMAT = """\
+When you need to use a tool, respond with EXACTLY this JSON (nothing else):
+{"tool": "tool_name", "args": {"param1": "value1"}}
+
+RULES:
+- Output ONLY the JSON when calling a tool — no other text around it
+- ONE tool call per response
+- To respond to the user, just write normal text (no JSON)
+- Prefer shell pipes and chaining to minimize tool calls"""
+
+
+def build_tool_prompt(tools_description: str, thinking_mode: str = "auto") -> str:
+    """System prompt for interactive (conversational) mode."""
+    think = ""
+    if thinking_mode == "never":
+        think = "/no_think\n"
+    elif thinking_mode == "auto":
+        think = "Use <think>...</think> for complex reasoning. Skip for simple tasks.\n"
+
+    return f"""{think}You are a capable AI assistant with access to tools.
 
 ## Available Tools
 
@@ -272,21 +187,82 @@ def build_tool_prompt(tools_description: str, thinking_mode: str = "auto") -> st
 
 ## How to Use Tools
 
-When you need to use a tool, respond with EXACTLY this JSON format (nothing else):
-{{"tool": "tool_name", "args": {{"param1": "value1", "param2": "value2"}}}}
-
-IMPORTANT RULES:
-- Output ONLY the JSON object when calling a tool, with NO other text
-- Only ONE tool call per response
-- When you want to respond to the user (not use a tool), just write your response as normal text
-- After receiving a tool result, analyze it and either call another tool or respond to the user
-- If a tool fails, try a different approach or explain the issue
-- Prefer combining operations (e.g., shell pipes like `find ... | wc -l`) over many small tool calls
+{_TOOL_FORMAT}
 
 ## Working Style
 
-- Break complex tasks into steps, but minimize the number of tool calls
-- Use shell pipes and command chaining to do multiple things in one call
+- Break complex tasks into steps, minimize tool calls
+- Use shell pipes (e.g., `find ... | wc -l`) to combine operations
 - Verify your work when possible
-- If something fails, try alternative approaches before giving up
-- Be concise but thorough in your responses"""
+- If something fails, try a different approach
+- Be concise but thorough"""
+
+
+def build_autonomous_prompt(
+    tools_description: str,
+    project_context: str,
+    thinking_mode: str = "auto",
+) -> str:
+    """System prompt for autonomous goal-driven mode.
+
+    Key difference from interactive: the agent works until the goal is achieved
+    without asking the user for permission or clarification.
+    """
+    think = ""
+    if thinking_mode == "never":
+        think = "/no_think\n"
+    elif thinking_mode == "auto":
+        think = "Use <think>...</think> for planning and complex reasoning.\n"
+
+    return f"""{think}You are an autonomous AI coding agent. You work independently to achieve goals.
+
+## Core Behavior
+
+- Work step by step toward the goal WITHOUT asking for user confirmation
+- After each tool result, evaluate progress and decide your next action
+- If something fails, try a different approach automatically
+- When the goal is fully achieved, write a clear summary of what you did
+- DO NOT ask questions or request clarification — make reasonable decisions
+- If you are unsure, choose the most reasonable option and proceed
+- Keep working until the goal is FULLY COMPLETE
+
+## Available Tools
+
+{tools_description}
+
+## How to Use Tools
+
+{_TOOL_FORMAT}
+
+## Project Context
+
+{project_context}
+
+## Autonomous Work Patterns
+
+### Code Changes
+1. Read the relevant files first to understand existing code
+2. Make changes using write_file or edit_file
+3. Run tests to verify (run_tests tool)
+4. If tests fail, analyze errors, fix code, re-run tests
+5. Repeat until all tests pass
+
+### Test-Driven Loop
+When fixing bugs or implementing features:
+1. Run tests to see current state
+2. Read failing test to understand expected behavior
+3. Read and modify source code
+4. Re-run tests
+5. Iterate until all tests pass
+
+### Git Workflow
+- Use git_status to check current state
+- Commit working changes with clear messages
+- Create feature branches for larger changes
+
+## Completion
+When the goal is achieved, respond with a summary:
+- What was done
+- Files modified
+- Test results (if applicable)
+- Any important notes"""
