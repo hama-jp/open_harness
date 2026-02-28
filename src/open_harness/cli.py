@@ -287,6 +287,28 @@ def handle_command(cmd: str, agent: Agent, config: HarnessConfig, display: Strea
             console.print(f"[green]Policy switched to: {arg}[/green]")
         return True
 
+    elif command == "/memory":
+        memories = agent.project_memory_store.get_memories(
+            str(agent.project.root), limit=20)
+        runbooks = agent.project_memory_store.get_runbooks(
+            str(agent.project.root), limit=5)
+        if not memories and not runbooks:
+            console.print("[dim]No project memories yet. Use /goal to start learning.[/dim]")
+        else:
+            if memories:
+                console.print("[bold]Learned memories:[/bold]")
+                for m in memories:
+                    icon = {"pattern": "P", "structure": "S", "error": "E", "runbook": "R"}.get(m.kind, "?")
+                    pin = " [yellow]*[/yellow]" if m.pinned else ""
+                    console.print(f"  [{icon}] {m.value} [dim](score:{m.score:.1f} seen:{m.seen_count}){pin}[/dim]")
+            if runbooks:
+                console.print("[bold]Runbooks:[/bold]")
+                for rb in runbooks:
+                    console.print(f"  [bold]{rb.title}[/bold] ({rb.usage_count} uses, {rb.success_count} ok)")
+                    for j, step in enumerate(rb.steps[:5], 1):
+                        console.print(f"    {j}. {step}")
+        return True
+
     elif command == "/help":
         console.print("""
 [bold]Interactive:[/bold]
@@ -302,6 +324,7 @@ def handle_command(cmd: str, agent: Agent, config: HarnessConfig, display: Strea
   /policy [mode]   - Show or set policy (safe/balanced/full)
   /tools           - List available tools
   /project         - Show detected project context
+  /memory          - Show learned project memories
   /clear           - Clear conversation
   /quit            - Exit
         """)

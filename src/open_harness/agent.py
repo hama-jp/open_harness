@@ -17,6 +17,11 @@ from open_harness.llm.compensator import (
     truncate_tool_output,
 )
 from open_harness.llm.router import ModelRouter
+from open_harness.memory.project_memory import (
+    ProjectMemoryEngine,
+    ProjectMemoryStore,
+    build_memory_block,
+)
 from open_harness.memory.store import MemoryStore
 from open_harness.planner import Plan, PlanCritic, PlanStep, Planner, StepResult
 from open_harness.policy import PolicyEngine, load_policy
@@ -57,6 +62,9 @@ class Agent:
         self.policy.set_project_root(self.project.root)
         self.planner = Planner(self.router)
         self.plan_critic = PlanCritic()
+        self.project_memory_store = ProjectMemoryStore(config.memory.db_path)
+        self.project_memory = ProjectMemoryEngine(
+            self.project_memory_store, str(self.project.root))
         self._interactive_prompt: str | None = None
         self._autonomous_prompt: str | None = None
 
@@ -72,9 +80,14 @@ class Agent:
     @property
     def autonomous_prompt(self) -> str:
         if self._autonomous_prompt is None:
+            memory_block = build_memory_block(
+                self.project_memory_store, str(self.project.root))
+            project_ctx = self.project.to_prompt()
+            if memory_block:
+                project_ctx += f"\n\n{memory_block}"
             self._autonomous_prompt = build_autonomous_prompt(
                 self.tools.get_prompt_description(),
-                self.project.to_prompt(),
+                project_ctx,
                 self.config.compensation.thinking_mode,
             )
         return self._autonomous_prompt
@@ -158,6 +171,9 @@ class Agent:
             finish_status = ckpt.finish(keep_changes=True)
             if finish_status:
                 yield AgentEvent("status", f"Finish: {finish_status}")
+            # Flush learned memories and invalidate cached prompt
+            self.project_memory.on_session_end()
+            self._autonomous_prompt = None
 
     def _run_direct_goal(
         self, goal: str, ckpt: CheckpointEngine,
@@ -381,6 +397,10 @@ class Agent:
                 output = truncate_tool_output(result.to_message(), 8000)
                 yield AgentEvent("tool_result", output,
                                  {"success": result.success, "tool": tc.name})
+
+                # Auto-learn from tool usage
+                self.project_memory.on_tool_result(
+                    tc.name, tc.arguments, result.success, output)
 
                 # Auto-snapshot after file writes (every 5 writes)
                 if checkpoint and tc.name in ("write_file", "edit_file") and result.success:
