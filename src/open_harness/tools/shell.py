@@ -38,10 +38,25 @@ class ShellTool(Tool):
     def __init__(self, config: ShellToolConfig | None = None):
         self.config = config or ShellToolConfig()
 
-    def _is_blocked(self, command: str) -> str | None:
+    def _check_safety(self, command: str) -> str | None:
+        """Check command against allowlist and blocklist.
+
+        Returns an error message if the command is not allowed, None if OK.
+        """
+        # Blocklist takes priority
         for blocked in self.config.blocked_commands:
             if blocked in command:
                 return f"Command blocked for safety: contains '{blocked}'"
+
+        # If allowlist is configured, command must match at least one entry
+        if self.config.allowed_commands:
+            cmd_base = command.split()[0] if command.split() else ""
+            if not any(cmd_base == allowed or command.startswith(allowed)
+                       for allowed in self.config.allowed_commands):
+                return (
+                    f"Command not in allowlist. Allowed: {', '.join(self.config.allowed_commands)}"
+                )
+
         return None
 
     def execute(self, **kwargs: Any) -> ToolResult:
@@ -52,9 +67,9 @@ class ShellTool(Tool):
         if not command:
             return ToolResult(success=False, output="", error="No command provided")
 
-        blocked = self._is_blocked(command)
-        if blocked:
-            return ToolResult(success=False, output="", error=blocked)
+        safety_error = self._check_safety(command)
+        if safety_error:
+            return ToolResult(success=False, output="", error=safety_error)
 
         try:
             result = subprocess.run(

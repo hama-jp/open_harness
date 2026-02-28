@@ -196,7 +196,7 @@ def main(config_path: str | None, tier: str | None, verbose: bool):
         pass
 
     tools = setup_tools(config)
-    memory = MemoryStore(config.memory.db_path)
+    memory = MemoryStore(config.memory.db_path, max_turns=config.memory.max_conversation_turns)
     agent = Agent(config, tools, memory)
     display = StreamingDisplay(console)
 

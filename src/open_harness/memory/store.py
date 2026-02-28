@@ -25,13 +25,13 @@ class ConversationTurn:
 class MemoryStore:
     """SQLite-backed conversation and memory store."""
 
-    def __init__(self, db_path: str = "~/.open_harness/memory.db"):
+    def __init__(self, db_path: str = "~/.open_harness/memory.db", max_turns: int = 50):
         self.db_path = Path(db_path).expanduser()
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._conn = sqlite3.connect(str(self.db_path))
         self._init_schema()
         self._conversation: list[ConversationTurn] = []
-        self._max_turns = 50
+        self._max_turns = max_turns
 
     def _init_schema(self):
         self._conn.executescript("""
