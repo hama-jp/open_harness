@@ -63,7 +63,7 @@ class ProjectContext:
         elif (self.root / "setup.py").exists():
             ctx["type"] = "python"
             ctx["languages"].append("python")
-            ctx["test_command"] = "python -m pytest"
+            ctx["test_command"] = "python3 -m pytest"
 
         # JavaScript / TypeScript
         if (self.root / "package.json").exists():
@@ -98,10 +98,10 @@ class ProjectContext:
 
     def _detect_python_test(self) -> str:
         if (self.root / "pytest.ini").exists() or (self.root / "pyproject.toml").exists():
-            return "python -m pytest"
+            return "python3 -m pytest"
         if (self.root / "tests").is_dir():
-            return "python -m pytest tests/"
-        return "python -m pytest"
+            return "python3 -m pytest tests/"
+        return "python3 -m pytest"
 
     def _scan_structure(self, max_depth: int = 3, max_entries: int = 60) -> str:
         """Generate a compact directory tree."""
