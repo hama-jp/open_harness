@@ -70,6 +70,17 @@ external_agents:
     enabled: true
     command: "gemini"
 
+# Execution policy — automatic guardrails for autonomous mode
+# Modes: safe (strict budgets), balanced (default), full (no limits)
+policy:
+  mode: "balanced"
+  # max_file_writes: 0       # 0 = unlimited
+  # max_shell_commands: 0
+  # max_git_commits: 10
+  # max_external_calls: 5
+  # disabled_tools: []
+  # denied_paths:             # default blocks /etc, ~/.ssh, .env, etc.
+
 # Memory
 memory:
   backend: "sqlite"

@@ -259,6 +259,34 @@ def handle_command(cmd: str, agent: Agent, config: HarnessConfig, display: Strea
             console.print(f"      [dim]{bg.log_path}[/dim]")
         return True
 
+    elif command == "/policy":
+        p = agent.policy.config
+        console.print(f"[bold]Policy mode:[/bold] {p.mode}")
+        budgets = []
+        if p.max_file_writes:
+            budgets.append(f"file writes: {p.max_file_writes}")
+        if p.max_shell_commands:
+            budgets.append(f"shell commands: {p.max_shell_commands}")
+        if p.max_git_commits:
+            budgets.append(f"git commits: {p.max_git_commits}")
+        if p.max_external_calls:
+            budgets.append(f"external calls: {p.max_external_calls}")
+        if budgets:
+            console.print(f"[dim]Budgets: {', '.join(budgets)}[/dim]")
+        else:
+            console.print("[dim]Budgets: unlimited[/dim]")
+        if p.denied_paths:
+            console.print(f"[dim]Denied paths: {len(p.denied_paths)} patterns[/dim]")
+        if p.blocked_shell_patterns:
+            console.print(f"[dim]Blocked shell: {len(p.blocked_shell_patterns)} patterns[/dim]")
+        if p.disabled_tools:
+            console.print(f"[dim]Disabled tools: {', '.join(p.disabled_tools)}[/dim]")
+        if arg and arg in ("safe", "balanced", "full"):
+            from open_harness.policy import PRESETS, PolicyConfig
+            agent.policy.config = PolicyConfig(**PRESETS[arg])
+            console.print(f"[green]Policy switched to: {arg}[/green]")
+        return True
+
     elif command == "/help":
         console.print("""
 [bold]Interactive:[/bold]
@@ -271,6 +299,7 @@ def handle_command(cmd: str, agent: Agent, config: HarnessConfig, display: Strea
 
 [bold]Settings:[/bold]
   /tier [name]     - Show or set model tier (small/medium/large)
+  /policy [mode]   - Show or set policy (safe/balanced/full)
   /tools           - List available tools
   /project         - Show detected project context
   /clear           - Clear conversation

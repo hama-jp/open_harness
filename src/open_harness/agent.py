@@ -19,8 +19,9 @@ from open_harness.llm.compensator import (
 )
 from open_harness.llm.router import ModelRouter
 from open_harness.memory.store import MemoryStore
+from open_harness.policy import PolicyEngine, load_policy
 from open_harness.project import ProjectContext
-from open_harness.tools.base import ToolRegistry
+from open_harness.tools.base import ToolRegistry, ToolResult
 
 logger = logging.getLogger(__name__)
 
@@ -52,6 +53,8 @@ class Agent:
         self.project = project or ProjectContext()
         self.router = ModelRouter(config)
         self.compensator = Compensator(config.compensation)
+        self.policy = PolicyEngine(load_policy(config.policy))
+        self.policy.set_project_root(self.project.root)
         self._interactive_prompt: str | None = None
         self._autonomous_prompt: str | None = None
 
@@ -111,8 +114,9 @@ class Agent:
         until the goal is achieved or the step budget is exhausted.
         """
         self.compensator.reset()
+        self.policy.begin_goal()
 
-        yield AgentEvent("status", f"Goal: {goal}")
+        yield AgentEvent("status", f"Goal: {goal} [policy: {self.policy.config.mode}]")
         yield AgentEvent("status", f"Project: {self.project.info['type']} @ {self.project.info['root']}")
 
         # Safety: create a checkpoint before autonomous work
@@ -128,6 +132,7 @@ class Agent:
         try:
             yield from self._agent_loop(messages, MAX_GOAL_STEPS)
         finally:
+            yield AgentEvent("status", f"Budget: {self.policy.budget.summary()}")
             # Restore stashed changes if we created a checkpoint
             if checkpoint == "stashed uncommitted changes":
                 restored = self._restore_checkpoint()
@@ -174,7 +179,17 @@ class Agent:
                 tc = response.tool_calls[0]
                 yield AgentEvent("tool_call", tc.name, {"tool": tc.name, "args": tc.arguments})
 
-                result = self.tools.execute(tc.name, tc.arguments)
+                # Policy check before execution
+                violation = self.policy.check(tc.name, tc.arguments)
+                if violation:
+                    result = ToolResult(
+                        success=False, output="",
+                        error=f"[Policy: {violation.rule}] {violation.message}",
+                    )
+                else:
+                    result = self.tools.execute(tc.name, tc.arguments)
+                    self.policy.record(tc.name)
+
                 output = truncate_tool_output(result.to_message(), 8000)
                 yield AgentEvent("tool_result", output,
                                  {"success": result.success, "tool": tc.name})

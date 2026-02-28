@@ -72,6 +72,7 @@ class HarnessConfig(BaseModel):
     tools: ToolsConfig = Field(default_factory=ToolsConfig)
     external_agents: dict[str, ExternalAgentConfig] = Field(default_factory=dict)
     memory: MemoryConfig = Field(default_factory=MemoryConfig)
+    policy: dict[str, Any] = Field(default_factory=dict)  # raw dict, parsed by PolicyEngine
 
 
 def load_config(config_path: str | Path | None = None) -> HarnessConfig:
