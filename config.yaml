@@ -17,7 +17,7 @@ llm:
   models:
     small:
       provider: "lm_studio"
-      model: "qwen/qwen3-4b-2507"
+      model: "qwen/qwen3.5-35b-a3b"
       max_tokens: 4096
       description: "Fast, simple tasks"
 
@@ -29,15 +29,15 @@ llm:
 
     large:
       provider: "lm_studio"
-      model: "qwen/qwen3-next-80b-a3b"
+      model: "qwen/qwen3.5-35b-a3b"
       max_tokens: 16384
       description: "Complex reasoning"
 
-    vision:
-      provider: "lm_studio"
-      model: "qwen/qwen3-vl-30b"
-      max_tokens: 8192
-      description: "Image understanding"
+    # vision:
+    #   provider: "lm_studio"
+    #   model: "qwen/qwen3-vl-30b"
+    #   max_tokens: 8192
+    #   description: "Image understanding"
 
   # Default model tier
   default_tier: "medium"
