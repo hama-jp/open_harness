@@ -191,8 +191,8 @@ class PolicyEngine:
         if violation:
             return violation
 
-        # Path checks for file tools
-        if category == "write" or tool_name == "read_file":
+        # Path checks for all file-accessing tools
+        if tool_name in ("read_file", "write_file", "edit_file", "list_dir", "search_files"):
             path = args.get("path", "")
             if path:
                 violation = self._check_path(path, tool_name, category)
@@ -253,7 +253,15 @@ class PolicyEngine:
         # Denied paths
         for pattern in self.config.denied_paths:
             expanded = str(Path(pattern).expanduser())
-            if fnmatch.fnmatch(path_str, expanded) or fnmatch.fnmatch(resolved.name, pattern):
+            # Check exact match, glob match, and parent-of match
+            # e.g. "/etc/*" should block both "/etc" and "/etc/passwd"
+            parent = expanded.rstrip("/*").rstrip("*")
+            if (
+                fnmatch.fnmatch(path_str, expanded)
+                or path_str == parent
+                or path_str.startswith(parent + "/")
+                or fnmatch.fnmatch(resolved.name, pattern)
+            ):
                 return PolicyViolation(
                     rule="denied_path",
                     message=f"Access to '{path}' is denied by policy (matches '{pattern}'). "

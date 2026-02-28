@@ -89,6 +89,7 @@ class Agent:
     def run_stream(self, user_message: str) -> Generator[AgentEvent, None, None]:
         """Interactive single-turn with streaming."""
         self.compensator.reset()
+        self.policy.begin_goal()  # reset budgets per turn
         self.memory.add_turn("user", user_message)
         messages = [
             {"role": "system", "content": self.interactive_prompt},
