@@ -4,11 +4,11 @@ from __future__ import annotations
 
 import json
 import logging
-import subprocess
 import time
 from dataclasses import dataclass, field
 from typing import Any, Generator
 
+from open_harness.checkpoint import CheckpointEngine
 from open_harness.config import HarnessConfig
 from open_harness.llm.client import LLMResponse, ToolCall
 from open_harness.llm.compensator import (
@@ -120,10 +120,13 @@ class Agent:
         yield AgentEvent("status", f"Goal: {goal} [policy: {self.policy.config.mode}]")
         yield AgentEvent("status", f"Project: {self.project.info['type']} @ {self.project.info['root']}")
 
-        # Safety: create a checkpoint before autonomous work
-        checkpoint = self._create_checkpoint()
-        if checkpoint:
-            yield AgentEvent("status", f"Checkpoint: {checkpoint}")
+        # Checkpoint engine for transactional safety
+        ckpt = CheckpointEngine(
+            self.project.root,
+            has_git=self.project.info.get("has_git", False),
+        )
+        ckpt_status = ckpt.begin()
+        yield AgentEvent("status", f"Checkpoint: {ckpt_status}")
 
         messages: list[dict[str, Any]] = [
             {"role": "system", "content": self.autonomous_prompt},
@@ -131,14 +134,12 @@ class Agent:
         ]
 
         try:
-            yield from self._agent_loop(messages, MAX_GOAL_STEPS)
+            yield from self._agent_loop(messages, MAX_GOAL_STEPS, checkpoint=ckpt)
         finally:
             yield AgentEvent("status", f"Budget: {self.policy.budget.summary()}")
-            # Restore stashed changes if we created a checkpoint
-            if checkpoint == "stashed uncommitted changes":
-                restored = self._restore_checkpoint()
-                if restored:
-                    yield AgentEvent("status", f"Restored: {restored}")
+            finish_status = ckpt.finish(keep_changes=True)
+            if finish_status:
+                yield AgentEvent("status", f"Finish: {finish_status}")
 
     # ------------------------------------------------------------------
     # Shared agent loop
@@ -149,10 +150,12 @@ class Agent:
         messages: list[dict[str, Any]],
         max_steps: int,
         tier: str | None = None,
+        checkpoint: CheckpointEngine | None = None,
     ) -> Generator[AgentEvent, None, None]:
         """Core ReAct loop shared by interactive and goal modes."""
         tier = tier or self.router.current_tier
         step = 0
+        _writes_since_snapshot = 0
 
         while step < max_steps:
             step += 1
@@ -195,6 +198,31 @@ class Agent:
                 yield AgentEvent("tool_result", output,
                                  {"success": result.success, "tool": tc.name})
 
+                # Auto-snapshot after file writes (every 5 writes)
+                if checkpoint and tc.name in ("write_file", "edit_file") and result.success:
+                    _writes_since_snapshot += 1
+                    if _writes_since_snapshot >= 5:
+                        snap = checkpoint.snapshot(f"after {_writes_since_snapshot} writes (step {step})")
+                        if snap:
+                            yield AgentEvent("status", f"Snapshot: {snap.commit_hash}")
+                        _writes_since_snapshot = 0
+
+                # Auto-rollback on test failure (if checkpoint active)
+                if (checkpoint and tc.name == "run_tests"
+                        and not result.success and checkpoint.snapshots):
+                    yield AgentEvent("compensation",
+                        "Tests failed — rolling back to last snapshot")
+                    rb = checkpoint.rollback(checkpoint.snapshots[-1])
+                    yield AgentEvent("status", f"Rollback: {rb}")
+                    # Tell the LLM about the rollback
+                    messages.append({"role": "assistant",
+                        "content": f'{{"tool": "{tc.name}", "args": {_safe_json(tc.arguments)}}}'})
+                    messages.append({"role": "user",
+                        "content": f"[Tool Result for {tc.name}]\n{output}\n\n"
+                                   f"[ROLLBACK] Changes have been rolled back to the last "
+                                   f"snapshot. Try a different approach."})
+                    continue
+
                 messages.append({"role": "assistant",
                     "content": f'{{"tool": "{tc.name}", "args": {_safe_json(tc.arguments)}}}'})
                 messages.append({"role": "user",
@@ -213,6 +241,12 @@ class Agent:
                         tier = comp.escalated_tier
                     continue
 
+            # Auto-snapshot before finishing (capture final state)
+            if checkpoint and _writes_since_snapshot > 0:
+                snap = checkpoint.snapshot(f"goal complete (step {step})")
+                if snap:
+                    yield AgentEvent("status", f"Final snapshot: {snap.commit_hash}")
+
             # Text response — done
             self.memory.add_turn("assistant", response.content)
             yield AgentEvent("done", response.content,
@@ -225,7 +259,8 @@ class Agent:
             yield AgentEvent("compensation", comp.notes)
             messages = comp.modified_messages or messages
             tier = comp.escalated_tier or tier
-            yield from self._agent_loop(messages, max_steps, tier=tier)
+            yield from self._agent_loop(messages, max_steps, tier=tier,
+                                        checkpoint=checkpoint)
             return
 
         yield AgentEvent("done",
@@ -260,50 +295,6 @@ class Agent:
         ]
         return any(indicators) and len(content) < 500
 
-    def _create_checkpoint(self) -> str | None:
-        """Create a git checkpoint before autonomous work."""
-        if not self.project.info.get("has_git"):
-            return None
-        cwd = str(self.project.root)
-        try:
-            r = subprocess.run(
-                "git status --porcelain", shell=True,
-                capture_output=True, text=True, timeout=10, cwd=cwd,
-            )
-            if r.stdout.strip():
-                stash_r = subprocess.run(
-                    "git stash push -m 'open-harness: auto-checkpoint before goal'",
-                    shell=True, capture_output=True, text=True, timeout=10, cwd=cwd,
-                )
-                if stash_r.returncode == 0 and "No local changes" not in stash_r.stdout:
-                    return "stashed uncommitted changes"
-            return "clean working tree"
-        except Exception as e:
-            logger.warning(f"Failed to create checkpoint: {e}")
-            return None
-
-    def _restore_checkpoint(self) -> str | None:
-        """Restore stashed changes after goal completion."""
-        if not self.project.info.get("has_git"):
-            return None
-        cwd = str(self.project.root)
-        try:
-            r = subprocess.run(
-                "git stash list", shell=True,
-                capture_output=True, text=True, timeout=10, cwd=cwd,
-            )
-            if "open-harness: auto-checkpoint" in r.stdout:
-                pop_r = subprocess.run(
-                    "git stash pop", shell=True,
-                    capture_output=True, text=True, timeout=10, cwd=cwd,
-                )
-                if pop_r.returncode == 0:
-                    return "restored stashed changes"
-                return f"stash pop failed: {pop_r.stderr.strip()}"
-            return None
-        except Exception as e:
-            logger.warning(f"Failed to restore checkpoint: {e}")
-            return None
 
 
 def _safe_json(obj: Any) -> str:
