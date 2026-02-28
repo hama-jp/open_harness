@@ -6,11 +6,11 @@ import json
 import re
 import time
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Generator
 
 import httpx
 
-from open_harness.config import ModelConfig, ProviderConfig
+from open_harness.config import ProviderConfig
 
 
 @dataclass
@@ -39,15 +39,11 @@ class LLMResponse:
 
     @property
     def clean_content(self) -> str:
-        """Content with thinking tags stripped."""
         return self.content
 
 
 def _extract_thinking(text: str) -> tuple[str, str]:
-    """Extract <think>...</think> blocks from response text.
-
-    Returns (thinking_content, remaining_text).
-    """
+    """Extract <think>...</think> blocks from response text."""
     pattern = r"<think>(.*?)</think>"
     thinking_parts = re.findall(pattern, text, re.DOTALL)
     thinking = "\n".join(thinking_parts).strip()
@@ -56,25 +52,23 @@ def _extract_thinking(text: str) -> tuple[str, str]:
 
 
 def _parse_tool_calls_from_text(text: str) -> list[ToolCall]:
-    """Try to extract tool calls from free-form text.
-
-    Handles various formats local LLMs might produce:
-    1. {"tool": "name", "args": {...}}
-    2. ```json\n{"tool": "name", "args": {...}}\n```
-    3. Native-style function calls embedded in text
-    """
+    """Try to extract tool calls from free-form text."""
     calls = []
 
     # Try code block extraction first
     code_block_pattern = r"```(?:json)?\s*(\{.*?\})\s*```"
     matches = re.findall(code_block_pattern, text, re.DOTALL)
 
-    # Also try bare JSON objects
     if not matches:
         bare_json_pattern = r'(\{"tool"\s*:\s*"[^"]+"\s*,\s*"args"\s*:\s*\{.*?\}\s*\})'
         matches = re.findall(bare_json_pattern, text, re.DOTALL)
 
-    # Also try tool_call format
+    if not matches:
+        # Try parsing entire text as JSON
+        stripped = text.strip()
+        if stripped.startswith("{") and stripped.endswith("}"):
+            matches = [stripped]
+
     if not matches:
         alt_pattern = r'(\{"tool_call"\s*:\s*\{.*?\}\s*\})'
         matches = re.findall(alt_pattern, text, re.DOTALL)
@@ -101,6 +95,111 @@ def _parse_tool_calls_from_text(text: str) -> list[ToolCall]:
     return calls
 
 
+# ---------------------------------------------------------------------------
+# Stream processor: handles <think> tags and detects tool calls during streaming
+# ---------------------------------------------------------------------------
+
+class StreamProcessor:
+    """Processes SSE chunks from a streaming LLM response.
+
+    States:
+      init      - haven't determined response type yet
+      thinking  - inside <think> block
+      detecting - after thinking, buffering first chars to detect text vs tool
+      text      - streaming normal text
+      tool      - buffering a tool call (not displayed until complete)
+    """
+
+    def __init__(self):
+        self.buffer = ""
+        self.thinking = ""
+        self.content_start = 0
+        self.displayed_up_to = 0
+        self.state = "init"
+
+    def feed(self, chunk: str) -> Generator[tuple[str, str], None, None]:
+        """Feed a chunk. Yields (event_type, data) pairs.
+
+        event_type: "thinking", "text", "tool_buffering"
+        """
+        self.buffer += chunk
+
+        # Re-evaluate state machine
+        changed = True
+        while changed:
+            changed = False
+
+            if self.state == "init":
+                stripped = self.buffer.lstrip()
+                if stripped.startswith("<think>"):
+                    self.state = "thinking"
+                    changed = True
+                elif len(stripped) >= 7 or (stripped and not stripped.startswith("<")):
+                    # Not a think block
+                    self.content_start = len(self.buffer) - len(stripped)
+                    self.displayed_up_to = self.content_start
+                    self.state = "detecting"
+                    changed = True
+
+            elif self.state == "thinking":
+                end_idx = self.buffer.find("</think>")
+                if end_idx >= 0:
+                    think_start = self.buffer.find("<think>") + len("<think>")
+                    self.thinking = self.buffer[think_start:end_idx].strip()
+                    self.content_start = end_idx + len("</think>")
+                    self.displayed_up_to = self.content_start
+                    yield ("thinking", self.thinking)
+                    self.state = "detecting"
+                    changed = True
+
+            elif self.state == "detecting":
+                content = self.buffer[self.content_start:].lstrip()
+                if not content:
+                    break
+                if content.startswith("{"):
+                    self.state = "tool"
+                    # Don't yield anything - buffer the tool call
+                elif len(content) > 2:
+                    self.state = "text"
+                    changed = True
+
+            elif self.state == "text":
+                new = self.buffer[self.displayed_up_to:]
+                if new:
+                    self.displayed_up_to = len(self.buffer)
+                    yield ("text", new)
+
+            elif self.state == "tool":
+                # Silently buffer
+                break
+
+    def finish(self) -> tuple[str, str, list[ToolCall]]:
+        """Call when stream ends. Returns (thinking, content, tool_calls)."""
+        content = self.buffer[self.content_start:].strip()
+
+        if self.state == "thinking":
+            # Stream ended inside thinking block (incomplete)
+            think_start = self.buffer.find("<think>")
+            if think_start >= 0:
+                self.thinking = self.buffer[think_start + len("<think>"):].strip()
+            content = ""
+
+        tool_calls: list[ToolCall] = []
+        if self.state == "tool":
+            tool_calls = _parse_tool_calls_from_text(content)
+
+        return self.thinking, content, tool_calls
+
+    @property
+    def undisplayed_text(self) -> str:
+        """Text that hasn't been yielded yet (for tool or detecting states)."""
+        return self.buffer[self.displayed_up_to:].strip()
+
+
+# ---------------------------------------------------------------------------
+# Main client
+# ---------------------------------------------------------------------------
+
 class LLMClient:
     """Client for OpenAI-compatible LLM APIs (LM Studio, Ollama, etc.)."""
 
@@ -124,14 +223,13 @@ class LLMClient:
         tools: list[dict[str, Any]] | None = None,
         tool_choice: str | None = None,
     ) -> LLMResponse:
-        """Send a chat completion request."""
+        """Send a non-streaming chat completion request."""
         payload: dict[str, Any] = {
             "model": model,
             "messages": messages,
             "max_tokens": max_tokens,
             "temperature": temperature,
         }
-
         if tools:
             payload["tools"] = tools
             if tool_choice:
@@ -142,10 +240,7 @@ class LLMClient:
             resp = self.client.post("/chat/completions", json=payload)
             resp.raise_for_status()
         except httpx.HTTPError as e:
-            return LLMResponse(
-                content=f"[LLM API Error: {e}]",
-                finish_reason="error",
-            )
+            return LLMResponse(content=f"[LLM API Error: {e}]", finish_reason="error")
 
         latency = (time.monotonic() - start) * 1000
         data = resp.json()
@@ -155,10 +250,8 @@ class LLMClient:
         raw_content = message.get("content", "") or ""
         finish = choice.get("finish_reason", "")
 
-        # Extract thinking blocks
         thinking, clean_content = _extract_thinking(raw_content)
 
-        # Parse tool calls - native format first
         tool_calls: list[ToolCall] = []
         native_calls = message.get("tool_calls", [])
         if native_calls:
@@ -174,7 +267,6 @@ class LLMClient:
                     raw=json.dumps(tc),
                 ))
 
-        # Fallback: try to parse tool calls from text
         if not tool_calls and clean_content:
             tool_calls = _parse_tool_calls_from_text(clean_content)
 
@@ -186,6 +278,80 @@ class LLMClient:
             usage=data.get("usage", {}),
             model=data.get("model", model),
             raw_response=data,
+            latency_ms=latency,
+        )
+
+    def chat_stream(
+        self,
+        messages: list[dict[str, Any]],
+        model: str,
+        max_tokens: int = 4096,
+        temperature: float = 0.3,
+    ) -> Generator[tuple[str, str], None, LLMResponse]:
+        """Streaming chat completion. Yields (event_type, data) tuples.
+
+        event_type: "thinking", "text", "tool_buffering"
+
+        Returns final LLMResponse when generator is exhausted (use .send(None)
+        or iterate to completion — the return value is accessible via
+        StopIteration.value).
+        """
+        payload: dict[str, Any] = {
+            "model": model,
+            "messages": messages,
+            "max_tokens": max_tokens,
+            "temperature": temperature,
+            "stream": True,
+        }
+
+        start = time.monotonic()
+        processor = StreamProcessor()
+        model_name = model
+
+        try:
+            with self.client.stream("POST", "/chat/completions", json=payload) as resp:
+                resp.raise_for_status()
+                for raw_line in resp.iter_lines():
+                    if not raw_line.startswith("data: "):
+                        continue
+                    data_str = raw_line[6:].strip()
+                    if data_str == "[DONE]":
+                        break
+
+                    try:
+                        data = json.loads(data_str)
+                    except json.JSONDecodeError:
+                        continue
+
+                    choice = data.get("choices", [{}])[0]
+                    delta = choice.get("delta", {})
+                    chunk = delta.get("content", "")
+                    if not chunk:
+                        continue
+
+                    model_name = data.get("model", model)
+
+                    # Process chunk through state machine
+                    for event in processor.feed(chunk):
+                        yield event
+
+        except httpx.HTTPError as e:
+            latency = (time.monotonic() - start) * 1000
+            return LLMResponse(
+                content=f"[LLM API Error: {e}]",
+                finish_reason="error",
+                latency_ms=latency,
+            )
+
+        latency = (time.monotonic() - start) * 1000
+        thinking, content, tool_calls = processor.finish()
+
+        return LLMResponse(
+            content=content,
+            thinking=thinking,
+            tool_calls=tool_calls,
+            finish_reason="stop",
+            model=model_name,
             latency_ms=latency,
         )
 

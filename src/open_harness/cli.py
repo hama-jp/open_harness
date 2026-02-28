@@ -1,22 +1,18 @@
-"""CLI interface for Open Harness."""
+"""CLI interface for Open Harness with streaming support."""
 
 from __future__ import annotations
 
 import logging
-import os
 import sys
 import time
 
 import click
 from rich.console import Console
-from rich.live import Live
 from rich.markdown import Markdown
 from rich.panel import Panel
-from rich.text import Text
 
-from open_harness.agent import Agent, AgentStep
+from open_harness.agent import Agent, AgentEvent
 from open_harness.config import HarnessConfig, load_config
-from open_harness.llm.router import ModelRouter
 from open_harness.memory.store import MemoryStore
 from open_harness.tools.base import ToolRegistry
 from open_harness.tools.external import CodexTool, GeminiCliTool
@@ -33,10 +29,7 @@ console = Console()
 
 
 def setup_tools(config: HarnessConfig) -> ToolRegistry:
-    """Register all available tools."""
     registry = ToolRegistry()
-
-    # Core tools
     registry.register(ShellTool(config.tools.shell))
     registry.register(ReadFileTool(config.tools.file))
     registry.register(WriteFileTool())
@@ -44,14 +37,13 @@ def setup_tools(config: HarnessConfig) -> ToolRegistry:
     registry.register(ListDirectoryTool())
     registry.register(SearchFilesTool())
 
-    # External agents
-    if config.external_agents.get("codex", None) and config.external_agents["codex"].enabled:
+    if config.external_agents.get("codex") and config.external_agents["codex"].enabled:
         codex = CodexTool(config.external_agents["codex"].command)
         if codex.available:
             registry.register(codex)
             console.print("[dim]  codex CLI available[/dim]")
 
-    if config.external_agents.get("gemini", None) and config.external_agents["gemini"].enabled:
+    if config.external_agents.get("gemini") and config.external_agents["gemini"].enabled:
         gemini = GeminiCliTool(config.external_agents["gemini"].command)
         if gemini.available:
             registry.register(gemini)
@@ -60,50 +52,77 @@ def setup_tools(config: HarnessConfig) -> ToolRegistry:
     return registry
 
 
-def on_step(step: AgentStep):
-    """Callback for agent steps - shows progress to user."""
-    if step.step_type == "tool_call":
-        tool_name = step.metadata.get("tool", "?")
-        args = step.metadata.get("args", {})
-        args_short = str(args)
-        if len(args_short) > 100:
-            args_short = args_short[:100] + "..."
-        console.print(f"[yellow]> {tool_name}[/yellow] [dim]{args_short}[/dim]")
+class StreamingDisplay:
+    """Handles real-time display of agent events."""
 
-    elif step.step_type == "tool_result":
-        success = step.metadata.get("success", False)
-        icon = "[green]OK[/green]" if success else "[red]FAIL[/red]"
-        # Show truncated output
-        output = step.content
-        if len(output) > 500:
-            output = output[:500] + "\n..."
-        if output.strip():
-            console.print(Panel(
-                output,
-                title=f"{icon} {step.metadata.get('tool', '')}",
-                border_style="dim",
-                expand=False,
-            ))
+    def __init__(self, console: Console):
+        self.console = console
+        self._text_buffer = ""
+        self._streaming = False
 
-    elif step.step_type == "compensation":
-        console.print(f"[magenta]~ Compensating: {step.content}[/magenta]")
+    def handle_event(self, event: AgentEvent):
+        if event.type == "status":
+            self.console.print(f"[dim]{event.data}[/dim]", end="\r")
 
-    elif step.step_type == "llm_call":
-        console.print(f"[dim]{step.content}[/dim]", end="\r")
+        elif event.type == "thinking":
+            first_line = event.data.split("\n")[0][:80]
+            self.console.print(f"[dim italic]thinking: {first_line}...[/dim italic]")
 
-    elif step.step_type == "llm_response":
-        latency = step.metadata.get("latency_ms", 0)
-        if latency:
-            console.print(f"[dim]({latency:.0f}ms)[/dim]", end=" ")
-        thinking = step.metadata.get("thinking", "")
-        if thinking:
-            # Show first line of thinking
-            first_line = thinking.split("\n")[0][:80]
-            console.print(f"[dim italic]thinking: {first_line}...[/dim italic]")
+        elif event.type == "text":
+            if not self._streaming:
+                self._streaming = True
+                self.console.print()  # blank line before response
+            self._text_buffer += event.data
+            # Print chunk immediately — raw text, not markdown
+            self.console.print(event.data, end="", highlight=False)
+
+        elif event.type == "tool_call":
+            self._flush_stream()
+            tool = event.metadata.get("tool", "?")
+            args = event.metadata.get("args", {})
+            args_short = str(args)
+            if len(args_short) > 100:
+                args_short = args_short[:100] + "..."
+            self.console.print(f"[yellow]> {tool}[/yellow] [dim]{args_short}[/dim]")
+
+        elif event.type == "tool_result":
+            success = event.metadata.get("success", False)
+            icon = "[green]OK[/green]" if success else "[red]FAIL[/red]"
+            output = event.data
+            if len(output) > 500:
+                output = output[:500] + "\n..."
+            if output.strip():
+                self.console.print(Panel(
+                    output,
+                    title=f"{icon} {event.metadata.get('tool', '')}",
+                    border_style="dim",
+                    expand=False,
+                ))
+
+        elif event.type == "compensation":
+            self._flush_stream()
+            self.console.print(f"[magenta]~ Compensating: {event.data}[/magenta]")
+
+        elif event.type == "done":
+            if self._streaming:
+                # Already streamed text — just add newline
+                self.console.print()
+                self._streaming = False
+                self._text_buffer = ""
+            elif event.data:
+                # Non-streamed response (e.g., after tool calls where text wasn't streamed)
+                self.console.print()
+                self.console.print(Markdown(event.data))
+
+    def _flush_stream(self):
+        if self._streaming:
+            self.console.print()
+            self._streaming = False
+            self._text_buffer = ""
 
 
 def handle_command(cmd: str, agent: Agent, config: HarnessConfig) -> bool:
-    """Handle special commands. Returns True if command was handled."""
+    """Handle /commands. Returns True if handled."""
     parts = cmd.strip().split(maxsplit=1)
     command = parts[0].lower()
 
@@ -149,7 +168,7 @@ def handle_command(cmd: str, agent: Agent, config: HarnessConfig) -> bool:
 
 @click.command()
 @click.option("--config", "-c", "config_path", default=None, help="Path to config file")
-@click.option("--tier", "-t", default=None, help="Model tier to use (small/medium/large)")
+@click.option("--tier", "-t", default=None, help="Model tier (small/medium/large)")
 @click.option("--verbose", "-v", is_flag=True, help="Verbose logging")
 def main(config_path: str | None, tier: str | None, verbose: bool):
     """Open Harness - AI agent harness for local LLMs."""
@@ -158,7 +177,6 @@ def main(config_path: str | None, tier: str | None, verbose: bool):
     else:
         logging.basicConfig(level=logging.WARNING)
 
-    # Banner
     console.print(Panel(
         "[bold]Open Harness[/bold] v0.1.0\n"
         "AI agent harness optimized for local LLMs\n"
@@ -166,12 +184,10 @@ def main(config_path: str | None, tier: str | None, verbose: bool):
         border_style="blue",
     ))
 
-    # Load config
     config = load_config(config_path)
     if tier:
         config.llm.default_tier = tier
 
-    # Show current model
     try:
         model_cfg = config.llm.models.get(config.llm.default_tier)
         if model_cfg:
@@ -179,15 +195,14 @@ def main(config_path: str | None, tier: str | None, verbose: bool):
     except Exception:
         pass
 
-    # Setup
     tools = setup_tools(config)
     memory = MemoryStore(config.memory.db_path)
-    agent = Agent(config, tools, memory, on_step=on_step)
+    agent = Agent(config, tools, memory)
+    display = StreamingDisplay(console)
 
     console.print(f"[dim]Tools: {', '.join(t.name for t in tools.list_tools())}[/dim]")
     console.print()
 
-    # REPL
     try:
         while True:
             try:
@@ -200,21 +215,17 @@ def main(config_path: str | None, tier: str | None, verbose: bool):
             if not user_input:
                 continue
 
-            # Handle commands
             if user_input.startswith("/"):
                 if handle_command(user_input, agent, config):
                     if user_input.strip().split()[0] in ("/quit", "/exit", "/q"):
                         break
                     continue
 
-            # Run agent
             try:
                 start = time.monotonic()
-                response = agent.run(user_input)
+                for event in agent.run_stream(user_input):
+                    display.handle_event(event)
                 elapsed = time.monotonic() - start
-
-                console.print()
-                console.print(Markdown(response))
                 console.print(f"\n[dim]({elapsed:.1f}s)[/dim]")
                 console.print()
 

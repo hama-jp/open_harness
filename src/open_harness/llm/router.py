@@ -3,9 +3,9 @@
 from __future__ import annotations
 
 import logging
-from typing import Any
+from typing import Any, Generator
 
-from open_harness.config import HarnessConfig, ModelConfig, ProviderConfig
+from open_harness.config import HarnessConfig, ModelConfig
 from open_harness.llm.client import LLMClient, LLMResponse
 
 logger = logging.getLogger(__name__)
@@ -20,7 +20,6 @@ class ModelRouter:
         self._current_tier: str = config.llm.default_tier
 
     def _get_client(self, provider_name: str) -> LLMClient:
-        """Get or create a client for a provider."""
         if provider_name not in self._clients:
             provider_cfg = self.config.llm.providers.get(provider_name)
             if provider_cfg is None:
@@ -29,7 +28,6 @@ class ModelRouter:
         return self._clients[provider_name]
 
     def get_model_config(self, tier: str | None = None) -> ModelConfig:
-        """Get the model configuration for a tier."""
         tier = tier or self._current_tier
         cfg = self.config.llm.models.get(tier)
         if cfg is None:
@@ -55,11 +53,9 @@ class ModelRouter:
         max_tokens: int | None = None,
         temperature: float = 0.3,
     ) -> LLMResponse:
-        """Send a chat request using the specified tier's model."""
         tier = tier or self._current_tier
         model_cfg = self.get_model_config(tier)
         client = self._get_client(model_cfg.provider)
-
         return client.chat(
             messages=messages,
             model=model_cfg.model,
@@ -68,8 +64,28 @@ class ModelRouter:
             tools=tools,
         )
 
+    def chat_stream(
+        self,
+        messages: list[dict[str, Any]],
+        tier: str | None = None,
+        max_tokens: int | None = None,
+        temperature: float = 0.3,
+    ) -> Generator[tuple[str, str], None, LLMResponse]:
+        """Streaming chat via the specified tier's model.
+
+        Yields (event_type, data) and returns LLMResponse at completion.
+        """
+        tier = tier or self._current_tier
+        model_cfg = self.get_model_config(tier)
+        client = self._get_client(model_cfg.provider)
+        return client.chat_stream(
+            messages=messages,
+            model=model_cfg.model,
+            max_tokens=max_tokens or model_cfg.max_tokens,
+            temperature=temperature,
+        )
+
     def list_tiers(self) -> dict[str, str]:
-        """List available tiers and their descriptions."""
         return {
             name: cfg.description
             for name, cfg in self.config.llm.models.items()
