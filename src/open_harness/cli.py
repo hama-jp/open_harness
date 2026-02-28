@@ -370,7 +370,8 @@ def handle_command(cmd: str, agent: Agent, config: HarnessConfig, display: Strea
 
 
 @click.command()
-@click.option("--config", "-c", "config_path", default=None, help="Config file path")
+@click.option("--config", "-c", "config_path", default=None,
+              help="Path to open_harness.yaml (auto-detected from CWD, ~/.open_harness/, or repo root)")
 @click.option("--tier", "-t", default=None, help="Model tier")
 @click.option("--goal", "-g", "goal_text", default=None, help="Run a goal non-interactively and exit")
 @click.option("--verbose", "-v", is_flag=True, help="Verbose logging")
@@ -390,7 +391,11 @@ def main(config_path: str | None, tier: str | None, goal_text: str | None, verbo
         border_style="blue",
     ))
 
-    config = load_config(config_path)
+    config, config_file = load_config(config_path)
+    if config_file:
+        console.print(f"[dim]Config: {config_file}[/dim]")
+    else:
+        console.print("[dim]Config: defaults (no open_harness.yaml found)[/dim]")
     if tier:
         config.llm.default_tier = tier
 

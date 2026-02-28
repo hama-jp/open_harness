@@ -75,22 +75,48 @@ class HarnessConfig(BaseModel):
     policy: dict[str, Any] = Field(default_factory=dict)  # raw dict, parsed by PolicyEngine
 
 
-def load_config(config_path: str | Path | None = None) -> HarnessConfig:
-    """Load configuration from YAML file."""
+CONFIG_FILENAME = "open_harness.yaml"
+
+# Also accept legacy name for backwards compatibility
+_CONFIG_NAMES = [CONFIG_FILENAME, "config.yaml"]
+
+
+def load_config(
+    config_path: str | Path | None = None,
+) -> tuple[HarnessConfig, Path | None]:
+    """Load configuration from YAML file.
+
+    Returns (config, resolved_path).  *resolved_path* is ``None`` when
+    no file was found and built-in defaults are used.
+
+    Search order (first match wins):
+      1. Explicit ``--config`` path
+      2. Current working directory: ``./open_harness.yaml`` (or legacy ``config.yaml``)
+      3. User config dir: ``~/.open_harness/open_harness.yaml``
+      4. Package directory (development): ``<repo>/open_harness.yaml``
+
+    This allows placing ``open_harness.yaml`` in any project directory
+    to customize settings per-project.
+    """
     if config_path is None:
-        candidates = [
-            Path.cwd() / "config.yaml",
-            Path.home() / ".open_harness" / "config.yaml",
-            Path(__file__).parent.parent.parent / "config.yaml",
+        search_dirs = [
+            Path.cwd(),
+            Path.home() / ".open_harness",
+            Path(__file__).parent.parent.parent,  # repo root (dev mode)
         ]
-        for p in candidates:
-            if p.exists():
-                config_path = p
+        for d in search_dirs:
+            for name in _CONFIG_NAMES:
+                p = d / name
+                if p.exists():
+                    config_path = p
+                    break
+            if config_path:
                 break
 
-    if config_path and Path(config_path).exists():
-        with open(config_path) as f:
+    resolved: Path | None = Path(config_path) if config_path else None
+    if resolved and resolved.exists():
+        with open(resolved) as f:
             raw: dict[str, Any] = yaml.safe_load(f) or {}
-        return HarnessConfig.model_validate(raw)
+        return HarnessConfig.model_validate(raw), resolved.resolve()
 
-    return HarnessConfig()
+    return HarnessConfig(), None
