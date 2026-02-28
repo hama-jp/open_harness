@@ -6,24 +6,25 @@ import json
 import logging
 import time
 from dataclasses import dataclass, field
-from typing import Any, Callable, Generator
+from typing import Any, Generator
 
 from open_harness.config import HarnessConfig
 from open_harness.llm.client import LLMResponse, ToolCall
-from open_harness.llm.compensator import Compensator, build_tool_prompt
+from open_harness.llm.compensator import Compensator, build_tool_prompt, truncate_tool_output
 from open_harness.llm.router import ModelRouter
 from open_harness.memory.store import MemoryStore
-from open_harness.tools.base import ToolRegistry, ToolResult
+from open_harness.tools.base import ToolRegistry
 
 logger = logging.getLogger(__name__)
 
-MAX_AGENT_STEPS = 20
+MAX_AGENT_STEPS = 15  # Per-attempt limit
+TOOL_OUTPUT_LIMIT = 8000  # Chars — keeps context manageable for local LLMs
 
 
 @dataclass
 class AgentEvent:
     """Event emitted during agent execution."""
-    type: str  # "thinking", "text", "tool_call", "tool_result", "compensation", "status", "done"
+    type: str  # thinking, text, tool_call, tool_result, compensation, status, done
     data: str = ""
     metadata: dict[str, Any] = field(default_factory=dict)
 
@@ -54,28 +55,21 @@ class Agent:
         return self._system_prompt
 
     def run_stream(self, user_message: str) -> Generator[AgentEvent, None, None]:
-        """Process a user message, yielding events as they happen.
-
-        Events:
-          status       - progress info (e.g. "Calling model...")
-          thinking     - LLM thinking content
-          text         - displayable text chunk (stream to terminal)
-          tool_call    - about to execute a tool
-          tool_result  - tool execution result
-          compensation - retry/escalation info
-          done         - final complete response
-        """
+        """Process a user message, yielding events as they happen."""
         self.compensator.reset()
         self.memory.add_turn("user", user_message)
         messages = self._build_messages()
         tier = self.router.current_tier
 
-        for step in range(MAX_AGENT_STEPS):
-            yield AgentEvent("status", f"Calling {tier} model...")
+        step = 0
+        while step < MAX_AGENT_STEPS:
+            step += 1
 
-            # --- stream from LLM ---
+            yield AgentEvent("status", f"[{step}] {tier} model...")
+
             response = yield from self._stream_llm(messages, tier)
 
+            # --- API error → compensate ---
             if response.finish_reason == "error":
                 comp = self.compensator.next_strategy(
                     messages, response.content, "API error", tier,
@@ -97,9 +91,10 @@ class Agent:
                 yield AgentEvent("tool_call", tc.name, {"tool": tc.name, "args": tc.arguments})
 
                 result = self.tools.execute(tc.name, tc.arguments)
+                output = truncate_tool_output(result.to_message(), TOOL_OUTPUT_LIMIT)
+
                 yield AgentEvent(
-                    "tool_result",
-                    result.to_message(),
+                    "tool_result", output,
                     {"success": result.success, "tool": tc.name},
                 )
 
@@ -109,11 +104,11 @@ class Agent:
                 })
                 messages.append({
                     "role": "user",
-                    "content": f"[Tool Result for {tc.name}]\n{result.to_message()}",
+                    "content": f"[Tool Result for {tc.name}]\n{output}",
                 })
                 continue
 
-            # --- failed tool call? ---
+            # --- malformed tool call → compensate ---
             if self._looks_like_failed_tool_call(response.content):
                 comp = self.compensator.next_strategy(
                     messages, response.content, "Malformed tool call", tier,
@@ -126,34 +121,71 @@ class Agent:
                         tier = comp.escalated_tier
                     continue
 
-            # --- normal text response ---
+            # --- normal text → done ---
             self.memory.add_turn("assistant", response.content)
             yield AgentEvent("done", response.content, {"latency_ms": response.latency_ms})
             return
 
-        yield AgentEvent("done", "[Agent reached maximum steps.]")
+        # --- step limit reached → try escalation ---
+        comp = self.compensator.on_step_limit(messages, tier, step)
+        if comp and comp.success:
+            yield AgentEvent(
+                "compensation",
+                comp.notes,
+                {"strategy": comp.strategy, "from_tier": tier, "to_tier": comp.escalated_tier},
+            )
+            # Restart with escalated model and condensed context
+            messages = comp.modified_messages or messages
+            tier = comp.escalated_tier or tier
+            step = 0  # Reset step counter for the new tier
 
-    # ---- non-streaming fallback (kept for simple use cases) ----
+            # Run another loop with the escalated model
+            while step < MAX_AGENT_STEPS:
+                step += 1
+                yield AgentEvent("status", f"[{step}] {tier} model (escalated)...")
+
+                response = yield from self._stream_llm(messages, tier)
+
+                if response.has_tool_call:
+                    tc = response.tool_calls[0]
+                    yield AgentEvent("tool_call", tc.name, {"tool": tc.name, "args": tc.arguments})
+
+                    result = self.tools.execute(tc.name, tc.arguments)
+                    output = truncate_tool_output(result.to_message(), TOOL_OUTPUT_LIMIT)
+                    yield AgentEvent(
+                        "tool_result", output,
+                        {"success": result.success, "tool": tc.name},
+                    )
+                    messages.append({
+                        "role": "assistant",
+                        "content": f'{{"tool": "{tc.name}", "args": {_safe_json(tc.arguments)}}}',
+                    })
+                    messages.append({
+                        "role": "user",
+                        "content": f"[Tool Result for {tc.name}]\n{output}",
+                    })
+                    continue
+
+                self.memory.add_turn("assistant", response.content)
+                yield AgentEvent("done", response.content)
+                return
+
+        yield AgentEvent("done", "[Agent reached maximum steps. Try a simpler request or use /tier large.]")
 
     def run(self, user_message: str) -> str:
-        """Non-streaming convenience wrapper. Returns final text."""
+        """Non-streaming convenience wrapper."""
         final = ""
         for event in self.run_stream(user_message):
             if event.type == "done":
                 final = event.data
         return final
 
-    # ---- internal helpers ----
-
     def _stream_llm(
         self,
         messages: list[dict[str, Any]],
         tier: str,
     ) -> Generator[AgentEvent, None, LLMResponse]:
-        """Stream LLM response, yielding thinking/text events.
-
-        Returns the final LLMResponse.
-        """
+        """Stream LLM response, yielding thinking/text events."""
         gen = self.router.chat_stream(messages=messages, tier=tier, temperature=0.3)
 
         response: LLMResponse | None = None

@@ -4,13 +4,12 @@ Strategies to help local LLMs succeed at tool calling and complex tasks:
 1. Parse fallback - extract tool calls from messy output
 2. Prompt refinement - add examples, rephrase, add CoT
 3. Model escalation - try larger models
-4. Task decomposition - break complex tasks into steps
-5. Self-verification - have LLM check its own output
+4. Output truncation - reduce tool output size for weak models
+5. Step-limit escalation - auto-escalate when hitting step limits
 """
 
 from __future__ import annotations
 
-import json
 import logging
 from dataclasses import dataclass
 from typing import Any
@@ -18,6 +17,8 @@ from typing import Any
 from open_harness.config import CompensationConfig
 
 logger = logging.getLogger(__name__)
+
+TIER_ORDER = ["small", "medium", "large"]
 
 
 @dataclass
@@ -36,9 +37,11 @@ class Compensator:
     def __init__(self, config: CompensationConfig):
         self.config = config
         self._attempt_count = 0
+        self._step_escalation_used = False
 
     def reset(self):
         self._attempt_count = 0
+        self._step_escalation_used = False
 
     @property
     def attempts_remaining(self) -> int:
@@ -51,10 +54,7 @@ class Compensator:
         error_context: str,
         current_tier: str,
     ) -> CompensationResult | None:
-        """Determine the next compensation strategy to try.
-
-        Returns None if all retries exhausted.
-        """
+        """Determine the next compensation strategy to try."""
         if self._attempt_count >= self.config.max_retries:
             return None
 
@@ -76,13 +76,48 @@ class Compensator:
             logger.warning(f"Unknown compensation strategy: {strategy}")
             return None
 
+    def on_step_limit(
+        self,
+        messages: list[dict[str, Any]],
+        current_tier: str,
+        step_count: int,
+    ) -> CompensationResult | None:
+        """Called when agent reaches step limit. Tries model escalation.
+
+        Returns None if escalation is not possible.
+        """
+        if self._step_escalation_used:
+            return None
+
+        next_tier = _next_tier(current_tier)
+        if next_tier is None:
+            return None
+
+        self._step_escalation_used = True
+
+        # Summarize conversation so far to reduce context size
+        summary_msg = (
+            "The previous attempt used too many steps and could not complete. "
+            "You are now using a more capable model. "
+            "Please complete the original task efficiently, using fewer tool calls. "
+            "Combine operations where possible (e.g., use shell pipes)."
+        )
+        condensed = _condense_messages(messages, summary_msg)
+
+        return CompensationResult(
+            strategy="step_limit_escalation",
+            success=True,
+            modified_messages=condensed,
+            escalated_tier=next_tier,
+            notes=f"Step limit reached ({step_count} steps). Escalating {current_tier} -> {next_tier}",
+        )
+
     def _refine_prompt(
         self,
         messages: list[dict[str, Any]],
         failed_response: str,
         error_context: str,
     ) -> CompensationResult:
-        """Add explicit correction to the conversation."""
         correction = (
             f"Your previous response could not be processed. "
             f"Error: {error_context}\n\n"
@@ -92,7 +127,6 @@ class Compensator:
             f"- To respond normally, just write text without any JSON tool calls.\n"
             f"- Do NOT wrap tool calls in code blocks or add extra text around them."
         )
-
         refined = list(messages)
         refined.append({"role": "assistant", "content": failed_response})
         refined.append({"role": "user", "content": correction})
@@ -110,7 +144,6 @@ class Compensator:
         failed_response: str,
         error_context: str,
     ) -> CompensationResult:
-        """Add few-shot examples to help the model understand the format."""
         example_msg = (
             f"Your previous response could not be processed. "
             f"Error: {error_context}\n\n"
@@ -123,7 +156,6 @@ class Compensator:
             f"The function calculates the factorial of a number using recursion.\n\n"
             f"Now please try again with the correct format."
         )
-
         refined = list(messages)
         refined.append({"role": "assistant", "content": failed_response})
         refined.append({"role": "user", "content": example_msg})
@@ -136,27 +168,89 @@ class Compensator:
         )
 
     def _escalate_model(self, current_tier: str) -> CompensationResult:
-        """Suggest using a larger model."""
-        tier_order = ["small", "medium", "large"]
-        try:
-            idx = tier_order.index(current_tier)
-        except ValueError:
-            idx = 0
-
-        if idx < len(tier_order) - 1:
-            next_tier = tier_order[idx + 1]
+        next_tier = _next_tier(current_tier)
+        if next_tier:
             return CompensationResult(
                 strategy="escalate_model",
                 success=True,
                 escalated_tier=next_tier,
                 notes=f"Escalating from {current_tier} to {next_tier}",
             )
-        else:
-            return CompensationResult(
-                strategy="escalate_model",
-                success=False,
-                notes=f"Already at highest tier ({current_tier}), cannot escalate",
-            )
+        return CompensationResult(
+            strategy="escalate_model",
+            success=False,
+            notes=f"Already at highest tier ({current_tier}), cannot escalate",
+        )
+
+
+def _next_tier(current: str) -> str | None:
+    """Get the next tier up, or None if already at max."""
+    try:
+        idx = TIER_ORDER.index(current)
+    except ValueError:
+        return None
+    if idx < len(TIER_ORDER) - 1:
+        return TIER_ORDER[idx + 1]
+    return None
+
+
+def _condense_messages(
+    messages: list[dict[str, Any]],
+    summary_prefix: str,
+) -> list[dict[str, Any]]:
+    """Condense a long message history, keeping system prompt and user request.
+
+    Truncates tool results to save context window for the larger model.
+    """
+    if not messages:
+        return messages
+
+    condensed: list[dict[str, Any]] = []
+
+    # Keep system prompt
+    if messages[0].get("role") == "system":
+        condensed.append(messages[0])
+
+    # Find original user request (first user message)
+    original_request = ""
+    for m in messages:
+        if m.get("role") == "user" and not m["content"].startswith("[Tool Result"):
+            original_request = m["content"]
+            break
+
+    # Collect tool results summary
+    tool_summary_parts = []
+    for m in messages:
+        content = m.get("content", "")
+        if content.startswith("[Tool Result for "):
+            # Extract tool name and truncate result
+            first_line = content.split("\n")[0]
+            result_preview = content[len(first_line):].strip()
+            if len(result_preview) > 200:
+                result_preview = result_preview[:200] + "..."
+            tool_summary_parts.append(f"{first_line}\n{result_preview}")
+
+    # Build condensed user message
+    parts = [summary_prefix, "", f"Original request: {original_request}"]
+    if tool_summary_parts:
+        parts.append("")
+        parts.append("Previous tool results (summarized):")
+        for ts in tool_summary_parts[-5:]:  # Keep last 5 tool results
+            parts.append(ts)
+
+    condensed.append({"role": "user", "content": "\n".join(parts)})
+    return condensed
+
+
+def truncate_tool_output(output: str, max_length: int = 5000) -> str:
+    """Truncate tool output to fit within context constraints.
+
+    Keeps the beginning and end for context.
+    """
+    if len(output) <= max_length:
+        return output
+    half = max_length // 2
+    return output[:half] + f"\n\n... [{len(output) - max_length} chars truncated] ...\n\n" + output[-half:]
 
 
 def build_tool_prompt(tools_description: str, thinking_mode: str = "auto") -> str:
@@ -187,10 +281,12 @@ IMPORTANT RULES:
 - When you want to respond to the user (not use a tool), just write your response as normal text
 - After receiving a tool result, analyze it and either call another tool or respond to the user
 - If a tool fails, try a different approach or explain the issue
+- Prefer combining operations (e.g., shell pipes like `find ... | wc -l`) over many small tool calls
 
 ## Working Style
 
-- Break complex tasks into steps
+- Break complex tasks into steps, but minimize the number of tool calls
+- Use shell pipes and command chaining to do multiple things in one call
 - Verify your work when possible
 - If something fails, try alternative approaches before giving up
 - Be concise but thorough in your responses"""
