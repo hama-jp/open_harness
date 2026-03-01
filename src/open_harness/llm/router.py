@@ -5,6 +5,8 @@ from __future__ import annotations
 import logging
 from typing import Any, Generator
 
+import httpx
+
 from open_harness.config import HarnessConfig, ModelConfig
 from open_harness.llm.client import LLMClient, LLMResponse
 
@@ -95,6 +97,6 @@ class ModelRouter:
         for name, client in self._clients.items():
             try:
                 client.close()
-            except Exception:
-                pass
+            except (OSError, httpx.HTTPError) as e:
+                logger.debug("Error closing client %s: %s", name, e)
         self._clients.clear()

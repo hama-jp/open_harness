@@ -362,6 +362,11 @@ class InputQueue:
                 break
         return items
 
+    def requeue(self, items: list[str]):
+        """Put items back into the queue."""
+        for item in items:
+            self._queue.put(item)
+
     def _reader(self):
         while self._active:
             try:
@@ -373,7 +378,8 @@ class InputQueue:
                         if line:
                             self._queue.put(line)
                             console.print(f"\n[yellow]⏩ Queued: {line[:60]}[/yellow]")
-            except Exception:
+            except (OSError, ValueError):
+                # stdin closed or invalid fd — stop reading
                 break
 
 
@@ -799,13 +805,13 @@ def main(config_path: str | None, tier: str | None, goal_text: str | None,
     else:
         console.print(f"[dim]Git: {git_status}[/dim]")
 
-    try:
-        model_cfg = config.llm.models.get(config.llm.default_tier)
-        if model_cfg:
+    model_cfg = config.llm.models.get(config.llm.default_tier)
+    if model_cfg:
+        try:
+            from urllib.parse import urlparse
             provider_cfg = config.llm.providers.get(model_cfg.provider)
             location = ""
             if provider_cfg:
-                from urllib.parse import urlparse
                 host = urlparse(provider_cfg.base_url).hostname or ""
                 if host in ("localhost", "127.0.0.1", "::1"):
                     location = " (local)"
@@ -815,8 +821,8 @@ def main(config_path: str | None, tier: str | None, goal_text: str | None,
                 f"[dim]Model: {model_cfg.model} ({config.llm.default_tier})"
                 f" @ {model_cfg.provider}{location}[/dim]"
             )
-    except Exception:
-        pass
+        except (KeyError, ValueError) as e:
+            logging.getLogger(__name__).debug("Model display error: %s", e)
 
     # Main agent for interactive use
     tools = setup_tools(config, project)
@@ -904,8 +910,7 @@ def main(config_path: str | None, tier: str | None, goal_text: str | None,
             if queued:
                 user_input = queued[0]
                 # Put remaining items back
-                for q in queued[1:]:
-                    input_queue._queue.put(q)
+                input_queue.requeue(queued[1:])
                 console.print(f"\n[yellow]⏩ Running queued: {user_input[:60]}[/yellow]")
             else:
                 try:
