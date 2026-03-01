@@ -561,9 +561,10 @@ def main(config_path: str | None, tier: str | None, goal_text: str | None,
         mode = _modes[_mode_index[0]]
         cols = shutil.get_terminal_size().columns
         line = "─" * cols
+        color = _mode_colors[mode]
         return HTML(
             f"<dim>{line}</dim>\n"
-            f"  <b>⏵⏵ {_mode_labels[mode]}</b>"
+            f"  <{color}><b>⏵⏵ {_mode_labels[mode]}</b></{color}>"
             f"  <dim>(shift+tab to cycle)</dim>"
         )
 
