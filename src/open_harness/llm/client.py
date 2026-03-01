@@ -19,6 +19,18 @@ _logger = logging.getLogger(__name__)
 _MAX_RETRIES = 3
 _BACKOFF_BASE = 1  # seconds — exponential: 1, 2, 4
 
+# OOM detection keywords in Ollama error responses
+_OOM_KEYWORDS = (
+    "out of memory", "oom", "exit status 2", "not enough memory", "alloc",
+    "unexpectedly stopped", "resource limitations",
+)
+
+
+def _is_oom_error(body: str) -> bool:
+    """Check if an Ollama error body indicates an out-of-memory condition."""
+    lower = body.lower()
+    return any(kw in lower for kw in _OOM_KEYWORDS)
+
 
 @dataclass
 class ToolCall:
@@ -520,9 +532,26 @@ class LLMClient:
             try:
                 resp = self.client.post("/api/chat", json=payload)
                 if resp.status_code in (429, 500, 502, 503, 504):
-                    _logger.warning(
-                        "Ollama API returned %d (attempt %d/%d), retrying...",
-                        resp.status_code, attempt + 1, _MAX_RETRIES)
+                    # Check for OOM — reduce num_ctx and retry
+                    body = ""
+                    try:
+                        body = resp.text
+                    except Exception:
+                        pass
+                    if resp.status_code == 500 and _is_oom_error(body):
+                        current_ctx = payload.get("options", {}).get("num_ctx", 0)
+                        if current_ctx > 8192:
+                            new_ctx = current_ctx // 2
+                            payload.setdefault("options", {})["num_ctx"] = new_ctx
+                            _logger.warning(
+                                "Ollama OOM with num_ctx=%d, reducing to %d",
+                                current_ctx, new_ctx)
+                        else:
+                            _logger.warning("Ollama OOM at minimum num_ctx, retrying...")
+                    else:
+                        _logger.warning(
+                            "Ollama API returned %d (attempt %d/%d), retrying...",
+                            resp.status_code, attempt + 1, _MAX_RETRIES)
                     time.sleep(_BACKOFF_BASE * (2 ** attempt))
                     continue
                 resp.raise_for_status()
@@ -632,8 +661,25 @@ class LLMClient:
                     "POST", "/api/chat", json=payload
                 ) as resp:
                     if resp.status_code in (429, 500, 502, 503, 504):
-                        _logger.warning("Ollama stream returned %d, retrying...",
-                                        resp.status_code)
+                        # Check for OOM — reduce num_ctx and retry
+                        body = ""
+                        try:
+                            body = resp.read().decode(errors="replace")
+                        except Exception:
+                            pass
+                        if resp.status_code == 500 and _is_oom_error(body):
+                            current_ctx = payload.get("options", {}).get("num_ctx", 0)
+                            if current_ctx > 8192:
+                                new_ctx = current_ctx // 2
+                                payload.setdefault("options", {})["num_ctx"] = new_ctx
+                                _logger.warning(
+                                    "Ollama OOM with num_ctx=%d, reducing to %d",
+                                    current_ctx, new_ctx)
+                            else:
+                                _logger.warning("Ollama OOM at minimum num_ctx, retrying...")
+                        else:
+                            _logger.warning("Ollama stream returned %d, retrying...",
+                                            resp.status_code)
                         time.sleep(_BACKOFF_BASE * (2 ** attempt))
                         processor = StreamProcessor()
                         continue

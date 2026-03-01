@@ -19,8 +19,8 @@ llm:
   # Model tiers for routing (small → medium → large)
   # context_length = num_ctx (Ollama KV cache size)
   #   32K  → fits in VRAM → fastest
-  #   65K  → VRAM + some RAM spill → balanced
-  #   131K → RAM-heavy → for orchestration with large context
+  #   49K  → VRAM balanced → good for multi-turn
+  #   65K  → near VRAM limit → for long orchestration
   models:
     small:
       provider: "ollama"
@@ -33,15 +33,15 @@ llm:
       provider: "ollama"
       model: "qwen3.5:27b"
       max_tokens: 8192
-      context_length: 65536
-      description: "Balanced performance (64K ctx)"
+      context_length: 49152
+      description: "Balanced performance (48K ctx)"
 
     large:
       provider: "ollama"
       model: "qwen3.5:27b"
       max_tokens: 16384
-      context_length: 131072
-      description: "Complex reasoning (128K ctx)"
+      context_length: 65536
+      description: "Complex reasoning (64K ctx)"
 
     # vision:
     #   provider: "lm_studio"

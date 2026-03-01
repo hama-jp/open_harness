@@ -162,15 +162,15 @@ def _build_yaml(
       provider: "{provider_key}"
       model: "{model_name}"
       max_tokens: 8192
-      context_length: 65536
-      description: "Balanced performance (64K ctx)"
+      context_length: 49152
+      description: "Balanced performance (48K ctx)"
 
     large:
       provider: "{provider_key}"
       model: "{model_name}"
       max_tokens: 16384
-      context_length: 131072
-      description: "Complex reasoning (128K ctx)\""""
+      context_length: 65536
+      description: "Complex reasoning (64K ctx)\""""
     else:
         models_block = f"""\
     small:
