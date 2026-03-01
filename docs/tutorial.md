@@ -109,17 +109,17 @@ llm:
   models:
     small:
       provider: "lm_studio"
-      model: "qwen/qwen3.5-35b-a3b"
+      model: "unsloth/qwen3.5-35b-a3b@q4_k_m"
       max_tokens: 4096
       description: "Fast, simple tasks"
     medium:
       provider: "lm_studio"
-      model: "qwen/qwen3.5-35b-a3b"
+      model: "unsloth/qwen3.5-35b-a3b@q4_k_m"
       max_tokens: 8192
       description: "Balanced performance"
     large:
       provider: "lm_studio"
-      model: "qwen/qwen3.5-35b-a3b"
+      model: "unsloth/qwen3.5-35b-a3b@q4_k_m"
       max_tokens: 16384
       description: "Complex reasoning"
 
@@ -201,7 +201,7 @@ llm:
   models:
     medium:
       provider: "lm_studio"
-      model: "qwen/qwen3.5-35b-a3b"
+      model: "unsloth/qwen3.5-35b-a3b@q4_k_m"
       max_tokens: 8192
 ```
 
@@ -226,7 +226,7 @@ On startup, Open Harness displays:
 Config: /home/you/project/open_harness.yaml
 Project: python @ /home/you/project
 Tests: python3 -m pytest
-Model: qwen/qwen3.5-35b-a3b (medium)
+Model: unsloth/qwen3.5-35b-a3b@q4_k_m (medium)
 Tools (14): shell, read_file, write_file, ...
 Git: already initialized
 Task queue: ready

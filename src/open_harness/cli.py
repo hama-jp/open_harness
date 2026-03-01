@@ -4,9 +4,12 @@ from __future__ import annotations
 
 import logging
 import os
+import queue as _queue_mod
+import select
 import shutil
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -243,10 +246,9 @@ class StreamingDisplay:
 # Command handlers
 # ---------------------------------------------------------------------------
 
-import queue as _queue_mod
-
-# Module-level task queue (set up in main)
+# Module-level task queue and input queue (set up in main)
 _task_queue: TaskQueueManager | None = None
+_input_queue: InputQueue | None = None
 # Thread-safe notification queue to avoid interleaving console output
 _notifications: _queue_mod.Queue[TaskRecord] = _queue_mod.Queue()
 
@@ -332,6 +334,49 @@ def _expand_at_references(text: str, project_root: Path, max_size: int = 50_000)
     return text
 
 
+class InputQueue:
+    """Captures stdin input during agent execution for queuing next instructions."""
+
+    def __init__(self):
+        self._queue: _queue_mod.Queue[str] = _queue_mod.Queue()
+        self._active = False
+        self._thread: threading.Thread | None = None
+
+    def start(self):
+        """Start capturing stdin in background."""
+        self._active = True
+        self._thread = threading.Thread(target=self._reader, daemon=True)
+        self._thread.start()
+
+    def stop(self):
+        """Stop capturing. Thread exits on next select timeout."""
+        self._active = False
+
+    def drain(self) -> list[str]:
+        """Return all queued instructions."""
+        items: list[str] = []
+        while not self._queue.empty():
+            try:
+                items.append(self._queue.get_nowait())
+            except _queue_mod.Empty:
+                break
+        return items
+
+    def _reader(self):
+        while self._active:
+            try:
+                readable, _, _ = select.select([sys.stdin], [], [], 0.5)
+                if readable:
+                    line = sys.stdin.readline()
+                    if line:
+                        line = line.strip()
+                        if line:
+                            self._queue.put(line)
+                            console.print(f"\n[yellow]⏩ Queued: {line[:60]}[/yellow]")
+            except Exception:
+                break
+
+
 def handle_command(cmd: str, agent: Agent, config: HarnessConfig, display: StreamingDisplay) -> bool | str:
     """Handle /commands. Returns True if handled, 'quit' to exit."""
     global _task_queue
@@ -409,8 +454,14 @@ def handle_command(cmd: str, agent: Agent, config: HarnessConfig, display: Strea
                           "LLM requests may queue.[/yellow]")
         arg = _expand_at_references(arg, agent.project.root)
         start = time.monotonic()
-        for event in agent.run_goal(arg):
-            display.handle(event)
+        if _input_queue:
+            _input_queue.start()
+        try:
+            for event in agent.run_goal(arg):
+                display.handle(event)
+        finally:
+            if _input_queue:
+                _input_queue.stop()
         elapsed = time.monotonic() - start
         console.print(f"\n[dim]Goal completed in {elapsed:.1f}s[/dim]\n")
         return True
@@ -574,26 +625,106 @@ def handle_command(cmd: str, agent: Agent, config: HarnessConfig, display: Strea
     return False
 
 
+def init_harness(
+    config_path: str | None,
+    tier: str | None,
+    verbose: bool,
+):
+    """Shared initialization for CLI and TUI.
+
+    Returns (version, config, config_file, project, tools, memory, agent,
+             task_store, task_queue, agent_factory).
+    """
+    if verbose:
+        logging.basicConfig(level=logging.DEBUG)
+    else:
+        logging.basicConfig(level=logging.WARNING)
+
+    version = get_version()
+
+    config, config_file = load_config(config_path)
+    if config_file is None and config_path is None:
+        console.print("[yellow]No open_harness.yaml found.[/yellow]")
+        if click.confirm("Run setup wizard to create one?", default=True):
+            from open_harness.setup_wizard import run_setup_wizard
+            created = run_setup_wizard()
+            config, config_file = load_config(str(created))
+        else:
+            console.print("[dim]Using defaults. Create open_harness.yaml manually later.[/dim]")
+    if tier:
+        config.llm.default_tier = tier
+
+    project = ProjectContext()
+    project.ensure_git()
+
+    tools = setup_tools(config, project)
+    memory = MemoryStore(config.memory.db_path, max_turns=config.memory.max_conversation_turns)
+    agent = Agent(config, tools, memory, project)
+
+    task_store = TaskStore(config.memory.db_path)
+    agent_factory = create_agent_factory(config, project)
+    task_queue = TaskQueueManager(
+        task_store, agent_factory, on_complete=_on_task_complete)
+    task_queue.start()
+
+    return (version, config, config_file, project, tools, memory, agent,
+            task_store, task_queue, agent_factory)
+
+
 @click.command()
 @click.option("--config", "-c", "config_path", default=None,
               help="Path to open_harness.yaml (auto-detected from CWD, ~/.open_harness/, or repo root)")
 @click.option("--tier", "-t", default=None, help="Model tier")
 @click.option("--goal", "-g", "goal_text", default=None, help="Run a goal non-interactively and exit")
 @click.option("--update", "-u", "do_update", is_flag=True, help="Update Open Harness to latest version and exit")
+@click.option("--tui", is_flag=True, help="Launch Textual TUI")
 @click.option("--verbose", "-v", is_flag=True, help="Verbose logging")
 def main(config_path: str | None, tier: str | None, goal_text: str | None,
-         do_update: bool, verbose: bool):
+         do_update: bool, tui: bool, verbose: bool):
     """Open Harness - self-driving AI agent for local LLMs."""
-    global _task_queue
+    global _task_queue, _input_queue
+
+    if do_update:
+        if verbose:
+            logging.basicConfig(level=logging.DEBUG)
+        else:
+            logging.basicConfig(level=logging.WARNING)
+        self_update()
+        return
+
+    if tui:
+        try:
+            from open_harness.tui.app import HarnessApp
+        except ImportError:
+            console.print("[red]Textual not installed. Run: uv pip install -e '.[tui]'[/red]")
+            return
+        (version, config, config_file, project, tools, memory, agent,
+         task_store, task_queue, agent_factory) = init_harness(config_path, tier, verbose)
+        _task_queue = task_queue
+        app = HarnessApp(
+            config=config,
+            project=project,
+            agent=agent,
+            tools=tools,
+            memory=memory,
+            task_queue=task_queue,
+            task_store=task_store,
+            version=version,
+        )
+        try:
+            app.run()
+        finally:
+            agent.close()
+            task_queue.shutdown()
+            task_store.close()
+            agent.router.close()
+            memory.close()
+        return
 
     if verbose:
         logging.basicConfig(level=logging.DEBUG)
     else:
         logging.basicConfig(level=logging.WARNING)
-
-    if do_update:
-        self_update()
-        return
 
     version = get_version()
 
@@ -630,6 +761,14 @@ def main(config_path: str | None, tier: str | None, goal_text: str | None,
     )
 
     config, config_file = load_config(config_path)
+    if config_file is None and config_path is None and not goal_text:
+        console.print("[yellow]No open_harness.yaml found.[/yellow]")
+        if click.confirm("Run setup wizard to create one?", default=True):
+            from open_harness.setup_wizard import run_setup_wizard
+            created = run_setup_wizard()
+            config, config_file = load_config(str(created))
+        else:
+            console.print("[dim]Using defaults. Create open_harness.yaml manually later.[/dim]")
     if config_file:
         console.print(f"[dim]Config: {config_file}[/dim]")
     else:
@@ -746,13 +885,25 @@ def main(config_path: str | None, tier: str | None, goal_text: str | None,
         history=FileHistory(str(history_path)),
     )
 
+    _input_queue = InputQueue()
+    input_queue = _input_queue
+
     try:
         while True:
-            try:
-                user_input = session.prompt(_get_prompt).strip()
-            except (EOFError, KeyboardInterrupt):
-                console.print("\n[dim]Goodbye![/dim]")
-                break
+            # Check for queued instructions first
+            queued = input_queue.drain()
+            if queued:
+                user_input = queued[0]
+                # Put remaining items back
+                for q in queued[1:]:
+                    input_queue._queue.put(q)
+                console.print(f"\n[yellow]⏩ Running queued: {user_input[:60]}[/yellow]")
+            else:
+                try:
+                    user_input = session.prompt(_get_prompt).strip()
+                except (EOFError, KeyboardInterrupt):
+                    console.print("\n[dim]Goodbye![/dim]")
+                    break
 
             if not user_input:
                 _drain_notifications()
@@ -777,19 +928,24 @@ def main(config_path: str | None, tier: str | None, goal_text: str | None,
                 start = time.monotonic()
 
                 if mode == "chat":
+                    input_queue.start()
                     for event in agent.run_stream(user_input):
                         display.handle(event)
+                    input_queue.stop()
                     console.print(f"\n[dim]({time.monotonic() - start:.1f}s)[/dim]\n")
 
                 elif mode == "goal":
                     if _task_queue and _task_queue.is_busy():
                         console.print("[yellow]Warning: a background task is running. "
                                       "LLM requests may queue.[/yellow]")
+                    input_queue.start()
                     for event in agent.run_goal(user_input):
                         display.handle(event)
+                    input_queue.stop()
                     console.print(f"\n[dim]Goal completed in {time.monotonic() - start:.1f}s[/dim]\n")
 
                 elif mode == "submit":
+                    # submit returns immediately, no need for input queuing
                     if not _task_queue:
                         console.print("[red]Task queue not initialized.[/red]")
                         continue
@@ -799,6 +955,7 @@ def main(config_path: str | None, tier: str | None, goal_text: str | None,
                     console.print(f"[dim]Check: /tasks | /result {task.id}[/dim]")
 
             except Exception as e:
+                input_queue.stop()
                 console.print(f"[red]Error: {e}[/red]")
                 if verbose:
                     console.print_exception()

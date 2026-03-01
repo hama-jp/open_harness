@@ -614,6 +614,21 @@ class Agent:
                                 retry_agent, result.to_message())
                             yield AgentEvent("compensation",
                                 f"{retry_agent} also rate-limited")
+                    else:
+                        # All external agents are rate-limited — tell the LLM
+                        # so it can try a different approach instead of looping
+                        cooldown_info = self.rate_limiter.status_summary()
+                        result = ToolResult(
+                            success=False, output="",
+                            error=(
+                                f"All external agents are rate-limited. "
+                                f"{cooldown_info} "
+                                f"Use local tools (shell, read_file, write_file, "
+                                f"edit_file) to proceed without external agents."
+                            ),
+                        )
+                        yield AgentEvent("compensation",
+                            "All external agents rate-limited — falling back to local tools")
 
                 output = truncate_tool_output(result.to_message(), 8000)
                 yield AgentEvent("tool_result", output,
@@ -718,7 +733,8 @@ class Agent:
             "```json" in content and '"tool"' in content,
             content.strip().startswith("{") and '"tool_call"' in content,
         ]
-        return any(indicators) and len(content) < 500
+        # Allow up to 2000 chars — weak LLMs often wrap tool calls in prose
+        return any(indicators) and len(content) < 2000
 
 
 

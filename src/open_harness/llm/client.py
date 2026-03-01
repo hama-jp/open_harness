@@ -51,42 +51,97 @@ def _extract_thinking(text: str) -> tuple[str, str]:
     return thinking, cleaned
 
 
+def _extract_balanced_json(text: str, start: int) -> str | None:
+    """Extract a balanced JSON object starting at *start* (must be '{').
+
+    Handles nested braces and quoted strings so that `{"args": {"k": "v"}}`
+    is captured in full rather than truncated at the first '}'.
+    """
+    if start >= len(text) or text[start] != "{":
+        return None
+    depth = 0
+    in_string = False
+    escape = False
+    for i in range(start, len(text)):
+        ch = text[i]
+        if escape:
+            escape = False
+            continue
+        if ch == "\\":
+            escape = True
+            continue
+        if ch == '"':
+            in_string = not in_string
+            continue
+        if in_string:
+            continue
+        if ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                return text[start:i + 1]
+    return None
+
+
 def _parse_tool_calls_from_text(text: str) -> list[ToolCall]:
     """Try to extract tool calls from free-form text."""
     calls = []
 
-    # Try code block extraction first
+    # Strategy 1: fenced code block — ```json ... ```
     code_block_pattern = r"```(?:json)?\s*(\{.*?\})\s*```"
     matches = re.findall(code_block_pattern, text, re.DOTALL)
 
+    # Strategy 2: bare {"tool": ...} with balanced brace matching
     if not matches:
-        bare_json_pattern = r'(\{"tool"\s*:\s*"[^"]+"\s*,\s*"args"\s*:\s*\{.*?\}\s*\})'
-        matches = re.findall(bare_json_pattern, text, re.DOTALL)
+        bare_starts = [m.start() for m in re.finditer(r'\{"tool"\s*:', text)]
+        for pos in bare_starts:
+            obj = _extract_balanced_json(text, pos)
+            if obj:
+                matches.append(obj)
 
+    # Strategy 3: entire text is a JSON object
     if not matches:
-        # Try parsing entire text as JSON
         stripped = text.strip()
         if stripped.startswith("{") and stripped.endswith("}"):
             matches = [stripped]
 
+    # Strategy 4: alternate {"tool_call": ...} format
     if not matches:
-        alt_pattern = r'(\{"tool_call"\s*:\s*\{.*?\}\s*\})'
-        matches = re.findall(alt_pattern, text, re.DOTALL)
+        alt_starts = [m.start() for m in re.finditer(r'\{"tool_call"\s*:', text)]
+        for pos in alt_starts:
+            obj = _extract_balanced_json(text, pos)
+            if obj:
+                matches.append(obj)
 
     for match in matches:
         try:
             data = json.loads(match)
             if "tool" in data and "args" in data:
+                args = data.get("args", {})
+                # Ensure args is a dict (weak LLMs may emit a JSON string)
+                if isinstance(args, str):
+                    try:
+                        args = json.loads(args)
+                    except (json.JSONDecodeError, ValueError):
+                        args = {"prompt": args}
                 calls.append(ToolCall(
                     name=data["tool"],
-                    arguments=data.get("args", {}),
+                    arguments=args,
                     raw=match,
                 ))
             elif "tool_call" in data:
                 tc = data["tool_call"]
+                args = tc.get("arguments", tc.get("args", {}))
+                # Ensure args is a dict
+                if isinstance(args, str):
+                    try:
+                        args = json.loads(args)
+                    except (json.JSONDecodeError, ValueError):
+                        args = {"prompt": args}
                 calls.append(ToolCall(
                     name=tc.get("name", tc.get("tool", "")),
-                    arguments=tc.get("arguments", tc.get("args", {})),
+                    arguments=args,
                     raw=match,
                 ))
         except (json.JSONDecodeError, KeyError):
@@ -109,6 +164,9 @@ class StreamProcessor:
       text      - streaming normal text
       tool      - buffering a tool call (not displayed until complete)
     """
+
+    # Fenced code block markers that indicate the LLM is wrapping a tool call
+    _FENCE_PREFIXES = ("```json", "```\n{", "```{")
 
     def __init__(self):
         self.buffer = ""
@@ -159,7 +217,11 @@ class StreamProcessor:
                 if content.startswith("{"):
                     self.state = "tool"
                     # Don't yield anything - buffer the tool call
-                elif len(content) > 2:
+                elif any(content.startswith(p) for p in self._FENCE_PREFIXES):
+                    # Fenced JSON block (e.g. ```json\n{"tool":...}\n```)
+                    self.state = "tool"
+                elif len(content) > 8:
+                    # Need enough chars to distinguish ```json from normal text
                     self.state = "text"
                     changed = True
 
@@ -186,6 +248,11 @@ class StreamProcessor:
 
         tool_calls: list[ToolCall] = []
         if self.state == "tool":
+            tool_calls = _parse_tool_calls_from_text(content)
+
+        # Fallback: even in text state, check if the full content looks like
+        # a tool call (weak LLMs may wrap JSON in prose or fences)
+        if not tool_calls and content:
             tool_calls = _parse_tool_calls_from_text(content)
 
         return self.thinking, content, tool_calls

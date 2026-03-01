@@ -57,7 +57,7 @@ class CodexTool(Tool):
 
         try:
             result = subprocess.run(
-                [self.command, "--approval-mode", "full-auto", prompt],
+                [self.command, "exec", "--full-auto", prompt],
                 capture_output=True,
                 text=True,
                 timeout=300,

@@ -1,0 +1,32 @@
+Screen {
+    layout: vertical;
+}
+
+#main-container {
+    height: 1fr;
+}
+
+#output {
+    width: 3fr;
+    border: solid $primary-darken-2;
+    padding: 0 1;
+}
+
+#sidebar {
+    width: 1fr;
+    min-width: 24;
+    max-width: 40;
+    border: solid $primary-darken-2;
+}
+
+#plan-content, #queue-content, #tasks-content, #stats-content {
+    padding: 1;
+    height: 100%;
+    overflow-y: auto;
+}
+
+#user-input {
+    dock: bottom;
+    margin: 0;
+    padding: 0 1;
+}
