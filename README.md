@@ -13,6 +13,7 @@ Self-driving AI agent harness optimized for local LLMs.
 - **Project Memory** — Learns project patterns across sessions (test commands, error fixes, workflows)
 - **Policy Guardrails** — Configurable safety limits (safe / balanced / full presets)
 - **Orchestrator Architecture** — Local LLM plans and coordinates; external agents (Claude Code, Codex, Gemini CLI) handle code generation and analysis
+- **TUI Dashboard** — Rich terminal UI (`--tui`) with split panes, plan progress bar, input history, multiline editing, dark/light theme, and real-time stats
 - **15 Built-in Tools** — File ops, shell, git, testing, and external agent delegation (Claude Code, Codex, Gemini CLI)
 - **Per-Project Config** — Place `open_harness.yaml` in any directory to customize per-project
 - **Performance Optimized** — Adaptive context management, tool output truncation, and system prompt compression for ~40-60% token reduction
@@ -35,8 +36,11 @@ harness
 ## Usage
 
 ```bash
-# Interactive mode
+# Interactive CLI mode
 harness
+
+# TUI dashboard mode
+harness --tui
 
 # Run a goal non-interactively
 harness --goal "Fix the failing tests"
@@ -47,6 +51,8 @@ harness --tier large
 # Custom config path
 harness --config ~/myproject/open_harness.yaml
 ```
+
+> Install the TUI extra: `uv pip install -e ".[tui]"`
 
 ### REPL commands
 
@@ -94,6 +100,7 @@ llm:
 - **Per-tool output truncation** — Intelligent head+tail truncation with per-tool limits (read_file: 8K, shell: 3K, tests: 4K)
 - **System prompt compression** — Tier-specific prompt optimization; small models get minimal prompts
 - **Optimized checkpoints** — Snapshots every 10 writes (was 5), fast no-change detection via `git diff --quiet`
+- **TUI dashboard** — Two-pane Textual UI with sidebar (history, plan, queue, agents, tasks, stats), draggable resize, sub-agent streaming panel, plan step progress bar, multiline input (Shift+Enter), input history navigation (Up/Down), compact/expand tool output (Ctrl+E), dark/light theme (Ctrl+D), real-time elapsed time, toast notifications, and Escape to cancel
 
 ## Documentation
 
