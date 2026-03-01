@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import io
+import re
 import time
 from typing import Any
 
@@ -14,8 +15,18 @@ from textual import work
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical, VerticalScroll
+from textual.message import Message
 from textual.timer import Timer
-from textual.widgets import Collapsible, Footer, Header, Input, OptionList, RichLog, Static
+from textual.widgets import (
+    Collapsible,
+    Footer,
+    Header,
+    OptionList,
+    ProgressBar,
+    RichLog,
+    Static,
+    TextArea,
+)
 from textual.worker import get_current_worker
 
 from open_harness.agent import Agent, AgentEvent
@@ -99,6 +110,37 @@ class DragHandle(Static):
         event.stop()
 
 
+class HarnessInput(TextArea):
+    """Multiline input: Enter submits, Shift+Enter adds newline."""
+
+    DEFAULT_CSS = """
+    HarnessInput {
+        height: auto;
+        min-height: 3;
+        max-height: 7;
+    }
+    """
+
+    class Submitted(Message):
+        """Posted when the user presses Enter (without Shift)."""
+
+        def __init__(self, value: str) -> None:
+            self.value = value
+            super().__init__()
+
+    def __init__(self, **kwargs) -> None:
+        super().__init__(show_line_numbers=False, **kwargs)
+
+    def on_key(self, event) -> None:
+        if event.key == "enter":
+            event.prevent_default()
+            event.stop()
+            value = self.text.strip()
+            if value:
+                self.post_message(self.Submitted(value=value))
+                self.load_text("")
+
+
 class StreamingDisplay:
     """Adaptor: renders AgentEvents to a Console writing to a StringIO."""
 
@@ -121,9 +163,12 @@ class HarnessApp(App):
 
     BINDINGS = [
         Binding("ctrl+q", "quit", "Quit"),
+        Binding("escape", "cancel_agent", "Stop", show=True),
         Binding("tab", "cycle_mode", "Mode", show=True),
         Binding("ctrl+s", "toggle_sidebar", "Sidebar", show=True),
         Binding("ctrl+a", "toggle_agent_panel", "Agents", show=True),
+        Binding("ctrl+e", "toggle_tool_output", "Expand", show=True),
+        Binding("ctrl+d", "toggle_dark_mode", "Theme", show=True),
         Binding("ctrl+l", "clear_log", "Clear", show=True),
         Binding("f1", "show_help", "Help", show=True),
     ]
@@ -164,16 +209,22 @@ class HarnessApp(App):
         self._tool_counts: dict[str, int] = {}
         self._compensations = 0
         self._agent_start_time: float | None = None
+        self._stats_timer: Timer | None = None
 
         # Plan tracking
         self._plan_text = ""
+        self._plan_total_steps: int = 0
 
         # Sub-agent tracking
         self._active_agents: dict[str, float] = {}  # tool_name → start_time
         self._agent_panel_timer: Timer | None = None
 
-        # Input history: (display_text, scroll_anchor)
-        self._input_history: list[tuple[str, int]] = []
+        # Input history: (display_text, scroll_anchor, original_text)
+        self._input_history: list[tuple[str, int, str]] = []
+        self._history_index: int = -1
+
+        # Tool output compact/expand
+        self._tool_output_compact: bool = True
 
     @property
     def current_mode(self) -> str:
@@ -187,6 +238,10 @@ class HarnessApp(App):
         yield Header()
         with Horizontal(id="main-container"):
             with Vertical(id="output-area"):
+                yield ProgressBar(
+                    id="step-progress", total=100,
+                    show_eta=False, show_percentage=True,
+                )
                 yield RichLog(id="output", highlight=True, markup=True, wrap=True)
                 yield RichLog(id="agent-panel", highlight=True, markup=True, wrap=True)
             yield DragHandle()
@@ -203,7 +258,7 @@ class HarnessApp(App):
                     yield Static("No background tasks.", id="tasks-content")
                 with Collapsible(title="Stats", collapsed=True):
                     yield Static("Waiting for execution...", id="stats-content")
-        yield Input(placeholder="Type a message or /command...", id="user-input")
+        yield HarnessInput(id="user-input")
         yield Footer()
 
     def on_mount(self) -> None:
@@ -234,17 +289,26 @@ class HarnessApp(App):
         agent_panel = self.query_one("#agent-panel", RichLog)
         agent_panel.border_title = "Sub-Agent Streaming Output"
         agent_panel.display = False
-        self.query_one("#user-input", Input).focus()
+        # Progress bar starts hidden
+        self.query_one("#step-progress", ProgressBar).display = False
+        self.query_one("#user-input", HarnessInput).focus()
         self.set_interval(2.0, self._check_task_notifications)
 
     # ------------------------------------------------------------------
     # Bindings
     # ------------------------------------------------------------------
 
+    def action_cancel_agent(self) -> None:
+        if not self._agent_running:
+            return
+        self.agent.cancel()
+        output = self.query_one("#output", RichLog)
+        output.write("[yellow]Canceling agent...[/yellow]")
+
     def action_cycle_mode(self) -> None:
         # Don't steal Tab from the input widget when it is focused
         focused = self.focused
-        if isinstance(focused, Input):
+        if isinstance(focused, (HarnessInput, TextArea)):
             return
         self._mode_index = (self._mode_index + 1) % len(self._modes)
         output = self.query_one("#output", RichLog)
@@ -261,11 +325,20 @@ class HarnessApp(App):
         panel = self.query_one("#agent-panel", RichLog)
         panel.display = not panel.display
 
+    def action_toggle_tool_output(self) -> None:
+        self._tool_output_compact = not self._tool_output_compact
+        mode = "compact" if self._tool_output_compact else "expanded"
+        output = self.query_one("#output", RichLog)
+        output.write(f"[dim]Tool output: {mode}[/dim]")
+
+    def action_toggle_dark_mode(self) -> None:
+        self.dark = not self.dark
+
     def on_option_list_option_selected(self, event: OptionList.OptionSelected) -> None:
         if event.option_list.id == "history-list":
             idx = event.option_index
             if 0 <= idx < len(self._input_history):
-                _, anchor = self._input_history[idx]
+                _, anchor, _ = self._input_history[idx]
                 output = self.query_one("#output", RichLog)
                 output.scroll_to(y=anchor, animate=True)
 
@@ -293,11 +366,16 @@ class HarnessApp(App):
             "  /clear         - Clear conversation\n"
             "  /quit          - Exit\n\n"
             "[bold]Keys:[/bold]\n"
-            "  Tab        - Cycle mode (when not in input)\n"
-            "  Ctrl+S     - Toggle sidebar\n"
-            "  Ctrl+A     - Toggle agent panel\n"
-            "  Ctrl+L     - Clear log\n"
-            "  Ctrl+Q     - Quit",
+            "  Escape       - Cancel running agent\n"
+            "  Tab          - Cycle mode (when not in input)\n"
+            "  Up/Down      - Navigate input history\n"
+            "  Shift+Enter  - New line in input\n"
+            "  Ctrl+E       - Toggle tool output compact/expand\n"
+            "  Ctrl+D       - Toggle dark/light mode\n"
+            "  Ctrl+S       - Toggle sidebar\n"
+            "  Ctrl+A       - Toggle agent panel\n"
+            "  Ctrl+L       - Clear log\n"
+            "  Ctrl+Q       - Quit",
             title="Help",
             border_style="cyan",
         ))
@@ -306,11 +384,40 @@ class HarnessApp(App):
     # Input handling
     # ------------------------------------------------------------------
 
-    def on_input_submitted(self, event: Input.Submitted) -> None:
+    def on_key(self, event) -> None:
+        """Handle Up/Down for input history navigation."""
+        focused = self.focused
+        if not isinstance(focused, HarnessInput):
+            return
+        if not self._input_history:
+            return
+
+        if event.key == "up" and focused.cursor_at_first_line:
+            max_idx = len(self._input_history) - 1
+            self._history_index = min(self._history_index + 1, max_idx)
+            _, _, orig_text = self._input_history[-(self._history_index + 1)]
+            focused.load_text(orig_text)
+            focused.move_cursor((0, 0))
+            event.prevent_default()
+            event.stop()
+        elif event.key == "down" and focused.cursor_at_last_line:
+            if self._history_index > 0:
+                self._history_index -= 1
+                _, _, orig_text = self._input_history[-(self._history_index + 1)]
+                focused.load_text(orig_text)
+            elif self._history_index == 0:
+                self._history_index = -1
+                focused.load_text("")
+            event.prevent_default()
+            event.stop()
+
+    def on_harness_input_submitted(self, event: HarnessInput.Submitted) -> None:
         text = event.value.strip()
         if not text:
             return
-        event.input.value = ""
+
+        # Reset history navigation
+        self._history_index = -1
 
         if text.startswith("/"):
             if text.strip().lower() in ("/quit", "/exit", "/q"):
@@ -373,13 +480,18 @@ class HarnessApp(App):
         self._text_buffer = ""
         self._agent_start_time = time.monotonic()
 
+        # Start real-time stats timer
+        if self._stats_timer:
+            self._stats_timer.stop()
+        self._stats_timer = self.set_interval(1.0, self._refresh_stats_section)
+
         # Record input history with scroll anchor
         output = self.query_one("#output", RichLog)
         anchor = output.virtual_size.height
         mode_tag = f"[dim]({mode})[/dim] " if mode != self.current_mode else ""
         output.write(f"[bold bright_white]> {mode_tag}{text[:120]}[/bold bright_white]")
         display = f"[{mode}] {text[:40]}" if len(text) > 40 else f"[{mode}] {text}"
-        self._input_history.append((display, anchor))
+        self._input_history.append((display, anchor, text))
         self._refresh_history_section()
 
         self.run_agent(text, mode)
@@ -446,8 +558,9 @@ class HarnessApp(App):
                 self._tool_fail += 1
             icon = "[green]OK[/green]" if ok else "[red]FAIL[/red]"
             out = event.data
-            if len(out) > 600:
-                out = out[:600] + "\n..."
+            max_len = 200 if self._tool_output_compact else 2000
+            if len(out) > max_len:
+                out = out[:max_len] + "\n..."
             if out.strip():
                 output.write(Panel(out, title=f"{icon} {event.metadata.get('tool', '')}",
                                    border_style="dim", expand=False))
@@ -523,6 +636,17 @@ class HarnessApp(App):
             output.write(f"[dim]({elapsed:.1f}s)[/dim]\n")
             self._agent_start_time = None
 
+        # Stop real-time stats timer
+        if self._stats_timer:
+            self._stats_timer.stop()
+            self._stats_timer = None
+
+        # Reset cancel event for next run
+        self.agent._cancel_event.clear()
+
+        # Hide progress bar
+        self.query_one("#step-progress", ProgressBar).display = False
+
         # Clear sub-agent tracking
         self._active_agents.clear()
         self._refresh_agents_section()
@@ -560,13 +684,27 @@ class HarnessApp(App):
             # Full plan summary: "Plan (3 steps):\n  1. Title\n  ..."
             self._plan_text = status_text
             plan_widget.update(self._plan_text)
+            # Update progress bar
+            match = re.search(r"Plan \((\d+) steps?\):", status_text)
+            if match:
+                n = int(match.group(1))
+                self._plan_total_steps = n
+                bar = self.query_one("#step-progress", ProgressBar)
+                bar.update(total=n, progress=0)
+                bar.display = True
         elif status_text.startswith("Step ") and "/" in status_text:
             # "Step 2/3: Title" — mark current step
-            if self._plan_text:
+            try:
+                parts = status_text.split("/", 1)
+                current = int(parts[0].replace("Step ", ""))
+                # Update progress bar
+                bar = self.query_one("#step-progress", ProgressBar)
+                bar.update(progress=current)
+            except (ValueError, IndexError):
+                current = None
+            if self._plan_text and current is not None:
                 lines = self._plan_text.split("\n")
                 try:
-                    parts = status_text.split("/", 1)
-                    current = int(parts[0].replace("Step ", ""))
                     updated: list[str] = []
                     for line in lines:
                         stripped = line.strip()
@@ -590,7 +728,7 @@ class HarnessApp(App):
     def _refresh_history_section(self) -> None:
         option_list = self.query_one("#history-list", OptionList)
         option_list.clear_options()
-        for i, (display, _) in enumerate(self._input_history):
+        for i, (display, _, _) in enumerate(self._input_history):
             option_list.add_option(f"{i + 1}. {display}")
 
     def _refresh_queue_section(self) -> None:
@@ -667,7 +805,22 @@ class HarnessApp(App):
                 break
             changed = True
             output = self.query_one("#output", RichLog)
-            icon = "[green]OK[/green]" if task.status == TaskStatus.SUCCEEDED else "[red]FAIL[/red]"
+            if task.status == TaskStatus.SUCCEEDED:
+                icon = "[green]OK[/green]"
+                self.notify(
+                    f"Task {task.id}: {task.goal[:40]}",
+                    title="Task OK",
+                    severity="information",
+                    timeout=5,
+                )
+            else:
+                icon = "[red]FAIL[/red]"
+                self.notify(
+                    f"Task {task.id}: {task.goal[:40]}",
+                    title="Task FAIL",
+                    severity="error",
+                    timeout=5,
+                )
             output.write(f"\n{icon} Task {task.id} complete: {task.goal[:50]}")
             if task.result_text:
                 output.write(f"[dim]{task.result_text[:100]}[/dim]")

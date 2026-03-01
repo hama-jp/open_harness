@@ -1170,24 +1170,35 @@ def main(config_path: str | None, tier: str | None, goal_text: str | None,
 
             mode = _modes[_mode_index[0]]
             try:
+                import signal
+
+                def _cancel_repl(signum, frame):
+                    console.print("\n[yellow]Canceling...[/yellow]")
+                    agent.cancel()
+
                 start = time.monotonic()
+                old_handler = signal.signal(signal.SIGINT, _cancel_repl)
 
-                if mode == "plan":
-                    input_queue.start()
-                    for event in agent.run_stream(user_input):
-                        display.handle(event)
-                    input_queue.stop()
-                    console.print(f"\n[dim]({time.monotonic() - start:.1f}s)[/dim]\n")
+                try:
+                    if mode == "plan":
+                        input_queue.start()
+                        for event in agent.run_stream(user_input):
+                            display.handle(event)
+                        input_queue.stop()
+                        console.print(f"\n[dim]({time.monotonic() - start:.1f}s)[/dim]\n")
 
-                elif mode == "goal":
-                    if _task_queue and _task_queue.is_busy():
-                        console.print("[yellow]Warning: a background task is running. "
-                                      "LLM requests may queue.[/yellow]")
-                    input_queue.start()
-                    for event in agent.run_goal(user_input):
-                        display.handle(event)
-                    input_queue.stop()
-                    console.print(f"\n[dim]Goal completed in {time.monotonic() - start:.1f}s[/dim]\n")
+                    elif mode == "goal":
+                        if _task_queue and _task_queue.is_busy():
+                            console.print("[yellow]Warning: a background task is running. "
+                                          "LLM requests may queue.[/yellow]")
+                        input_queue.start()
+                        for event in agent.run_goal(user_input):
+                            display.handle(event)
+                        input_queue.stop()
+                        console.print(f"\n[dim]Goal completed in {time.monotonic() - start:.1f}s[/dim]\n")
+                finally:
+                    signal.signal(signal.SIGINT, old_handler)
+                    agent._cancel_event.clear()
 
             except Exception as e:
                 input_queue.stop()

@@ -10,6 +10,12 @@ Screen {
     width: 3fr;
 }
 
+#step-progress {
+    height: 1;
+    display: none;
+    margin: 0 1;
+}
+
 #output {
     height: 1fr;
     border: solid $primary-darken-2;
@@ -46,5 +52,7 @@ Screen {
 #user-input {
     dock: bottom;
     margin: 0;
-    padding: 0 1;
+    padding: 0;
+    min-height: 3;
+    max-height: 7;
 }
