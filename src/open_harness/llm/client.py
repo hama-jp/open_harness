@@ -442,6 +442,9 @@ class LLMClient:
         model_name = model
 
         try:
+            # Retry only the connection phase. Once we start yielding chunks,
+            # we cannot retry without corrupting downstream consumers.
+            _chunks_yielded = False
             success = False
             for _attempt in range(_MAX_RETRIES):
                 try:
@@ -475,10 +478,19 @@ class LLMClient:
                             model_name = data.get("model", model)
 
                             for event in processor.feed(chunk):
+                                _chunks_yielded = True
                                 yield event
                     success = True
                     break
                 except httpx.TimeoutException as e:
+                    # If we already yielded chunks, retrying would corrupt output
+                    if _chunks_yielded:
+                        latency = (time.monotonic() - start) * 1000
+                        return LLMResponse(
+                            content="[LLM API Error: stream interrupted after partial output]",
+                            finish_reason="error",
+                            latency_ms=latency,
+                        )
                     _logger.warning(
                         "LLM stream timeout (attempt %d/%d): %s",
                         _attempt + 1, _MAX_RETRIES, e)

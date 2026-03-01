@@ -147,11 +147,12 @@ class EditFileTool(Tool):
         lines = [_re.sub(r"\s+", " ", line.strip()) for line in s.splitlines()]
         return "\n".join(lines)
 
-    def _fuzzy_find(self, text: str, old: str) -> tuple[int, int] | None:
+    def _fuzzy_find(self, text: str, old: str) -> tuple[int, int] | int | None:
         """Find *old* in *text* using whitespace-normalized comparison.
 
         Returns (start, end) indices into *text* of the matching region,
-        or None if no unique match is found.
+        the match count (int > 1) if multiple matches found, or None if
+        no match is found.
         """
         norm_old = self._normalize_ws(old)
         norm_old_lines = norm_old.splitlines()
@@ -173,6 +174,8 @@ class EditFileTool(Tool):
 
         if len(matches) == 1:
             return matches[0]
+        if len(matches) > 1:
+            return len(matches)  # signal: multiple matches
         return None
 
     def execute(self, **kwargs: Any) -> ToolResult:
@@ -204,12 +207,18 @@ class EditFileTool(Tool):
                 )
             # count == 0 — try whitespace-normalized fuzzy match
             span = self._fuzzy_find(text, old)
-            if span:
+            if isinstance(span, tuple):
                 text = text[: span[0]] + new + text[span[1] :]
                 p.write_text(text)
                 return ToolResult(
                     success=True,
                     output=f"Edit applied to {p} (matched with whitespace normalization)",
+                )
+            if isinstance(span, int):
+                return ToolResult(
+                    success=False, output="",
+                    error=f"old_string found {span} times (with whitespace normalization). "
+                          f"Provide more context to make it unique.",
                 )
             return ToolResult(success=False, output="", error="old_string not found in file")
         except Exception as e:

@@ -336,7 +336,8 @@ class Agent:
                 yield from self._tracked_goal(
                     self._run_direct_goal(goal, ckpt), tracker)
 
-            goal_succeeded = True
+            # Only mark as succeeded if not canceled
+            goal_succeeded = not self._cancel_event.is_set()
 
         finally:
             self._cancel_event.clear()
@@ -547,7 +548,7 @@ class Agent:
     @staticmethod
     def _estimate_tokens(messages: list[dict[str, Any]]) -> int:
         """Rough token estimate: ~4 chars per token."""
-        return sum(len(m.get("content", "")) for m in messages) // 4
+        return sum(len(m.get("content") or "") for m in messages) // 4
 
     @staticmethod
     def _trim_messages(
@@ -746,19 +747,20 @@ class Agent:
                     messages.append({"role": "user",
                         "content": f"[Tool Result for {actual_tool}]\n{output}"})
 
-                # Auto-rollback on test failure (after all tool calls processed)
-                last_tc = response.tool_calls[-1]
-                last_tool = last_tc.name
-                if (checkpoint and last_tool == "run_tests"
-                        and checkpoint.snapshots):
-                    # Check if the last tool result was a failure
-                    last_msg = messages[-1].get("content", "")
-                    if "[Tool Error]" in last_msg or "FAIL" in last_msg[:200]:
+                # Auto-rollback on test failure (check ANY run_tests in this batch)
+                if checkpoint and checkpoint.snapshots:
+                    test_failed = False
+                    for msg in messages[-(len(response.tool_calls) * 2):]:
+                        content = msg.get("content", "")
+                        if "[Tool Result for run_tests]" in content:
+                            if "[Tool Error]" in content or "FAIL" in content[:200]:
+                                test_failed = True
+                                break
+                    if test_failed:
                         yield AgentEvent("compensation",
                             "Tests failed — rolling back to last snapshot")
                         rb = checkpoint.rollback(checkpoint.snapshots[-1])
                         yield AgentEvent("status", f"Rollback: {rb}")
-                        # Amend last message to inform LLM of rollback
                         messages[-1]["content"] += (
                             "\n\n[ROLLBACK] Changes have been rolled back to the last "
                             "snapshot. Try a different approach.")
@@ -769,10 +771,26 @@ class Agent:
                 recovered_tc = self._recover_tool_call(response.content)
                 if recovered_tc:
                     yield AgentEvent("compensation", "Recovered malformed tool call")
-                    # Inject recovered tool call into response and re-process
-                    response.tool_calls = [recovered_tc]
-                    # Re-process as a tool call by decrementing step and continuing
-                    step -= 1
+                    # Execute recovered tool call directly
+                    actual_tool = recovered_tc.name
+                    yield AgentEvent("tool_call", actual_tool,
+                        {"tool": actual_tool, "args": recovered_tc.arguments})
+                    violation = self.policy.check(actual_tool, recovered_tc.arguments)
+                    if violation:
+                        result = ToolResult(
+                            success=False, output="",
+                            error=f"[Policy: {violation.rule}] {violation.message}",
+                        )
+                    else:
+                        result = self.tools.execute(actual_tool, recovered_tc.arguments)
+                        self.policy.record(actual_tool)
+                    output = truncate_tool_output(result.to_message(), 8000)
+                    yield AgentEvent("tool_result", output,
+                                     {"success": result.success, "tool": actual_tool})
+                    messages.append({"role": "assistant",
+                        "content": f'{{"tool": "{actual_tool}", "args": {_safe_json(recovered_tc.arguments)}}}'})
+                    messages.append({"role": "user",
+                        "content": f"[Tool Result for {actual_tool}]\n{output}"})
                     continue
 
                 comp = self.compensator.next_strategy(

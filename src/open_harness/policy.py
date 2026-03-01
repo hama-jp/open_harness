@@ -201,7 +201,8 @@ class PolicyEngine:
             return violation
 
         # Path checks for file-accessing tools
-        if tool_name in ("read_file", "write_file", "edit_file", "list_dir", "search_files"):
+        if tool_name in ("read_file", "write_file", "edit_file", "list_dir",
+                          "search_files", "project_tree"):
             path = args.get("path", "")
             if path:
                 if tool_name in ("write_file", "edit_file"):
@@ -370,7 +371,20 @@ class PolicyEngine:
 
     def _check_cwd(self, cwd: str, tool_name: str, category: str) -> PolicyViolation | None:
         """Check that a working directory is within the project root."""
-        resolved = Path(cwd).expanduser().resolve()
+        if not isinstance(cwd, str):
+            return PolicyViolation(
+                rule="cwd_invalid_type",
+                message=f"Working directory must be a string, got {type(cwd).__name__}",
+                tool=tool_name, category=category,
+            )
+        try:
+            resolved = Path(cwd).expanduser().resolve()
+        except (TypeError, ValueError) as e:
+            return PolicyViolation(
+                rule="cwd_invalid_path",
+                message=f"Invalid working directory '{cwd}': {e}",
+                tool=tool_name, category=category,
+            )
         if self._project_root:
             try:
                 resolved.relative_to(self._project_root)
