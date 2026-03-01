@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import os
+import shutil
 import subprocess
 import sys
 import time
@@ -13,6 +14,7 @@ import click
 from prompt_toolkit import PromptSession
 from prompt_toolkit.formatted_text import HTML
 from prompt_toolkit.key_binding import KeyBindings
+from prompt_toolkit.styles import Style
 from rich.console import Console
 from rich.markdown import Markdown
 from rich.panel import Panel
@@ -541,11 +543,7 @@ def main(config_path: str | None, tier: str | None, goal_text: str | None,
     _modes = ["chat", "goal", "submit"]
     _mode_index = [0]  # list to allow mutation in closure
 
-    _mode_prompts = {
-        "chat": HTML("<ansigreen><b>&gt; </b></ansigreen>"),
-        "goal": HTML("<ansiyellow><b>goal&gt; </b></ansiyellow>"),
-        "submit": HTML("<ansiblue><b>bg&gt; </b></ansiblue>"),
-    }
+    _mode_colors = {"chat": "ansigreen", "goal": "ansiyellow", "submit": "ansiblue"}
     _mode_labels = {
         "chat": "chat",
         "goal": "goal (autonomous)",
@@ -553,12 +551,19 @@ def main(config_path: str | None, tier: str | None, goal_text: str | None,
     }
 
     def _get_prompt():
-        return _mode_prompts[_modes[_mode_index[0]]]
+        mode = _modes[_mode_index[0]]
+        color = _mode_colors[mode]
+        cols = shutil.get_terminal_size().columns
+        line = "─" * cols
+        return HTML(f"<dim>{line}</dim>\n<{color}><b>❯ </b></{color}>")
 
     def _get_toolbar():
         mode = _modes[_mode_index[0]]
+        cols = shutil.get_terminal_size().columns
+        line = "─" * cols
         return HTML(
-            f"  <b>{_mode_labels[mode]}</b> mode"
+            f"<dim>{line}</dim>\n"
+            f"  <b>⏵⏵ {_mode_labels[mode]}</b>"
             f"  <dim>(shift+tab to cycle)</dim>"
         )
 
@@ -568,7 +573,10 @@ def main(config_path: str | None, tier: str | None, goal_text: str | None,
     def _cycle_mode(event):
         _mode_index[0] = (_mode_index[0] + 1) % len(_modes)
 
-    session = PromptSession(key_bindings=kb, bottom_toolbar=_get_toolbar)
+    _pt_style = Style.from_dict({"bottom-toolbar": "noreverse"})
+    session = PromptSession(
+        key_bindings=kb, bottom_toolbar=_get_toolbar, style=_pt_style,
+    )
 
     try:
         while True:
