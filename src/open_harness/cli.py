@@ -345,13 +345,24 @@ class InputQueue:
 
     def start(self):
         """Start capturing stdin in background."""
+        # Ensure any old reader thread is dead before starting a new one
+        if self._thread is not None and self._thread.is_alive():
+            self._active = False
+            self._thread.join(timeout=2.0)
         self._active = True
         self._thread = threading.Thread(target=self._reader, daemon=True)
         self._thread.start()
 
     def stop(self):
-        """Stop capturing. Thread exits on next select timeout."""
+        """Stop capturing and wait for reader thread to exit.
+
+        Must be called before prompt_toolkit takes control of stdin again,
+        otherwise two readers compete for stdin and input freezes.
+        """
         self._active = False
+        if self._thread is not None:
+            self._thread.join(timeout=2.0)
+            self._thread = None
 
     def drain(self) -> list[str]:
         """Return all queued instructions."""
@@ -377,6 +388,8 @@ class InputQueue:
             try:
                 readable, _, _ = select.select([sys.stdin], [], [], 0.5)
                 if readable:
+                    if not self._active:
+                        break
                     line = sys.stdin.readline()
                     if line:
                         line = line.strip()
