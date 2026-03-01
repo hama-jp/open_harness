@@ -6,10 +6,22 @@ Screen {
     height: 1fr;
 }
 
-#output {
+#output-area {
     width: 3fr;
+}
+
+#output {
+    height: 1fr;
     border: solid $primary-darken-2;
     padding: 0 1;
+}
+
+#agent-panel {
+    height: auto;
+    max-height: 12;
+    border: solid $secondary;
+    padding: 0 1;
+    display: none;
 }
 
 #sidebar {
@@ -17,12 +29,11 @@ Screen {
     min-width: 24;
     max-width: 40;
     border: solid $primary-darken-2;
+    padding: 0;
 }
 
-#plan-content, #queue-content, #tasks-content, #stats-content {
-    padding: 1;
-    height: 100%;
-    overflow-y: auto;
+#plan-content, #queue-content, #agents-content, #tasks-content, #stats-content {
+    padding: 0 1;
 }
 
 #user-input {

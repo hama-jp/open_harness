@@ -27,6 +27,7 @@ class ShellTool(Tool):
 
     name = "shell"
     description = "Execute a shell command and return the output. Use for running programs, git operations, system commands, etc."
+    max_output = 3000
     parameters = [
         ToolParameter(
             name="command",

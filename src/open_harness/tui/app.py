@@ -13,8 +13,9 @@ from rich.table import Table
 from textual import work
 from textual.app import App, ComposeResult
 from textual.binding import Binding
-from textual.containers import Horizontal
-from textual.widgets import Footer, Header, Input, RichLog, Static, TabbedContent, TabPane
+from textual.containers import Horizontal, Vertical, VerticalScroll
+from textual.timer import Timer
+from textual.widgets import Collapsible, Footer, Header, Input, RichLog, Static
 from textual.worker import get_current_worker
 
 from open_harness.agent import Agent, AgentEvent
@@ -54,6 +55,7 @@ class HarnessApp(App):
         Binding("ctrl+q", "quit", "Quit"),
         Binding("tab", "cycle_mode", "Mode", show=True),
         Binding("ctrl+s", "toggle_sidebar", "Sidebar", show=True),
+        Binding("ctrl+a", "toggle_agent_panel", "Agents", show=True),
         Binding("ctrl+l", "clear_log", "Clear", show=True),
         Binding("f1", "show_help", "Help", show=True),
     ]
@@ -98,6 +100,10 @@ class HarnessApp(App):
         # Plan tracking
         self._plan_text = ""
 
+        # Sub-agent tracking
+        self._active_agents: dict[str, float] = {}  # tool_name → start_time
+        self._agent_panel_timer: Timer | None = None
+
     @property
     def current_mode(self) -> str:
         return self._modes[self._mode_index]
@@ -107,18 +113,21 @@ class HarnessApp(App):
     # ------------------------------------------------------------------
 
     def compose(self) -> ComposeResult:
-        tool_names = [t.name for t in self.tools.list_tools()]
         yield Header()
         with Horizontal(id="main-container"):
-            yield RichLog(id="output", highlight=True, markup=True, wrap=True)
-            with TabbedContent(id="sidebar"):
-                with TabPane("Plan", id="tab-plan"):
+            with Vertical(id="output-area"):
+                yield RichLog(id="output", highlight=True, markup=True, wrap=True)
+                yield RichLog(id="agent-panel", highlight=True, markup=True, wrap=True)
+            with VerticalScroll(id="sidebar"):
+                with Collapsible(title="Plan", collapsed=False):
                     yield Static("No plan yet.", id="plan-content")
-                with TabPane("Queue", id="tab-queue"):
+                with Collapsible(title="Queue", collapsed=False):
                     yield Static("No queued instructions.", id="queue-content")
-                with TabPane("Tasks", id="tab-tasks"):
+                with Collapsible(title="Agents", collapsed=False):
+                    yield Static("No active agents.", id="agents-content")
+                with Collapsible(title="Tasks", collapsed=False):
                     yield Static("No background tasks.", id="tasks-content")
-                with TabPane("Stats", id="tab-stats"):
+                with Collapsible(title="Stats", collapsed=True):
                     yield Static("Waiting for execution...", id="stats-content")
         yield Input(placeholder="Type a message or /command...", id="user-input")
         yield Footer()
@@ -145,6 +154,8 @@ class HarnessApp(App):
         output.write(
             f"[dim]Mode: {self.current_mode} (Tab to cycle)[/dim]\n"
         )
+        # Agent panel starts hidden
+        self.query_one("#agent-panel", RichLog).display = False
         self.query_one("#user-input", Input).focus()
         self.set_interval(2.0, self._check_task_notifications)
 
@@ -164,6 +175,10 @@ class HarnessApp(App):
     def action_toggle_sidebar(self) -> None:
         sidebar = self.query_one("#sidebar")
         sidebar.display = not sidebar.display
+
+    def action_toggle_agent_panel(self) -> None:
+        panel = self.query_one("#agent-panel", RichLog)
+        panel.display = not panel.display
 
     def action_clear_log(self) -> None:
         self.query_one("#output", RichLog).clear()
@@ -191,6 +206,7 @@ class HarnessApp(App):
             "[bold]Keys:[/bold]\n"
             "  Tab        - Cycle mode (when not in input)\n"
             "  Ctrl+S     - Toggle sidebar\n"
+            "  Ctrl+A     - Toggle agent panel\n"
             "  Ctrl+L     - Clear log\n"
             "  Ctrl+Q     - Quit",
             title="Help",
@@ -216,7 +232,7 @@ class HarnessApp(App):
 
         if self._agent_running:
             self._instruction_queue.append(text)
-            self._refresh_queue_tab()
+            self._refresh_queue_section()
             output = self.query_one("#output", RichLog)
             output.write(f"[yellow]Queued: {text[:60]}[/yellow]")
             return
@@ -260,7 +276,7 @@ class HarnessApp(App):
             output = self.query_one("#output", RichLog)
             output.write(f"[green]Task {task.id} queued: {task.goal[:60]}[/green]")
             output.write(f"[dim]Check: /tasks | /result {task.id}[/dim]")
-            self._refresh_tasks_tab()
+            self._refresh_tasks_section()
             return
 
         text = _expand_at_references(text, self.project.root)
@@ -321,7 +337,7 @@ class HarnessApp(App):
             # Stats
             self._tool_calls += 1
             self._tool_counts[tool] = self._tool_counts.get(tool, 0) + 1
-            self._refresh_stats_tab()
+            self._refresh_stats_section()
 
         elif event.type == "tool_result":
             ok = event.metadata.get("success", False)
@@ -336,13 +352,42 @@ class HarnessApp(App):
             if out.strip():
                 output.write(Panel(out, title=f"{icon} {event.metadata.get('tool', '')}",
                                    border_style="dim", expand=False))
-            self._refresh_stats_tab()
+            self._refresh_stats_section()
 
         elif event.type == "compensation":
             self._flush_text_buffer()
             output.write(f"[magenta]~ {event.data}[/magenta]")
             self._compensations += 1
-            self._refresh_stats_tab()
+            self._refresh_stats_section()
+
+        elif event.type == "agent_progress":
+            tool = event.metadata.get("tool", "?")
+            color_map = {
+                "codex": "cyan",
+                "claude_code": "magenta",
+                "gemini_cli": "yellow",
+            }
+            color = color_map.get(tool, "white")
+            panel = self.query_one("#agent-panel", RichLog)
+            panel.write(f"[{color}][{tool}][/{color}] {event.data}")
+            # Auto-show panel
+            if not panel.display:
+                panel.display = True
+            # Track active agent
+            self._active_agents[tool] = time.monotonic()
+            self._refresh_agents_section()
+
+        elif event.type == "agent_done":
+            tool = event.metadata.get("tool", "?")
+            success = event.metadata.get("success", False)
+            icon = "[green]OK[/green]" if success else "[red]FAIL[/red]"
+            panel = self.query_one("#agent-panel", RichLog)
+            panel.write(f"[bold]{icon} {tool} finished[/bold]")
+            self._active_agents.pop(tool, None)
+            self._refresh_agents_section()
+            # Auto-hide after 3s if no active agents
+            if not self._active_agents:
+                self._schedule_agent_panel_hide()
 
         elif event.type == "done":
             self._flush_text_buffer()
@@ -358,7 +403,7 @@ class HarnessApp(App):
                 border_style="cyan",
                 expand=False,
             ))
-            self._refresh_stats_tab()
+            self._refresh_stats_section()
 
     def _flush_text_buffer(self) -> None:
         if self._text_buffer:
@@ -379,19 +424,37 @@ class HarnessApp(App):
             output.write(f"[dim]({elapsed:.1f}s)[/dim]\n")
             self._agent_start_time = None
 
+        # Clear sub-agent tracking
+        self._active_agents.clear()
+        self._refresh_agents_section()
+
         # Auto-dequeue
         if self._instruction_queue:
             next_input = self._instruction_queue.pop(0)
-            self._refresh_queue_tab()
+            self._refresh_queue_section()
             output.write(f"[yellow]Running queued: {next_input[:60]}[/yellow]")
             self._run_input(next_input)
 
     # ------------------------------------------------------------------
-    # Sidebar tab updates
+    # Agent panel auto-hide / toggle
+    # ------------------------------------------------------------------
+
+    def _schedule_agent_panel_hide(self) -> None:
+        if self._agent_panel_timer:
+            self._agent_panel_timer.stop()
+        self._agent_panel_timer = self.set_timer(3.0, self._hide_agent_panel)
+
+    def _hide_agent_panel(self) -> None:
+        if not self._active_agents:
+            self.query_one("#agent-panel", RichLog).display = False
+        self._agent_panel_timer = None
+
+    # ------------------------------------------------------------------
+    # Sidebar section updates
     # ------------------------------------------------------------------
 
     def _update_plan_from_status(self, status_text: str) -> None:
-        """Parse plan-related status events and update the Plan tab."""
+        """Parse plan-related status events and update the Plan section."""
         plan_widget = self.query_one("#plan-content", Static)
 
         if status_text.startswith("Plan ("):
@@ -425,7 +488,7 @@ class HarnessApp(App):
         elif "finished" in status_text.lower() and "step" in status_text.lower():
             pass  # will be updated on next Step N/M status
 
-    def _refresh_queue_tab(self) -> None:
+    def _refresh_queue_section(self) -> None:
         queue_widget = self.query_one("#queue-content", Static)
         if not self._instruction_queue:
             queue_widget.update("No queued instructions.")
@@ -435,7 +498,18 @@ class HarnessApp(App):
                 lines.append(f"  {i}. {instr[:60]}")
             queue_widget.update("\n".join(lines))
 
-    def _refresh_tasks_tab(self) -> None:
+    def _refresh_agents_section(self) -> None:
+        widget = self.query_one("#agents-content", Static)
+        if not self._active_agents:
+            widget.update("[dim]No active agents.[/dim]")
+            return
+        lines = []
+        for tool, start in self._active_agents.items():
+            elapsed = time.monotonic() - start
+            lines.append(f"  [yellow]{tool}[/yellow]  {elapsed:.0f}s")
+        widget.update("\n".join(lines))
+
+    def _refresh_tasks_section(self) -> None:
         tasks_widget = self.query_one("#tasks-content", Static)
         tasks = self.task_queue.list_tasks(limit=15)
         if not tasks:
@@ -455,7 +529,7 @@ class HarnessApp(App):
             lines.append(f"  {t.id}  {status:20s}  {t.goal[:30]:30s}  {elapsed}")
         tasks_widget.update("\n".join(lines))
 
-    def _refresh_stats_tab(self) -> None:
+    def _refresh_stats_section(self) -> None:
         stats_widget = self.query_one("#stats-content", Static)
         elapsed = ""
         if self._agent_start_time:
@@ -495,4 +569,4 @@ class HarnessApp(App):
             elif task.error_text:
                 output.write(f"[red]{task.error_text[:100]}[/red]")
         if changed:
-            self._refresh_tasks_tab()
+            self._refresh_tasks_section()

@@ -74,9 +74,10 @@ class TestTrimMessages:
         trimmed = Agent._trim_messages(msgs, max_tokens=3000)
         compressed = [m for m in trimmed if "[Earlier:" in m.get("content", "")]
         assert len(compressed) > 0
-        # Check format
-        assert "read_file" in compressed[0]["content"]
-        assert "success" in compressed[0]["content"] or "fail" in compressed[0]["content"]
+        # L2 aggregated format: "[Earlier: N tool calls, M succeeded]"
+        # or L1 format: "[Earlier: used X → status]"
+        content = compressed[0]["content"]
+        assert "tool call" in content or "used" in content
 
     def test_short_list_not_trimmed(self):
         """Lists with <= protected_tail + 1 messages should not be trimmed."""
@@ -96,4 +97,7 @@ class TestTrimMessages:
         trimmed = Agent._trim_messages(msgs, max_tokens=3000)
         compressed = [m for m in trimmed if "[Earlier:" in m.get("content", "")]
         assert len(compressed) > 0
-        assert any("fail" in c["content"] for c in compressed)
+        # L2 aggregated format shows count of successes (0 out of N = all failed)
+        # or L1 format shows "fail" directly
+        content = " ".join(c["content"] for c in compressed)
+        assert "0 succeeded" in content or "fail" in content

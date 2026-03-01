@@ -103,8 +103,87 @@ def _extract_balanced_json(text: str, start: int) -> str | None:
     return None
 
 
+class ToolCallParser:
+    """Schema-aware parser for tool calls from free-form text.
+
+    Pre-compiles a combined regex from registered tool names for fast
+    first-match short-circuiting. Falls back to generic parsing.
+    """
+
+    def __init__(self, tool_names: list[str] | None = None):
+        self._tool_names = set(tool_names) if tool_names else set()
+        # Pre-compile a pattern that matches {"tool": "<known_name>"
+        if self._tool_names:
+            escaped = "|".join(re.escape(n) for n in self._tool_names)
+            self._known_tool_pattern = re.compile(
+                r'\{\s*"tool"\s*:\s*"(' + escaped + r')"'
+            )
+        else:
+            self._known_tool_pattern = None
+
+    def parse(self, text: str) -> list[ToolCall]:
+        """Parse tool calls with short-circuit on known tool names."""
+        # Fast path: try known tool name regex first
+        if self._known_tool_pattern:
+            match = self._known_tool_pattern.search(text)
+            if match:
+                obj = _extract_balanced_json(text, text.rfind("{", 0, match.end()))
+                if obj:
+                    call = _try_parse_tool_json(obj)
+                    if call:
+                        return [call]
+
+        # Fallback to full parsing
+        return _parse_tool_calls_from_text(text)
+
+
+def _try_parse_tool_json(raw: str) -> ToolCall | None:
+    """Try to parse a single JSON string as a tool call."""
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        # Single repair pass: strip markdown fences, trailing prose, fix quotes
+        cleaned = raw.strip()
+        for prefix in ("```json", "```"):
+            if cleaned.startswith(prefix):
+                cleaned = cleaned[len(prefix):]
+        if cleaned.endswith("```"):
+            cleaned = cleaned[:-3]
+        cleaned = cleaned.strip()
+        try:
+            data = json.loads(cleaned)
+        except json.JSONDecodeError:
+            return None
+
+    if "tool" in data and "args" in data:
+        args = data.get("args", {})
+        if isinstance(args, str):
+            try:
+                args = json.loads(args)
+            except (json.JSONDecodeError, ValueError):
+                args = {"prompt": args}
+        return ToolCall(name=data["tool"], arguments=args, raw=raw)
+    elif "tool_call" in data:
+        tc = data["tool_call"]
+        args = tc.get("arguments", tc.get("args", {}))
+        if isinstance(args, str):
+            try:
+                args = json.loads(args)
+            except (json.JSONDecodeError, ValueError):
+                args = {"prompt": args}
+        return ToolCall(
+            name=tc.get("name", tc.get("tool", "")),
+            arguments=args, raw=raw,
+        )
+    return None
+
+
 def _parse_tool_calls_from_text(text: str) -> list[ToolCall]:
-    """Try to extract tool calls from free-form text."""
+    """Try to extract tool calls from free-form text.
+
+    Uses a unified search: fenced blocks → bare {"tool":...} → whole text → alt format.
+    Short-circuits on first successful match.
+    """
     calls = []
 
     # Strategy 1: fenced code block — ```json ... ```
@@ -134,37 +213,9 @@ def _parse_tool_calls_from_text(text: str) -> list[ToolCall]:
                 matches.append(obj)
 
     for match in matches:
-        try:
-            data = json.loads(match)
-            if "tool" in data and "args" in data:
-                args = data.get("args", {})
-                # Ensure args is a dict (weak LLMs may emit a JSON string)
-                if isinstance(args, str):
-                    try:
-                        args = json.loads(args)
-                    except (json.JSONDecodeError, ValueError):
-                        args = {"prompt": args}
-                calls.append(ToolCall(
-                    name=data["tool"],
-                    arguments=args,
-                    raw=match,
-                ))
-            elif "tool_call" in data:
-                tc = data["tool_call"]
-                args = tc.get("arguments", tc.get("args", {}))
-                # Ensure args is a dict
-                if isinstance(args, str):
-                    try:
-                        args = json.loads(args)
-                    except (json.JSONDecodeError, ValueError):
-                        args = {"prompt": args}
-                calls.append(ToolCall(
-                    name=tc.get("name", tc.get("tool", "")),
-                    arguments=args,
-                    raw=match,
-                ))
-        except (json.JSONDecodeError, KeyError):
-            continue
+        call = _try_parse_tool_json(match)
+        if call:
+            calls.append(call)
 
     return calls
 

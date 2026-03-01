@@ -153,6 +153,7 @@ class CodexTool(Tool):
     """Delegate tasks to OpenAI Codex CLI."""
 
     name = "codex"
+    max_output = 5000
     description = (
         "Delegate a coding task to OpenAI Codex CLI agent. "
         "Best for complex code generation, refactoring, and debugging tasks. "
@@ -210,6 +211,7 @@ class ClaudeCodeTool(Tool):
     """Delegate tasks to Claude Code (Anthropic CLI)."""
 
     name = "claude_code"
+    max_output = 5000
     description = (
         "Delegate a coding task to Claude Code (Anthropic CLI agent). "
         "Best for code generation, code analysis, complex reasoning, and refactoring. "
@@ -271,6 +273,7 @@ class GeminiCliTool(Tool):
     """Delegate tasks to Google Gemini CLI."""
 
     name = "gemini_cli"
+    max_output = 5000
     description = (
         "Delegate a task to Google Gemini CLI agent. "
         "Useful for tasks that benefit from Gemini's capabilities."

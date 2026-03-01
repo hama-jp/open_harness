@@ -21,8 +21,15 @@ from typing import Any
 logger = logging.getLogger(__name__)
 
 # Hard limits to keep plans small and manageable for weak LLMs
-MAX_PLAN_STEPS = 5
+MAX_PLAN_STEPS = 8
 PLANNING_MAX_TOKENS = 2048
+
+# Complexity-based defaults
+_COMPLEXITY_PROFILES = {
+    "low": {"max_steps": 3, "max_agent_steps": 8, "replan_depth": 0},
+    "medium": {"max_steps": 5, "max_agent_steps": 12, "replan_depth": 1},
+    "high": {"max_steps": 8, "max_agent_steps": 15, "replan_depth": 2},
+}
 
 
 @dataclass
@@ -111,11 +118,18 @@ Respond with ONLY a JSON object in the same format as before."""
 
 
 class Planner:
-    """Creates structured plans from goals using the LLM."""
+    """Creates structured plans from goals using the LLM.
+
+    Supports complexity-adaptive planning: estimates goal complexity
+    and adjusts max_steps, max_agent_steps, and replan_depth accordingly.
+    """
 
     def __init__(self, router: Any, max_steps: int = MAX_PLAN_STEPS):
         self.router = router
         self.max_steps = min(max_steps, MAX_PLAN_STEPS)
+        self._complexity: str = "medium"
+        self._replan_depth: int = 1
+        self._replan_count: int = 0
 
     def create_plan(
         self,
@@ -126,8 +140,18 @@ class Planner:
         """Generate a plan for the given goal.
 
         Returns (Plan, None) on success or (None, PlanFailure) on failure.
+        Automatically estimates goal complexity to tune planning parameters.
         """
-        system = PLAN_SYSTEM_PROMPT.format(max_steps=self.max_steps)
+        # Adaptive complexity
+        self._complexity = GoalComplexityEstimator.estimate(goal)
+        profile = GoalComplexityEstimator.get_profile(self._complexity)
+        effective_max_steps = min(profile["max_steps"], self.max_steps)
+        self._replan_depth = profile["replan_depth"]
+        self._replan_count = 0
+        logger.info("Goal complexity: %s (max_steps=%d, replan_depth=%d)",
+                     self._complexity, effective_max_steps, self._replan_depth)
+
+        system = PLAN_SYSTEM_PROMPT.format(max_steps=effective_max_steps)
         user_msg = f"GOAL: {goal}"
         if context:
             user_msg += f"\n\nCONTEXT:\n{context}"
@@ -150,7 +174,13 @@ class Planner:
         if not response.content:
             return None, PlanFailure(reason="Empty response from LLM")
 
-        return self._parse_plan(goal, response.content)
+        plan, failure = self._parse_plan(goal, response.content)
+        # Apply complexity-based agent step budget to each step
+        if plan:
+            step_budget = profile["max_agent_steps"]
+            for step in plan.steps:
+                step.max_agent_steps = step_budget
+        return plan, failure
 
     def replan_remaining(
         self,
@@ -160,7 +190,17 @@ class Planner:
         failure_reason: str,
         tier: str = "small",
     ) -> tuple[Plan | None, PlanFailure | None]:
-        """Create a revised plan after a step failure."""
+        """Create a revised plan after a step failure.
+
+        Respects replan_depth limit from complexity estimation.
+        """
+        self._replan_count += 1
+        if self._replan_count > self._replan_depth:
+            return None, PlanFailure(
+                reason=f"Replan depth exceeded ({self._replan_count} > {self._replan_depth})",
+                recoverable=False,
+            )
+
         completed_text = "\n".join(
             f"  {i+1}. {s.title} (DONE)" for i, s in enumerate(completed)
         ) or "  (none)"
@@ -283,6 +323,62 @@ class PlanCritic:
             issues.append("Plan contains duplicate step titles (possible hallucination)")
 
         return issues
+
+
+# -----------------------------------------------------------------------
+# Goal complexity estimation
+# -----------------------------------------------------------------------
+
+# Keywords that suggest higher complexity
+_HIGH_COMPLEXITY_KEYWORDS = [
+    "refactor", "migrate", "architecture", "redesign", "overhaul",
+    "integrate", "multi-file", "multiple files", "full test suite",
+    "performance", "optimize", "security audit", "database schema",
+]
+
+_MEDIUM_COMPLEXITY_KEYWORDS = [
+    "implement", "feature", "add", "create", "build", "modify",
+    "update", "fix bug", "debug", "test", "review", "analyze",
+]
+
+
+class GoalComplexityEstimator:
+    """Estimate goal complexity from text to tune planning parameters.
+
+    Returns "low", "medium", or "high" based on keyword analysis and
+    goal length heuristics.
+    """
+
+    @staticmethod
+    def estimate(goal: str) -> str:
+        """Estimate complexity of a goal text."""
+        goal_lower = goal.lower()
+        word_count = len(goal.split())
+
+        # Long goals tend to be more complex
+        if word_count > 100:
+            return "high"
+
+        # Check for high-complexity keywords
+        high_count = sum(1 for kw in _HIGH_COMPLEXITY_KEYWORDS if kw in goal_lower)
+        if high_count >= 2:
+            return "high"
+
+        # Check for medium-complexity keywords
+        med_count = sum(1 for kw in _MEDIUM_COMPLEXITY_KEYWORDS if kw in goal_lower)
+        if med_count >= 2 or high_count >= 1:
+            return "medium"
+
+        # Short, simple goals
+        if word_count < 15:
+            return "low"
+
+        return "medium"
+
+    @staticmethod
+    def get_profile(complexity: str) -> dict[str, int]:
+        """Get planning parameters for a given complexity level."""
+        return dict(_COMPLEXITY_PROFILES.get(complexity, _COMPLEXITY_PROFILES["medium"]))
 
 
 # -----------------------------------------------------------------------

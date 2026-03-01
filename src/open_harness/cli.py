@@ -89,26 +89,69 @@ def self_update() -> bool:
     remote = subprocess.run(
         ["git", "rev-parse", "@{u}"], cwd=repo, capture_output=True, text=True)
 
-    if remote.returncode != 0:
-        console.print("[yellow]No upstream branch configured. Trying git pull anyway.[/yellow]")
+    no_upstream = remote.returncode != 0
+    if no_upstream:
+        console.print("[yellow]No upstream branch configured. Will pull origin/main.[/yellow]")
     elif local.stdout.strip() == remote.stdout.strip():
         console.print(f"[green]Already up-to-date (v{current_ver}).[/green]")
         return False
 
-    # 2. git pull
-    console.print("[dim]git pull ...[/dim]")
-    pull = subprocess.run(
-        ["git", "pull", "--ff-only"], cwd=repo, capture_output=True, text=True, timeout=60)
+    # 2. Stash local changes so pull doesn't fail on dirty working tree
+    status = subprocess.run(
+        ["git", "status", "--porcelain"], cwd=repo, capture_output=True, text=True)
+    stashed = False
+    if status.stdout.strip():
+        console.print("[dim]Stashing local changes ...[/dim]")
+        stash = subprocess.run(
+            ["git", "stash", "push", "-m", "open-harness: pre-update stash"],
+            cwd=repo, capture_output=True, text=True, timeout=15)
+        if stash.returncode == 0 and "No local changes" not in stash.stdout:
+            stashed = True
+
+    # 3. git pull — use explicit remote/branch when no upstream is set
+    if no_upstream:
+        # Determine the default branch on origin (usually main or master)
+        default_branch = "main"
+        for candidate in ("main", "master"):
+            check = subprocess.run(
+                ["git", "rev-parse", "--verify", f"origin/{candidate}"],
+                cwd=repo, capture_output=True, text=True)
+            if check.returncode == 0:
+                default_branch = candidate
+                break
+        console.print(f"[dim]git pull origin {default_branch} ...[/dim]")
+        pull = subprocess.run(
+            ["git", "pull", "--ff-only", "origin", default_branch],
+            cwd=repo, capture_output=True, text=True, timeout=60)
+    else:
+        console.print("[dim]git pull ...[/dim]")
+        pull = subprocess.run(
+            ["git", "pull", "--ff-only"], cwd=repo, capture_output=True, text=True, timeout=60)
+
     if pull.returncode != 0:
         console.print(f"[red]git pull failed: {pull.stderr.strip()}[/red]")
-        console.print("[dim]Hint: commit or stash local changes first.[/dim]")
+        if stashed:
+            subprocess.run(["git", "stash", "pop"], cwd=repo, capture_output=True, text=True)
+            console.print("[dim]Restored stashed changes.[/dim]")
+        else:
+            console.print("[dim]Hint: commit or stash local changes first.[/dim]")
         return False
 
     # Show what changed
     if pull.stdout.strip():
         console.print(f"[dim]{pull.stdout.strip()}[/dim]")
 
-    # 3. reinstall package (prefer uv, fall back to pip)
+    # Restore stashed changes after successful pull
+    if stashed:
+        pop = subprocess.run(
+            ["git", "stash", "pop"], cwd=repo, capture_output=True, text=True)
+        if pop.returncode == 0:
+            console.print("[dim]Restored stashed changes.[/dim]")
+        else:
+            console.print(f"[yellow]Stash pop failed: {pop.stderr.strip()[:100]}[/yellow]")
+            console.print("[dim]Your changes are still in git stash.[/dim]")
+
+    # 4. reinstall package (prefer uv, fall back to pip)
     if shutil.which("uv"):
         install_cmd = ["uv", "pip", "install", "-e", str(repo), "-q"]
         install_label = "uv pip install -e ."
@@ -233,6 +276,16 @@ class StreamingDisplay:
             elif event.data:
                 self.con.print()
                 self.con.print(Markdown(event.data))
+
+        elif event.type == "agent_progress":
+            tool = event.metadata.get("tool", "?")
+            self.con.print(f"[dim][{tool}] {event.data}[/dim]", end="\r")
+
+        elif event.type == "agent_done":
+            tool = event.metadata.get("tool", "?")
+            ok = event.metadata.get("success", False)
+            icon = "[green]OK[/green]" if ok else "[red]FAIL[/red]"
+            self.con.print(f"[dim]{icon} {tool} finished[/dim]")
 
         elif event.type == "summary":
             self._flush()
@@ -934,6 +987,13 @@ def main(config_path: str | None, tier: str | None, goal_text: str | None,
         console.print(f"[yellow]Git: auto-initialized (to allow safe file editing)[/yellow]")
     else:
         console.print(f"[dim]Git: {git_status}[/dim]")
+
+    # Clean up orphan branches from crashed sessions
+    if project.info.get("has_git"):
+        from open_harness.checkpoint import CheckpointEngine
+        orphans = CheckpointEngine.cleanup_orphan_branches(project.root)
+        if orphans:
+            console.print(f"[yellow]Cleaned up {len(orphans)} orphan branch(es) from previous session[/yellow]")
 
     model_cfg = config.llm.models.get(config.llm.default_tier)
     if model_cfg:

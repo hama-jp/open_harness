@@ -12,6 +12,7 @@ class TestRunnerTool(Tool):
     """Run project tests and return results."""
 
     name = "run_tests"
+    max_output = 4000
     description = (
         "Run the project's test suite (or a specific test file/pattern). "
         "Returns test output including pass/fail status. "

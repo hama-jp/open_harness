@@ -219,7 +219,7 @@ On startup, Open Harness displays:
 
 ```
 ╭──────────────────────────────────────────────────╮
-│ Open Harness v0.3.3                              │
+│ Open Harness v0.5.0                              │
 │ Self-driving AI agent for local LLMs             │
 │ Type /help for commands, /goal <task> for auto    │
 ╰──────────────────────────────────────────────────╯
@@ -355,7 +355,7 @@ The agent will:
 ### Limits and safety
 
 - Max 50 agent steps per goal
-- Max 5 plan steps (prevents over-planning)
+- Max 3-8 plan steps (adaptive based on goal complexity)
 - Checkpoint/rollback on failures (in git repos)
 - Policy guardrails enforced throughout
 
@@ -658,7 +658,7 @@ For complex goals, Open Harness uses a plan-execute-verify loop.
 Goal
   │
   ▼
-Planner ─── creates plan (up to 5 steps)
+Planner ─── creates plan (up to 3-8 steps, adaptive)
   │
   ▼
 Plan Critic ─── validates plan (rule-based)
@@ -671,7 +671,7 @@ Executor ─── executes each step
   ├── Step 3 → FAIL
   │     │
   │     ▼
-  │   Replanner ─── replan remaining steps (1 attempt)
+  │   Replanner ─── replan remaining steps (0-2 attempts)
   │     │
   │     ▼
   │   Continue execution...
@@ -684,11 +684,23 @@ Done (or fallback to direct mode)
 
 Each plan contains:
 - **Goal**: Original task description
-- **Steps**: Up to 5 sequential steps, each with:
+- **Steps**: Up to 3-8 sequential steps (adaptive), each with:
   - Title and detailed instruction
   - Success criteria (verifiable conditions)
-  - Agent step budget (default 12 per step)
+  - Agent step budget (8-15 per step, adaptive)
 - **Assumptions**: What the planner assumed about the environment
+
+### Complexity-adaptive planning (v0.5.0)
+
+The planner automatically estimates goal complexity (Low / Medium / High) and adjusts its behavior:
+
+| Complexity | Max steps | Agent step budget | Replan attempts |
+|------------|-----------|-------------------|-----------------|
+| Low | 3 | 8 per step | 0 |
+| Medium | 5 | 12 per step | 1 |
+| High | 8 | 15 per step | 2 |
+
+Simple goals like "fix typo" get fewer steps and a tighter budget, while complex goals like "refactor the database schema and migrate all data" get more room to work.
 
 ### Fallback behavior
 
@@ -696,7 +708,7 @@ The system is designed for graceful degradation:
 
 1. If the planner can't create a plan → direct execution
 2. If the critic rejects the plan → direct execution
-3. If a step fails → replan once, then fallback
+3. If a step fails → replan (up to complexity-dependent limit), then fallback
 4. If replanning fails → direct execution with completed context
 
 This means `/goal` always attempts to complete the task, even with a weak LLM.
@@ -728,7 +740,7 @@ When you run `/goal`, the system automatically:
 
 1. **Stashes** any uncommitted changes (safety net)
 2. **Creates a work branch** (`harness/goal-<timestamp>`)
-3. **Snapshots** after every 5 file writes and after each plan step
+3. **Snapshots** after every 10 file writes and after each plan step
 4. **Rolls back** if tests fail
 5. **Squash-merges** all changes back to your branch on success
 6. **Restores** your original stashed changes
@@ -1111,7 +1123,17 @@ Config: defaults (no open_harness.yaml found)
 
 ### Model returns garbage / tool calls fail
 
-This is expected with smaller LLMs. The compensation engine handles this automatically:
+This is expected with smaller LLMs. The compensation engine handles this automatically with error-class-specific strategies (v0.5.0):
+
+| Error class | Strategy |
+|-------------|----------|
+| `malformed_json` | JSON repair (no LLM retry needed) |
+| `wrong_tool_name` | Fuzzy match to suggest correct tool name |
+| `missing_args` | Inject parameter schema into correction prompt |
+| `empty_response` | Immediate model escalation |
+| `prose_wrapped` | Extract JSON from prose (parser handles it) |
+
+If classification-based recovery fails, the standard retry sequence applies:
 
 1. `refine_prompt` — adds correction hints
 2. `add_examples` — adds tool-call examples

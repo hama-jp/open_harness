@@ -16,6 +16,7 @@ class ReadFileTool(Tool):
 
     name = "read_file"
     description = "Read the contents of a file. Returns the file content as text."
+    max_output = 8000
     parameters = [
         ToolParameter(
             name="path",

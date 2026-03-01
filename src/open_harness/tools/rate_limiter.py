@@ -184,7 +184,13 @@ class AgentRateLimiter:
 
     @staticmethod
     def is_rate_limit_error(output: str) -> bool:
-        """Detect whether the output indicates a rate limit error."""
+        """Detect whether the output indicates a rate limit error.
+
+        Only scans the first 2000 chars — rate limit messages appear near
+        the start of output, so scanning the full text is wasteful.
+        """
+        # Short-circuit: rate limit errors appear in the first portion of output
+        output = output[:2000]
         for pattern in _RATE_LIMIT_PATTERNS:
             if pattern.search(output):
                 return True
