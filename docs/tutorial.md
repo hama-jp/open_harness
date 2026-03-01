@@ -24,6 +24,7 @@ A comprehensive guide to using Open Harness — a self-driving AI agent harness 
 16. [@file References and Tab Completion](#16-file-references-and-tab-completion)
 17. [Mode Switching](#17-mode-switching)
 18. [Rate-Limit Fallback](#18-rate-limit-fallback)
+19. [TUI Dashboard](#19-tui-dashboard)
 
 ---
 
@@ -1263,6 +1264,69 @@ If all agents are rate-limited, the task proceeds with the original agent (which
 
 ---
 
+## 19. TUI Dashboard
+
+Open Harness includes a rich terminal UI (TUI) built with [Textual](https://textual.textualize.io/). Launch it with:
+
+```bash
+harness --tui
+```
+
+> **Prerequisite**: Install the TUI extra: `uv pip install -e ".[tui]"`
+
+### Layout
+
+The TUI has a two-pane layout:
+
+- **Main output** (left) — Streaming agent output, tool calls, and results
+- **Sidebar** (right) — Collapsible sections for History, Plan, Queue, Agents, Tasks, and Stats
+- **Sub-agent panel** — Auto-shows when external agents (Claude Code, Codex, Gemini) are active
+- **Progress bar** — Appears during goal execution, showing plan step progress (e.g., Step 2/5)
+- **Input area** (bottom) — Multiline text area with Shift+Enter for new lines
+
+The panes are separated by a **draggable resize handle** — click and drag to adjust widths.
+
+### Keyboard shortcuts
+
+| Key | Action |
+|-----|--------|
+| `Escape` | Cancel running agent |
+| `Enter` | Submit input |
+| `Shift+Enter` | Insert new line in input |
+| `Up` / `Down` | Navigate input history (when cursor at top/bottom) |
+| `Tab` | Cycle mode: plan / goal (when not in input) |
+| `Ctrl+E` | Toggle tool output compact (200 chars) / expanded (2000 chars) |
+| `Ctrl+D` | Toggle dark / light theme |
+| `Ctrl+S` | Toggle sidebar visibility |
+| `Ctrl+A` | Toggle sub-agent panel |
+| `Ctrl+L` | Clear output log |
+| `Ctrl+Q` | Quit |
+| `F1` | Show help |
+
+### Features
+
+**Agent cancellation** — Press `Escape` to cancel a running agent. The agent stops after the current tool call finishes. In CLI mode, `Ctrl+C` provides the same functionality during plan and goal execution.
+
+**Input history** — Use `Up` and `Down` arrow keys to navigate through previous inputs. History includes both plan and goal mode inputs. Click an entry in the sidebar History section to scroll to its output.
+
+**Plan step progress** — When a goal is running, a progress bar appears at the top of the output area showing the current step out of total steps (e.g., `Step 3/5`). Completed steps are shown in green, the current step in yellow, and future steps dimmed in the Plan sidebar.
+
+**Compact / expanded tool output** — By default, tool results are truncated to 200 characters. Press `Ctrl+E` to toggle between compact (200 chars) and expanded (2000 chars) mode.
+
+**Real-time stats** — The Stats sidebar section updates every second during agent execution, showing elapsed time, tool call counts, and compensation counts.
+
+**Toast notifications** — When a background task completes, a toast notification appears at the top of the screen indicating success or failure.
+
+**Dark / light theme** — Press `Ctrl+D` to toggle between dark and light themes.
+
+**Multiline input** — The input area is a full text editor. Press `Enter` to submit, `Shift+Enter` to add a new line. This is useful for pasting multi-line code or writing complex prompts.
+
+### Slash commands in TUI
+
+All REPL commands work in TUI mode: `/goal`, `/submit`, `/tasks`, `/result`, `/model`, `/tier`, `/policy`, `/tools`, `/memory`, `/project`, `/clear`, `/quit`.
+
+---
+
 ## Appendix: Command-Line Reference
 
 ```
@@ -1272,6 +1336,7 @@ Options:
   -c, --config PATH     Path to open_harness.yaml
   -t, --tier TIER       Model tier (small, medium, large)
   -g, --goal TEXT       Run goal non-interactively and exit
+  --tui                 Launch TUI dashboard mode
   -v, --verbose         Enable debug logging
   --help                Show help
 ```
