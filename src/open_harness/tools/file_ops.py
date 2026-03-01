@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import os
+import re as _re
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from open_harness.config import FileToolConfig
 from open_harness.tools.base import Tool, ToolParameter, ToolResult
@@ -140,6 +141,43 @@ class EditFileTool(Tool):
         ),
     ]
 
+    @staticmethod
+    def _normalize_ws(s: str) -> str:
+        """Normalize whitespace: strip each line, collapse runs of spaces."""
+        lines = [_re.sub(r"\s+", " ", line.strip()) for line in s.splitlines()]
+        return "\n".join(lines)
+
+    def _fuzzy_find(self, text: str, old: str) -> tuple[int, int] | int | None:
+        """Find *old* in *text* using whitespace-normalized comparison.
+
+        Returns (start, end) indices into *text* of the matching region,
+        the match count (int > 1) if multiple matches found, or None if
+        no match is found.
+        """
+        norm_old = self._normalize_ws(old)
+        norm_old_lines = norm_old.splitlines()
+        if not norm_old_lines:
+            return None
+
+        text_lines = text.splitlines(keepends=True)
+        norm_text_lines = [_re.sub(r"\s+", " ", line.strip()) for line in text_lines]
+
+        window = len(norm_old_lines)
+        matches: list[tuple[int, int]] = []
+        for i in range(len(norm_text_lines) - window + 1):
+            candidate = "\n".join(norm_text_lines[i : i + window])
+            if candidate == norm_old:
+                # Compute byte offsets in original text
+                start = sum(len(l) for l in text_lines[:i])
+                end = sum(len(l) for l in text_lines[: i + window])
+                matches.append((start, end))
+
+        if len(matches) == 1:
+            return matches[0]
+        if len(matches) > 1:
+            return len(matches)  # signal: multiple matches
+        return None
+
     def execute(self, **kwargs: Any) -> ToolResult:
         path = kwargs.get("path", "")
         old = kwargs.get("old_string", "")
@@ -157,17 +195,32 @@ class EditFileTool(Tool):
         try:
             text = p.read_text()
             count = text.count(old)
-            if count == 0:
-                return ToolResult(success=False, output="", error="old_string not found in file")
+            if count == 1:
+                text = text.replace(old, new, 1)
+                p.write_text(text)
+                return ToolResult(success=True, output=f"Edit applied to {p}")
             if count > 1:
                 return ToolResult(
                     success=False,
                     output="",
                     error=f"old_string found {count} times. Provide more context to make it unique.",
                 )
-            text = text.replace(old, new, 1)
-            p.write_text(text)
-            return ToolResult(success=True, output=f"Edit applied to {p}")
+            # count == 0 — try whitespace-normalized fuzzy match
+            span = self._fuzzy_find(text, old)
+            if isinstance(span, tuple):
+                text = text[: span[0]] + new + text[span[1] :]
+                p.write_text(text)
+                return ToolResult(
+                    success=True,
+                    output=f"Edit applied to {p} (matched with whitespace normalization)",
+                )
+            if isinstance(span, int):
+                return ToolResult(
+                    success=False, output="",
+                    error=f"old_string found {span} times (with whitespace normalization). "
+                          f"Provide more context to make it unique.",
+                )
+            return ToolResult(success=False, output="", error="old_string not found in file")
         except Exception as e:
             return ToolResult(success=False, output="", error=str(e))
 
@@ -310,3 +363,115 @@ class SearchFilesTool(Tool):
             return ToolResult(success=True, output="\n".join(matches))
         except Exception as e:
             return ToolResult(success=False, output="", error=str(e))
+
+
+class AskUserTool(Tool):
+    """Ask the user a question and return their answer."""
+
+    name = "ask_user"
+    description = (
+        "Ask the user a question when you need clarification or a decision. "
+        "Returns the user's answer as text."
+    )
+    parameters = [
+        ToolParameter(
+            name="question",
+            type="string",
+            description="The question to ask the user",
+        ),
+    ]
+
+    def __init__(self, user_input_fn: Callable[[str], str] | None = None):
+        self._user_input_fn = user_input_fn
+
+    def execute(self, **kwargs: Any) -> ToolResult:
+        question = kwargs.get("question", "")
+        if not question:
+            return ToolResult(success=False, output="", error="No question provided")
+
+        if self._user_input_fn is None:
+            return ToolResult(
+                success=False,
+                output="",
+                error="Cannot ask user: running in non-interactive mode.",
+            )
+        try:
+            answer = self._user_input_fn(question)
+            return ToolResult(success=True, output=str(answer) if answer is not None else "")
+        except (EOFError, KeyboardInterrupt):
+            return ToolResult(success=True, output="[User declined to answer]")
+        except Exception as e:
+            return ToolResult(success=False, output="", error=str(e))
+
+
+class ProjectTreeTool(Tool):
+    """Show directory tree structure."""
+
+    name = "project_tree"
+    description = (
+        "Show the directory tree structure starting from a given path. "
+        "Useful for understanding project layout."
+    )
+    parameters = [
+        ToolParameter(
+            name="path",
+            type="string",
+            description="Root path to display tree from",
+            required=False,
+            default=".",
+        ),
+        ToolParameter(
+            name="max_depth",
+            type="integer",
+            description="Maximum depth to traverse",
+            required=False,
+            default=3,
+        ),
+    ]
+
+    _SKIP = {
+        ".git", "node_modules", "__pycache__", ".venv", "venv",
+        ".mypy_cache", ".ruff_cache", ".pytest_cache", "dist", "build",
+        ".eggs", ".tox", ".next", "target", ".cache",
+    }
+    _SKIP_EXT = {".pyc", ".pyo", ".so", ".dylib"}
+
+    def execute(self, **kwargs: Any) -> ToolResult:
+        path = kwargs.get("path", ".")
+        max_depth = kwargs.get("max_depth", 3)
+        p = Path(path).expanduser().resolve()
+        if not p.exists():
+            return ToolResult(success=False, output="", error=f"Path not found: {p}")
+        if not p.is_dir():
+            return ToolResult(success=False, output="", error=f"Not a directory: {p}")
+
+        lines: list[str] = [str(p.name) + "/"]
+        self._walk(p, max_depth, "", lines)
+        return ToolResult(success=True, output="\n".join(lines))
+
+    def _walk(self, root: Path, max_depth: int, prefix: str,
+              lines: list[str], depth: int = 0):
+        if depth >= max_depth:
+            return
+        try:
+            entries = sorted(root.iterdir(),
+                             key=lambda e: (not e.is_dir(), e.name.lower()))
+        except PermissionError:
+            lines.append(f"{prefix}(permission denied)")
+            return
+        # Filter out skipped dirs/files
+        entries = [
+            e for e in entries
+            if e.name not in self._SKIP
+            and not e.name.startswith(".")
+            and e.suffix not in self._SKIP_EXT
+        ]
+        for i, entry in enumerate(entries):
+            is_last = i == len(entries) - 1
+            connector = "└── " if is_last else "├── "
+            if entry.is_dir():
+                lines.append(f"{prefix}{connector}{entry.name}/")
+                extension = "    " if is_last else "│   "
+                self._walk(entry, max_depth, prefix + extension, lines, depth + 1)
+            else:
+                lines.append(f"{prefix}{connector}{entry.name}")

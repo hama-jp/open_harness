@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import re
 import time
 from dataclasses import dataclass, field
@@ -11,6 +12,12 @@ from typing import Any, Generator
 import httpx
 
 from open_harness.config import ProviderConfig
+
+_logger = logging.getLogger(__name__)
+
+# Retry configuration
+_MAX_RETRIES = 3
+_BACKOFF_BASE = 1  # seconds — exponential: 1, 2, 4
 
 
 @dataclass
@@ -327,11 +334,40 @@ class LLMClient:
                 payload["tool_choice"] = tool_choice
 
         start = time.monotonic()
-        try:
-            resp = self.client.post("/chat/completions", json=payload)
-            resp.raise_for_status()
-        except httpx.HTTPError as e:
-            return LLMResponse(content=f"[LLM API Error: {e}]", finish_reason="error")
+        resp = None
+        last_error: Exception | None = None
+        for attempt in range(_MAX_RETRIES):
+            try:
+                resp = self.client.post("/chat/completions", json=payload)
+                if resp.status_code in (429, 500, 502, 503, 504):
+                    _logger.warning(
+                        "LLM API returned %d (attempt %d/%d), retrying...",
+                        resp.status_code, attempt + 1, _MAX_RETRIES)
+                    time.sleep(_BACKOFF_BASE * (2 ** attempt))
+                    continue
+                resp.raise_for_status()
+                break
+            except httpx.TimeoutException as e:
+                last_error = e
+                _logger.warning(
+                    "LLM API timeout (attempt %d/%d): %s",
+                    attempt + 1, _MAX_RETRIES, e)
+                time.sleep(_BACKOFF_BASE * (2 ** attempt))
+            except httpx.HTTPError as e:
+                last_error = e
+                # Don't retry client errors (4xx) except 429
+                if hasattr(e, "response") and e.response is not None:
+                    if 400 <= e.response.status_code < 500 and e.response.status_code != 429:
+                        return LLMResponse(content=f"[LLM API Error: {e}]", finish_reason="error")
+                _logger.warning(
+                    "LLM API error (attempt %d/%d): %s",
+                    attempt + 1, _MAX_RETRIES, e)
+                time.sleep(_BACKOFF_BASE * (2 ** attempt))
+        else:
+            err = last_error or "exhausted retries"
+            return LLMResponse(content=f"[LLM API Error: {err}]", finish_reason="error")
+        if resp is None:
+            return LLMResponse(content="[LLM API Error: no response]", finish_reason="error")
 
         latency = (time.monotonic() - start) * 1000
         try:
@@ -406,31 +442,76 @@ class LLMClient:
         model_name = model
 
         try:
-            with self._stream_client.stream("POST", "/chat/completions", json=payload) as resp:
-                resp.raise_for_status()
-                for raw_line in resp.iter_lines():
-                    if not raw_line.startswith("data: "):
+            # Retry only the connection phase. Once we start yielding chunks,
+            # we cannot retry without corrupting downstream consumers.
+            _chunks_yielded = False
+            success = False
+            for _attempt in range(_MAX_RETRIES):
+                try:
+                    with self._stream_client.stream("POST", "/chat/completions", json=payload) as resp:
+                        if resp.status_code in (429, 500, 502, 503, 504):
+                            _logger.warning(
+                                "LLM stream API returned %d (attempt %d/%d), retrying...",
+                                resp.status_code, _attempt + 1, _MAX_RETRIES)
+                            time.sleep(_BACKOFF_BASE * (2 ** _attempt))
+                            processor = StreamProcessor()
+                            continue
+                        resp.raise_for_status()
+                        for raw_line in resp.iter_lines():
+                            if not raw_line.startswith("data: "):
+                                continue
+                            data_str = raw_line[6:].strip()
+                            if data_str == "[DONE]":
+                                break
+
+                            try:
+                                data = json.loads(data_str)
+                            except json.JSONDecodeError:
+                                continue
+
+                            choice = data.get("choices", [{}])[0]
+                            delta = choice.get("delta", {})
+                            chunk = delta.get("content", "")
+                            if not chunk:
+                                continue
+
+                            model_name = data.get("model", model)
+
+                            for event in processor.feed(chunk):
+                                _chunks_yielded = True
+                                yield event
+                    success = True
+                    break
+                except (httpx.TimeoutException, httpx.TransportError) as e:
+                    # If we already yielded chunks, retrying would corrupt output
+                    if _chunks_yielded:
+                        latency = (time.monotonic() - start) * 1000
+                        return LLMResponse(
+                            content=f"[LLM API Error: stream interrupted after partial output: {e}]",
+                            finish_reason="error",
+                            latency_ms=latency,
+                        )
+                    _logger.warning(
+                        "LLM stream error (attempt %d/%d): %s",
+                        _attempt + 1, _MAX_RETRIES, e)
+                    if _attempt < _MAX_RETRIES - 1:
+                        time.sleep(_BACKOFF_BASE * (2 ** _attempt))
+                        processor = StreamProcessor()
                         continue
-                    data_str = raw_line[6:].strip()
-                    if data_str == "[DONE]":
-                        break
+                    latency = (time.monotonic() - start) * 1000
+                    return LLMResponse(
+                        content=f"[LLM API Error: {e}]",
+                        finish_reason="error",
+                        latency_ms=latency,
+                    )
 
-                    try:
-                        data = json.loads(data_str)
-                    except json.JSONDecodeError:
-                        continue
-
-                    choice = data.get("choices", [{}])[0]
-                    delta = choice.get("delta", {})
-                    chunk = delta.get("content", "")
-                    if not chunk:
-                        continue
-
-                    model_name = data.get("model", model)
-
-                    # Process chunk through state machine
-                    for event in processor.feed(chunk):
-                        yield event
+            if not success:
+                latency = (time.monotonic() - start) * 1000
+                return LLMResponse(
+                    content="[LLM API Error: exhausted retries]",
+                    finish_reason="error",
+                    latency_ms=latency,
+                )
 
         except KeyboardInterrupt:
             latency = (time.monotonic() - start) * 1000
@@ -440,13 +521,6 @@ class LLMClient:
                 thinking=thinking,
                 finish_reason="interrupted",
                 model=model_name,
-                latency_ms=latency,
-            )
-        except httpx.ReadTimeout:
-            latency = (time.monotonic() - start) * 1000
-            return LLMResponse(
-                content="[LLM API Error: read timeout — no response from server]",
-                finish_reason="error",
                 latency_ms=latency,
             )
         except httpx.HTTPError as e:

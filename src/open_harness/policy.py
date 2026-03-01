@@ -201,7 +201,8 @@ class PolicyEngine:
             return violation
 
         # Path checks for file-accessing tools
-        if tool_name in ("read_file", "write_file", "edit_file", "list_dir", "search_files"):
+        if tool_name in ("read_file", "write_file", "edit_file", "list_dir",
+                          "search_files", "project_tree"):
             path = args.get("path", "")
             if path:
                 if tool_name in ("write_file", "edit_file"):
@@ -217,6 +218,14 @@ class PolicyEngine:
             violation = self._check_shell(command, tool_name, category)
             if violation:
                 return violation
+
+        # CWD checks for tools that accept a working directory
+        if tool_name in ("shell", "git_diff", "git_commit", "git_log", "run_tests"):
+            cwd = args.get("cwd", "")
+            if cwd:
+                violation = self._check_cwd(cwd, tool_name, category)
+                if violation:
+                    return violation
 
         return None
 
@@ -359,6 +368,35 @@ class PolicyEngine:
                     f"{f' ({self._project_root})' if self._project_root else ''}. {hint}",
             tool=tool_name, category=category,
         )
+
+    def _check_cwd(self, cwd: str, tool_name: str, category: str) -> PolicyViolation | None:
+        """Check that a working directory is within the project root."""
+        if not isinstance(cwd, str):
+            return PolicyViolation(
+                rule="cwd_invalid_type",
+                message=f"Working directory must be a string, got {type(cwd).__name__}",
+                tool=tool_name, category=category,
+            )
+        try:
+            resolved = Path(cwd).expanduser().resolve()
+        except (TypeError, ValueError) as e:
+            return PolicyViolation(
+                rule="cwd_invalid_path",
+                message=f"Invalid working directory '{cwd}': {e}",
+                tool=tool_name, category=category,
+            )
+        if self._project_root:
+            try:
+                resolved.relative_to(self._project_root)
+                return None
+            except ValueError:
+                return PolicyViolation(
+                    rule="cwd_outside_project",
+                    message=f"Working directory '{cwd}' is outside project root "
+                            f"({self._project_root}). Use a path within the project.",
+                    tool=tool_name, category=category,
+                )
+        return None
 
     def _check_shell(self, command: str, tool_name: str, category: str) -> PolicyViolation | None:
         cmd_lower = command.lower().strip()
