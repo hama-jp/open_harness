@@ -168,12 +168,16 @@ class StreamProcessor:
     # Fenced code block markers that indicate the LLM is wrapping a tool call
     _FENCE_PREFIXES = ("```json", "```\n{", "```{")
 
+    # Yield a partial thinking event every N characters so the UI stays alive
+    _THINKING_YIELD_INTERVAL = 200
+
     def __init__(self):
         self.buffer = ""
         self.thinking = ""
         self.content_start = 0
         self.displayed_up_to = 0
         self.state = "init"
+        self._thinking_yielded_at = 0
 
     def feed(self, chunk: str) -> Generator[tuple[str, str], None, None]:
         """Feed a chunk. Yields (event_type, data) pairs.
@@ -209,6 +213,17 @@ class StreamProcessor:
                     yield ("thinking", self.thinking)
                     self.state = "detecting"
                     changed = True
+                else:
+                    # Yield partial thinking so the UI stays responsive
+                    think_start = self.buffer.find("<think>")
+                    if think_start >= 0:
+                        partial_len = len(self.buffer) - think_start - len("<think>")
+                        if partial_len - self._thinking_yielded_at >= self._THINKING_YIELD_INTERVAL:
+                            self._thinking_yielded_at = partial_len
+                            snippet = self.buffer[think_start + len("<think>"):].strip()
+                            # Show last line as progress
+                            last_line = snippet.split("\n")[-1][:80]
+                            yield ("thinking", last_line)
 
             elif self.state == "detecting":
                 content = self.buffer[self.content_start:].lstrip()
@@ -272,14 +287,22 @@ class LLMClient:
 
     def __init__(self, provider: ProviderConfig, timeout: float = 120):
         self.provider = provider
-        # Local LLMs can take a while for first token, but stream chunks quickly
+        _headers = {
+            "Authorization": f"Bearer {provider.api_key}",
+            "Content-Type": "application/json",
+        }
+        # Non-streaming: generous read timeout for slow models
         self.client = httpx.Client(
             base_url=provider.base_url,
-            headers={
-                "Authorization": f"Bearer {provider.api_key}",
-                "Content-Type": "application/json",
-            },
+            headers=_headers,
             timeout=httpx.Timeout(timeout, connect=30, read=300),
+        )
+        # Streaming: shorter read timeout — chunks arrive frequently once
+        # generation starts, so a 60s gap means something is wrong.
+        self._stream_client = httpx.Client(
+            base_url=provider.base_url,
+            headers=_headers,
+            timeout=httpx.Timeout(timeout, connect=30, read=60),
         )
 
     def chat(
@@ -383,7 +406,7 @@ class LLMClient:
         model_name = model
 
         try:
-            with self.client.stream("POST", "/chat/completions", json=payload) as resp:
+            with self._stream_client.stream("POST", "/chat/completions", json=payload) as resp:
                 resp.raise_for_status()
                 for raw_line in resp.iter_lines():
                     if not raw_line.startswith("data: "):
@@ -409,6 +432,23 @@ class LLMClient:
                     for event in processor.feed(chunk):
                         yield event
 
+        except KeyboardInterrupt:
+            latency = (time.monotonic() - start) * 1000
+            thinking, content, tool_calls = processor.finish()
+            return LLMResponse(
+                content=content or "[Interrupted]",
+                thinking=thinking,
+                finish_reason="interrupted",
+                model=model_name,
+                latency_ms=latency,
+            )
+        except httpx.ReadTimeout:
+            latency = (time.monotonic() - start) * 1000
+            return LLMResponse(
+                content="[LLM API Error: read timeout — no response from server]",
+                finish_reason="error",
+                latency_ms=latency,
+            )
         except httpx.HTTPError as e:
             latency = (time.monotonic() - start) * 1000
             return LLMResponse(
@@ -438,3 +478,4 @@ class LLMClient:
 
     def close(self):
         self.client.close()
+        self._stream_client.close()

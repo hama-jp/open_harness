@@ -722,6 +722,11 @@ class Agent:
                     yield AgentEvent("text", data)
         except StopIteration as e:
             response = e.value
+        except KeyboardInterrupt:
+            # Gracefully close the generator so the httpx stream is cleaned up
+            gen.close()
+            response = LLMResponse(content="[Interrupted]", finish_reason="interrupted")
+            yield AgentEvent("done", "[Interrupted by user]")
         if response is None:
             response = LLMResponse(content="", finish_reason="error")
         return response
