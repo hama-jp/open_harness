@@ -27,7 +27,7 @@ from open_harness.memory.store import MemoryStore
 from open_harness.project import ProjectContext
 from open_harness.tasks.queue import TaskQueueManager, TaskRecord, TaskStatus, TaskStore
 from open_harness.tools.base import ToolRegistry
-from open_harness.tools.external import CodexTool, GeminiCliTool
+from open_harness.tools.external import ClaudeCodeTool, CodexTool, GeminiCliTool
 from open_harness.tools.file_ops import (
     EditFileTool, ListDirectoryTool, ReadFileTool, SearchFilesTool, WriteFileTool,
 )
@@ -143,6 +143,7 @@ def setup_tools(config: HarnessConfig, project: ProjectContext) -> ToolRegistry:
     for name, tool_cls, flag_key in [
         ("codex", CodexTool, "codex"),
         ("gemini", GeminiCliTool, "gemini"),
+        ("claude_code", ClaudeCodeTool, "claude"),
     ]:
         ext_cfg = config.external_agents.get(flag_key)
         if ext_cfg and ext_cfg.enabled:

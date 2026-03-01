@@ -12,7 +12,8 @@ Self-driving AI agent harness optimized for local LLMs.
 - **Background Task Queue** — Submit goals to a FIFO queue, keep working while they execute
 - **Project Memory** — Learns project patterns across sessions (test commands, error fixes, workflows)
 - **Policy Guardrails** — Configurable safety limits (safe / balanced / full presets)
-- **14 Built-in Tools** — File ops, shell, git, testing, and external agent delegation (Codex, Gemini CLI)
+- **Orchestrator Architecture** — Local LLM plans and coordinates; external agents (Claude Code, Codex, Gemini CLI) handle code generation and analysis
+- **15 Built-in Tools** — File ops, shell, git, testing, and external agent delegation (Claude Code, Codex, Gemini CLI)
 - **Per-Project Config** — Place `open_harness.yaml` in any directory to customize per-project
 
 ## Quick Start
