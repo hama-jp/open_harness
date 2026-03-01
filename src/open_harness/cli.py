@@ -39,6 +39,17 @@ console = Console()
 _REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 
 
+def get_version() -> str:
+    """Read version from pyproject.toml."""
+    toml = _REPO_ROOT / "pyproject.toml"
+    if toml.exists():
+        for line in toml.read_text().splitlines():
+            if line.strip().startswith("version"):
+                # version = "0.2.0"
+                return line.split("=", 1)[1].strip().strip('"').strip("'")
+    return "unknown"
+
+
 def self_update() -> bool:
     """Pull latest code from git and reinstall the package.
 
@@ -51,6 +62,8 @@ def self_update() -> bool:
         console.print(f"[red]Not a git repository: {repo}[/red]")
         return False
 
+    current_ver = get_version()
+    console.print(f"[dim]Current version: v{current_ver}[/dim]")
     console.print(f"[dim]Updating from {repo} ...[/dim]")
 
     # 1. git fetch + check
@@ -69,7 +82,7 @@ def self_update() -> bool:
     if remote.returncode != 0:
         console.print("[yellow]No upstream branch configured. Trying git pull anyway.[/yellow]")
     elif local.stdout.strip() == remote.stdout.strip():
-        console.print("[green]Already up-to-date.[/green]")
+        console.print(f"[green]Already up-to-date (v{current_ver}).[/green]")
         return False
 
     # 2. git pull
@@ -86,7 +99,6 @@ def self_update() -> bool:
         console.print(f"[dim]{pull.stdout.strip()}[/dim]")
 
     # 3. pip install -e . (pick up dependency changes)
-    pip_exe = str(Path(sys.executable).parent / "pip")
     console.print("[dim]pip install -e . ...[/dim]")
     pip = subprocess.run(
         [sys.executable, "-m", "pip", "install", "-e", str(repo), "-q"],
@@ -94,7 +106,9 @@ def self_update() -> bool:
     if pip.returncode != 0:
         console.print(f"[yellow]pip install warning: {pip.stderr.strip()[:200]}[/yellow]")
 
-    console.print("[green]Update complete. Please restart harness.[/green]")
+    new_ver = get_version()
+    console.print(f"[green]Updated: v{current_ver} -> v{new_ver}[/green]")
+    console.print("[dim]Please restart harness to apply changes.[/dim]")
     return True
 
 
@@ -460,8 +474,9 @@ def main(config_path: str | None, tier: str | None, goal_text: str | None,
         self_update()
         return
 
+    version = get_version()
     console.print(Panel(
-        "[bold]Open Harness[/bold] v0.2.0\n"
+        f"[bold]Open Harness[/bold] v{version}\n"
         "Self-driving AI agent for local LLMs\n"
         "[dim]Type /help for commands, /goal <task> for autonomous mode[/dim]",
         border_style="blue",
