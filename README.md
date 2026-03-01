@@ -2,6 +2,8 @@
 
 Self-driving AI agent harness optimized for local LLMs.
 
+![Open Harness CLI](screenshot.png)
+
 ## Features
 
 - **Local LLM First** — Designed for LM Studio, Ollama, and any OpenAI-compatible API
