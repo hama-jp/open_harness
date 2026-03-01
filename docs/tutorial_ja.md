@@ -146,6 +146,9 @@ tools:
 
 # ── 外部エージェント ──
 external_agents:
+  claude:
+    enabled: true
+    command: "claude"
   codex:
     enabled: true
     command: "codex"
@@ -156,6 +159,9 @@ external_agents:
 # ── ポリシー ──
 policy:
   mode: "balanced"          # safe | balanced | full
+  # writable_paths:         # プロジェクトルート以外の書き込み可能ディレクトリ
+  #   - "/tmp/*"
+  #   - "~/other-project/*"
 
 # ── メモリ ──
 memory:
@@ -445,8 +451,12 @@ Log: ~/.open_harness/logs/task_1709312400_abc123.log
 
 | ツール | 説明 | 使用例 |
 |--------|------|--------|
+| `claude_code` | Claude Code (Anthropic) に委譲 | `claude_code("このモジュールをリファクタリングして")` |
 | `codex` | OpenAI Codex CLI に委譲 | `codex("REST APIクライアントを生成して")` |
 | `gemini_cli` | Google Gemini CLI に委譲 | `gemini_cli("このアーキテクチャを分析して")` |
+
+> **オーケストレーターアーキテクチャ**: Open Harness はローカルLLMを計画・調整のオーケストレーターとして使用します。
+> コード生成・分析・デバッグは外部エージェント（Claude Code, Codex, Gemini CLI）に委譲されます。
 
 ---
 
@@ -535,8 +545,8 @@ models:
 
 | プリセット | ファイル書き込み | シェル | Git コミット | 外部呼び出し |
 |-----------|----------------|--------|-------------|-------------|
-| `safe` | 20回 | 30回 | 3回 | 2回 |
-| `balanced` | 無制限 | 無制限 | 10回 | 5回 |
+| `safe` | 20回 | 30回 | 3回 | 10回 |
+| `balanced` | 無制限 | 無制限 | 10回 | 無制限 |
 | `full` | 無制限 | 無制限 | 無制限 | 無制限 |
 
 ### 実行時のポリシー切替
@@ -560,9 +570,26 @@ Denied paths: 8 patterns
 Blocked shell: 7 patterns
 ```
 
+### 書き込みパス制限
+
+デフォルトでは、`write_file` と `edit_file` は**プロジェクトルートディレクトリ**以下に制限されます。これにより、エージェントがプロジェクト外のファイルを誤って変更することを防ぎます。
+
+追加のディレクトリへの書き込みを許可するには、`writable_paths` を使用します：
+
+```yaml
+policy:
+  writable_paths:
+    - "/tmp/*"              # /tmp への書き込みを許可
+    - "~/other-project/*"   # 別のプロジェクトへの書き込みを許可
+```
+
+`full` プリセットではホームディレクトリ全体（`~/*`）への書き込みが許可されます。
+
+> **注意**: 読み取り操作（`read_file`、`list_dir`、`search_files`）は `writable_paths` による制限を**受けません** — `denied_paths` に含まれないすべてのパスを読み取れます。
+
 ### デフォルトの拒否パス
 
-以下のパスはすべてのモードでデフォルトでブロックされます：
+以下のパスはすべてのモードでデフォルトでブロックされます（読み取り・書き込み両方）：
 
 - `/etc/*`、`/usr/*`、`/bin/*`、`/sbin/*`、`/boot/*`
 - `~/.ssh/*`、`~/.gnupg/*`
@@ -583,6 +610,8 @@ policy:
   mode: "balanced"
   max_file_writes: 50
   max_git_commits: 5
+  writable_paths:
+    - "/tmp/*"             # /tmp への書き込みを許可
   disabled_tools:
     - "shell"              # シェルを完全に無効化
   denied_paths:
@@ -755,9 +784,41 @@ Runbooks:
 
 ## 12. 外部エージェント連携
 
-Open Harness は外部の AI ツールにタスクを委譲できます。
+Open Harness は**オーケストレーターアーキテクチャ**を採用しています。ローカルLLMが計画・判断・ツール選択を担当し、コード生成・分析・デバッグなどの複雑なタスクは外部AIエージェントに委譲します。
+
+### なぜオーケストレーター？
+
+ローカルLLMは指示に従い簡単な判断を下すのは得意ですが、コード生成や複雑な推論は苦手です。強力な外部エージェント（Claude, Codex, Gemini）に委譲することで、両方の利点を活用できます：
+
+- **ローカルLLM** → 高速な計画、ツール選択、調整
+- **外部エージェント** → 高品質なコード生成、分析、デバッグ
+
+### Claude Code（Anthropic）— 推奨
+
+得意分野：コード生成、コード分析、リファクタリング、複雑な推論
+
+```yaml
+external_agents:
+  claude:
+    enabled: true
+    command: "claude"
+```
+
+自律モードでの使用例：
+
+```
+> /goal 認証モジュールをJWTトークン方式にリファクタリングする
+```
+
+エージェントは Claude Code に委譲します：
+
+```
+> claude_code "src/auth.py をセッションベースからJWTトークン方式にリファクタリングしてください。後方互換性を維持してください。"
+```
 
 ### Codex（OpenAI）
+
+得意分野：コード生成、デバッグ、自律的なコーディングタスク
 
 ```yaml
 external_agents:
@@ -766,19 +827,9 @@ external_agents:
     command: "codex"
 ```
 
-自律モードでの使用例：
-
-```
-> /goal Codex を使って認証モジュールのセキュリティ問題をレビューする
-```
-
-エージェントは `codex` ツールを使って複雑な分析を委譲します：
-
-```
-> codex "src/auth.py のセキュリティ脆弱性をレビューしてください。SQL インジェクション、XSS、認証バイパスに注目してください。"
-```
-
 ### Gemini CLI（Google）
+
+得意分野：コードレビュー、分析、別の視点からの提案
 
 ```yaml
 external_agents:
@@ -790,8 +841,8 @@ external_agents:
 ### ポリシーによる制限
 
 外部呼び出しはポリシーで制限されています：
-- `safe`：最大2回
-- `balanced`：最大5回
+- `safe`：最大10回
+- `balanced`：無制限（オーケストレーターが自由に委譲）
 - `full`：無制限
 
 ### 前提条件

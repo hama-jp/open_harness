@@ -146,6 +146,9 @@ tools:
 
 # ── External Agents ──
 external_agents:
+  claude:
+    enabled: true
+    command: "claude"
   codex:
     enabled: true
     command: "codex"
@@ -156,6 +159,9 @@ external_agents:
 # ── Policy ──
 policy:
   mode: "balanced"          # safe | balanced | full
+  # writable_paths:         # extra dirs writable beyond project root
+  #   - "/tmp/*"
+  #   - "~/other-project/*"
 
 # ── Memory ──
 memory:
@@ -449,8 +455,13 @@ Test commands are auto-detected per project type:
 
 | Tool | Description | Example |
 |------|-------------|---------|
+| `claude_code` | Delegate to Claude Code (Anthropic) | `claude_code("Refactor this module")` |
 | `codex` | Delegate to OpenAI Codex CLI | `codex("Generate a REST API client")` |
 | `gemini_cli` | Delegate to Google Gemini CLI | `gemini_cli("Analyze this architecture")` |
+
+> **Orchestrator architecture**: Open Harness uses the local LLM as an orchestrator for planning
+> and coordination. Code generation, analysis, and debugging are delegated to external agents
+> (Claude Code, Codex, Gemini CLI) which are far more capable at these tasks.
 
 ---
 
@@ -539,8 +550,8 @@ The policy engine provides automatic safety guardrails during autonomous executi
 
 | Preset | File writes | Shell | Git commits | External calls |
 |--------|------------|-------|-------------|----------------|
-| `safe` | 20 | 30 | 3 | 2 |
-| `balanced` | unlimited | unlimited | 10 | 5 |
+| `safe` | 20 | 30 | 3 | 10 |
+| `balanced` | unlimited | unlimited | 10 | unlimited |
 | `full` | unlimited | unlimited | unlimited | unlimited |
 
 ### Switch policy at runtime
@@ -564,9 +575,26 @@ Denied paths: 8 patterns
 Blocked shell: 7 patterns
 ```
 
+### Write path restrictions
+
+By default, `write_file` and `edit_file` are restricted to the **project root directory**. This prevents the agent from accidentally modifying files outside your project.
+
+To allow writing to additional directories, use `writable_paths`:
+
+```yaml
+policy:
+  writable_paths:
+    - "/tmp/*"              # Allow writes to /tmp
+    - "~/other-project/*"   # Allow writes to another project
+```
+
+The `full` preset allows writes to the entire home directory (`~/*`).
+
+> **Note**: Read operations (`read_file`, `list_dir`, `search_files`) are **not** restricted by `writable_paths` — they can read any path not in `denied_paths`.
+
 ### Default denied paths
 
-The following paths are blocked by default in all modes:
+The following paths are blocked by default in all modes (both read and write):
 
 - `/etc/*`, `/usr/*`, `/bin/*`, `/sbin/*`, `/boot/*`
 - `~/.ssh/*`, `~/.gnupg/*`
@@ -587,6 +615,8 @@ policy:
   mode: "balanced"
   max_file_writes: 50
   max_git_commits: 5
+  writable_paths:
+    - "/tmp/*"             # Allow writing to /tmp
   disabled_tools:
     - "shell"              # Disable shell entirely
   denied_paths:
@@ -759,9 +789,41 @@ Each project directory has its own set of learned memories. When you `cd` to a d
 
 ## 12. External Agent Integration
 
-Open Harness can delegate tasks to external AI tools.
+Open Harness uses an **orchestrator architecture**: the local LLM handles planning, judgment, and tool selection, while complex tasks like code generation, analysis, and debugging are delegated to external AI agents.
+
+### Why Orchestrator?
+
+Local LLMs are good at following instructions and making simple decisions, but struggle with code generation and complex reasoning. By delegating these tasks to powerful external agents (Claude, Codex, Gemini), you get the best of both worlds:
+
+- **Local LLM** → Fast planning, tool selection, coordination
+- **External agents** → High-quality code generation, analysis, debugging
+
+### Claude Code (Anthropic) — Recommended
+
+Best for: code generation, code analysis, refactoring, complex reasoning.
+
+```yaml
+external_agents:
+  claude:
+    enabled: true
+    command: "claude"
+```
+
+Usage in autonomous mode:
+
+```
+> /goal Refactor the authentication module to use JWT tokens
+```
+
+The agent will delegate to Claude Code:
+
+```
+> claude_code "Refactor src/auth.py to use JWT tokens instead of session-based auth. Keep backward compatibility."
+```
 
 ### Codex (OpenAI)
+
+Best for: code generation, debugging, autonomous coding tasks.
 
 ```yaml
 external_agents:
@@ -770,19 +832,9 @@ external_agents:
     command: "codex"
 ```
 
-Usage in autonomous mode:
-
-```
-> /goal Use Codex to review the authentication module for security issues
-```
-
-The agent will use the `codex` tool to delegate complex analysis:
-
-```
-> codex "Review src/auth.py for security vulnerabilities. Focus on SQL injection, XSS, and authentication bypass."
-```
-
 ### Gemini CLI (Google)
+
+Best for: code review, analysis, alternative perspectives.
 
 ```yaml
 external_agents:
@@ -794,8 +846,8 @@ external_agents:
 ### Policy limits
 
 External calls are limited by policy:
-- `safe`: 2 calls max
-- `balanced`: 5 calls max
+- `safe`: 10 calls max
+- `balanced`: unlimited (orchestrator delegates freely)
 - `full`: unlimited
 
 ### Requirements

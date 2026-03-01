@@ -69,6 +69,9 @@ external_agents:
   gemini:
     enabled: true
     command: "gemini"
+  claude:
+    enabled: true
+    command: "claude"
 
 # Execution policy — automatic guardrails for autonomous mode
 # Modes: safe (strict budgets), balanced (default), full (no limits)
@@ -80,6 +83,9 @@ policy:
   # max_external_calls: 5
   # disabled_tools: []
   # denied_paths:             # default blocks /etc, ~/.ssh, .env, etc.
+  # writable_paths:           # extra dirs writable beyond project root (globs)
+  #   - "/tmp/*"
+  #   - "~/other-project/*"
 
 # Memory
 memory:

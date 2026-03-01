@@ -9,7 +9,7 @@ Tool categories:
   write    - write_file, edit_file
   execute  - shell, run_tests
   git      - git_commit, git_branch
-  external - codex, gemini_cli
+  external - codex, gemini_cli, claude_code
 """
 
 from __future__ import annotations
@@ -39,6 +39,7 @@ TOOL_CATEGORIES: dict[str, str] = {
     "git_branch": "git",
     "codex": "external",
     "gemini_cli": "external",
+    "claude_code": "external",
 }
 
 
@@ -64,6 +65,11 @@ class PolicyConfig:
         ]
     )
 
+    # Extra writable directories beyond project root (globs)
+    # By default, write_file/edit_file are restricted to project root.
+    # Add paths here to allow writing outside the project.
+    writable_paths: list[str] = field(default_factory=list)
+
     # Shell command additions (on top of ShellToolConfig)
     blocked_shell_patterns: list[str] = field(
         default_factory=lambda: [
@@ -86,14 +92,16 @@ PRESETS: dict[str, dict[str, Any]] = {
         "max_file_writes": 20,
         "max_shell_commands": 30,
         "max_git_commits": 3,
-        "max_external_calls": 2,
+        "max_external_calls": 10,
+        "writable_paths": [],  # project root only
     },
     "balanced": {
         "mode": "balanced",
         "max_file_writes": 0,  # unlimited
         "max_shell_commands": 0,
         "max_git_commits": 10,
-        "max_external_calls": 5,
+        "max_external_calls": 0,  # unlimited — orchestrator delegates freely
+        "writable_paths": [],  # project root only
     },
     "full": {
         "mode": "full",
@@ -101,6 +109,7 @@ PRESETS: dict[str, dict[str, Any]] = {
         "max_shell_commands": 0,
         "max_git_commits": 0,
         "max_external_calls": 0,
+        "writable_paths": ["~/*"],  # home directory
     },
 }
 
@@ -191,11 +200,14 @@ class PolicyEngine:
         if violation:
             return violation
 
-        # Path checks for all file-accessing tools
+        # Path checks for file-accessing tools
         if tool_name in ("read_file", "write_file", "edit_file", "list_dir", "search_files"):
             path = args.get("path", "")
             if path:
-                violation = self._check_path(path, tool_name, category)
+                if tool_name in ("write_file", "edit_file"):
+                    violation = self._check_write_path(path, tool_name, category)
+                else:
+                    violation = self._check_read_path(path, tool_name, category)
                 if violation:
                     return violation
 
@@ -246,16 +258,14 @@ class PolicyEngine:
                 )
         return None
 
-    def _check_path(self, path: str, tool_name: str, category: str) -> PolicyViolation | None:
-        resolved = Path(path).expanduser().resolve()
-        path_str = str(resolved)
-
-        # Denied paths
+    def _check_denied(self, path_str: str, resolved: Path, path: str,
+                       tool_name: str, category: str) -> PolicyViolation | None:
+        """Check if a path matches any denied pattern (shared by read/write)."""
         for pattern in self.config.denied_paths:
             expanded = str(Path(pattern).expanduser())
             # Check exact match, glob match, and parent-of match
             # e.g. "/etc/*" should block both "/etc" and "/etc/passwd"
-            parent = expanded.rstrip("/*").rstrip("*")
+            parent = expanded.removesuffix("/*").removesuffix("*")
             if (
                 fnmatch.fnmatch(path_str, expanded)
                 or path_str == parent
@@ -268,8 +278,18 @@ class PolicyEngine:
                             f"Use a different path or approach.",
                     tool=tool_name, category=category,
                 )
+        return None
 
-        # Allowed paths (if configured)
+    def _check_read_path(self, path: str, tool_name: str, category: str) -> PolicyViolation | None:
+        """Check read access: denied_paths + allowed_paths (if configured)."""
+        resolved = Path(path).expanduser().resolve()
+        path_str = str(resolved)
+
+        violation = self._check_denied(path_str, resolved, path, tool_name, category)
+        if violation:
+            return violation
+
+        # Allowed paths (if configured) — read-only legacy check
         if self.config.allowed_paths:
             matched = False
             for pattern in self.config.allowed_paths:
@@ -293,6 +313,52 @@ class PolicyEngine:
                 )
 
         return None
+
+    def _check_write_path(self, path: str, tool_name: str, category: str) -> PolicyViolation | None:
+        """Check write access: denied_paths, then restrict to project root + writable_paths."""
+        resolved = Path(path).expanduser().resolve()
+        path_str = str(resolved)
+
+        # 1. Denied paths check (same as read)
+        violation = self._check_denied(path_str, resolved, path, tool_name, category)
+        if violation:
+            return violation
+
+        # 2. Project root check — always allowed
+        if self._project_root:
+            try:
+                resolved.relative_to(self._project_root)
+                return None  # inside project root → OK
+            except ValueError:
+                pass
+
+        # 3. writable_paths check
+        for pattern in self.config.writable_paths:
+            expanded = str(Path(pattern).expanduser())
+            if fnmatch.fnmatch(path_str, expanded):
+                return None  # matches a writable path → OK
+            # Also check parent-of match for directory patterns
+            # e.g. "/tmp/*" → parent "/tmp", allows "/tmp/subdir/file.txt"
+            parent = expanded.removesuffix("/*").removesuffix("*")
+            if path_str.startswith(parent + "/") or path_str == parent:
+                return None
+
+        # 4. Also check legacy allowed_paths for backward compatibility
+        if self.config.allowed_paths:
+            for pattern in self.config.allowed_paths:
+                expanded = str(Path(pattern).expanduser())
+                if fnmatch.fnmatch(path_str, expanded):
+                    return None
+
+        # 5. Blocked — outside project root and no writable_paths match
+        hint = ("Add the path to 'writable_paths' in your policy config, "
+                "or use 'policy.mode: full' to allow writes to the home directory.")
+        return PolicyViolation(
+            rule="write_outside_project",
+            message=f"Write to '{path}' is denied: outside project root"
+                    f"{f' ({self._project_root})' if self._project_root else ''}. {hint}",
+            tool=tool_name, category=category,
+        )
 
     def _check_shell(self, command: str, tool_name: str, category: str) -> PolicyViolation | None:
         cmd_lower = command.lower().strip()
