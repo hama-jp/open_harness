@@ -48,8 +48,20 @@ class DragHandle(Static):
     """
 
     def __init__(self) -> None:
-        super().__init__("┃", id="drag-handle")
+        super().__init__("", id="drag-handle")
         self._dragging = False
+
+    def render(self) -> str:
+        h = self.size.height
+        if h < 3:
+            return "┃" * h
+        # Grip handle in the center third, thin line elsewhere
+        grip_len = max(5, h // 3)
+        pad_top = (h - grip_len) // 2
+        pad_bot = h - pad_top - grip_len
+        return "\n".join(
+            ["│"] * pad_top + ["┃"] * grip_len + ["│"] * pad_bot
+        )
 
     def on_mouse_down(self, event) -> None:
         self._dragging = True
