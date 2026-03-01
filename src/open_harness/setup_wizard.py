@@ -228,12 +228,44 @@ def run_setup_wizard(config_dir: Path | None = None) -> Path:
     provider_key = provider_choices[provider_idx - 1]
     preset = _PROVIDERS[provider_key]
 
-    # Step 2: Server URL
+    # Step 2: Server URL (with connection test)
     console.print(f"\n[bold]Step 2:[/bold] Server URL")
-    if preset["base_url"]:
-        base_url = click.prompt("Server URL", default=preset["base_url"])
-    else:
-        base_url = click.prompt("Server URL (e.g. http://localhost:8080/v1)")
+    while True:
+        if preset["base_url"]:
+            base_url = click.prompt("Server URL", default=preset["base_url"])
+        else:
+            base_url = click.prompt("Server URL (e.g. http://localhost:8080/v1)")
+
+        # Connection test
+        console.print(f"[dim]Testing connection to {base_url} ...[/dim]", end=" ")
+        try:
+            test_resp = httpx.get(f"{base_url}/models", timeout=5.0)
+            test_resp.raise_for_status()
+            console.print("[green]OK[/green]")
+            break
+        except httpx.ConnectError:
+            console.print("[red]FAILED — connection refused[/red]")
+            console.print(
+                f"[yellow]Could not connect to {base_url}.[/yellow]\n"
+                "[dim]Check that the server is running and the URL is correct.[/dim]"
+            )
+        except httpx.TimeoutException:
+            console.print("[red]FAILED — timeout[/red]")
+            console.print(
+                f"[yellow]Connection to {base_url} timed out.[/yellow]\n"
+                "[dim]The server may be slow to respond or unreachable.[/dim]"
+            )
+        except httpx.HTTPStatusError as e:
+            # Server responded but with an error — still reachable
+            console.print(f"[yellow]Warning — HTTP {e.response.status_code}[/yellow]")
+            console.print("[dim]Server is reachable but returned an error. This may be OK.[/dim]")
+            break
+        except httpx.HTTPError as e:
+            console.print(f"[red]FAILED — {e}[/red]")
+
+        if not click.confirm("Re-enter URL?", default=True):
+            console.print("[dim]Continuing with the current URL.[/dim]")
+            break
 
     # Step 3: API key
     console.print(f"\n[bold]Step 3:[/bold] API Key")
