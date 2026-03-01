@@ -303,7 +303,7 @@ class HarnessApp(App):
 
         # Record input history with scroll anchor
         output = self.query_one("#output", RichLog)
-        anchor = output.line_count
+        anchor = output.virtual_size.height
         mode_tag = f"[dim]({mode})[/dim] " if mode != self.current_mode else ""
         output.write(f"[bold bright_white]> {mode_tag}{text[:120]}[/bold bright_white]")
         display = f"[{mode}] {text[:40]}" if len(text) > 40 else f"[{mode}] {text}"
