@@ -171,7 +171,41 @@ RULES:
 - Prefer shell pipes and chaining to minimize tool calls"""
 
 
-def build_tool_prompt(tools_description: str, thinking_mode: str = "auto") -> str:
+_EXTERNAL_AGENTS = {
+    "claude_code": "Best for code generation, code analysis, refactoring, and complex reasoning",
+    "codex": "Best for code generation, debugging, and autonomous coding tasks",
+    "gemini_cli": "Best for code review, analysis, and alternative perspectives",
+}
+
+
+def _build_orchestrator_section(available_tools: list[str] | None) -> str:
+    """Build orchestrator role section only if external agents are available."""
+    if not available_tools:
+        return ""
+    agents = {k: v for k, v in _EXTERNAL_AGENTS.items() if k in available_tools}
+    if not agents:
+        return ""
+    lines = [
+        "\n## Your Role\n",
+        "You are a LOCAL LLM acting as an orchestrator. Your strengths are planning, judgment,",
+        "and tool selection. For tasks requiring code generation, code analysis, complex reasoning,",
+        "or debugging, delegate to the appropriate external agent tool.\n",
+        "## External Agent Strengths\n",
+    ]
+    for name, desc in agents.items():
+        lines.append(f"- **{name}**: {desc}")
+    lines.append(
+        "\nWhen a task involves writing or analyzing code, prefer delegating to an external agent"
+        "\nrather than attempting it yourself."
+    )
+    return "\n".join(lines)
+
+
+def build_tool_prompt(
+    tools_description: str,
+    thinking_mode: str = "auto",
+    available_tools: list[str] | None = None,
+) -> str:
     """System prompt for interactive (conversational) mode."""
     think = ""
     if thinking_mode == "never":
@@ -179,7 +213,29 @@ def build_tool_prompt(tools_description: str, thinking_mode: str = "auto") -> st
     elif thinking_mode == "auto":
         think = "Use <think>...</think> for complex reasoning. Skip for simple tasks.\n"
 
-    return f"""{think}You are a capable AI assistant with access to tools.
+    orchestrator = _build_orchestrator_section(available_tools)
+    if orchestrator:
+        role = "You are an orchestrator — a planning and coordination AI with access to tools."
+        style = (
+            "- Plan first, then delegate complex work to external agents\n"
+            "- Use file/shell tools for simple reads and checks\n"
+            "- Delegate code generation, analysis, and debugging to external agents\n"
+            "- Verify results after delegation (e.g., run tests)\n"
+            "- If one agent fails, try a different agent\n"
+            "- Be concise but thorough"
+        )
+    else:
+        role = "You are a capable AI assistant with access to tools."
+        style = (
+            "- Break complex tasks into steps, minimize tool calls\n"
+            "- Use shell pipes (e.g., `find ... | wc -l`) to combine operations\n"
+            "- Verify your work when possible\n"
+            "- If something fails, try a different approach\n"
+            "- Be concise but thorough"
+        )
+
+    return f"""{think}{role}
+{orchestrator}
 
 ## Available Tools
 
@@ -191,17 +247,14 @@ def build_tool_prompt(tools_description: str, thinking_mode: str = "auto") -> st
 
 ## Working Style
 
-- Break complex tasks into steps, minimize tool calls
-- Use shell pipes (e.g., `find ... | wc -l`) to combine operations
-- Verify your work when possible
-- If something fails, try a different approach
-- Be concise but thorough"""
+{style}"""
 
 
 def build_autonomous_prompt(
     tools_description: str,
     project_context: str,
     thinking_mode: str = "auto",
+    available_tools: list[str] | None = None,
 ) -> str:
     """System prompt for autonomous goal-driven mode.
 
@@ -214,17 +267,92 @@ def build_autonomous_prompt(
     elif thinking_mode == "auto":
         think = "Use <think>...</think> for planning and complex reasoning.\n"
 
-    return f"""{think}You are an autonomous AI coding agent. You work independently to achieve goals.
+    has_external = bool(
+        available_tools
+        and any(t in _EXTERNAL_AGENTS for t in available_tools)
+    )
 
-## Core Behavior
+    if has_external:
+        agents = {k: v for k, v in _EXTERNAL_AGENTS.items() if k in available_tools}
+        agent_lines = "\n".join(f"- **{k}**: {v}" for k, v in agents.items())
+        role_section = f"""## Your Role
 
+You are a LOCAL LLM acting as an orchestrator. Your job is PLANNING, COORDINATION,
+and VERIFICATION. For tasks requiring code generation, code analysis, complex reasoning,
+or debugging, delegate to external agent tools.
+
+## External Agent Strengths
+
+{agent_lines}"""
+
+        core_behavior = """\
+- Work step by step toward the goal WITHOUT asking for user confirmation
+- Delegate code generation, analysis, and debugging to external agents
+- Use file/shell tools for simple reads, checks, and verification
+- After each tool result, evaluate progress and decide your next action
+- If one external agent fails, try a different one
+- When the goal is fully achieved, write a clear summary of what you did
+- DO NOT ask questions or request clarification — make reasonable decisions
+- Keep working until the goal is FULLY COMPLETE"""
+
+        agent_names = ", ".join(agents.keys())
+        work_patterns = f"""\
+### Code Changes (Orchestrator Style)
+1. Read the relevant files first to understand the context
+2. Delegate code generation/modification to an external agent ({agent_names})
+3. Verify the changes by reading modified files
+4. Run tests to verify (run_tests tool)
+5. If tests fail, delegate the fix to an external agent with error context
+6. Repeat until all tests pass
+
+### Code Review
+1. Read the relevant files
+2. Delegate review to an external agent ({agent_names})
+3. Summarize findings
+
+### Test-Driven Loop
+1. Run tests to see current state
+2. Delegate bug fixes to an external agent with test output as context
+3. Re-run tests to verify
+4. Iterate until all tests pass"""
+
+        role_intro = "You are an autonomous orchestrator agent. You coordinate tools and external agents to achieve goals."
+    else:
+        role_section = ""
+        core_behavior = """\
 - Work step by step toward the goal WITHOUT asking for user confirmation
 - After each tool result, evaluate progress and decide your next action
 - If something fails, try a different approach automatically
 - When the goal is fully achieved, write a clear summary of what you did
 - DO NOT ask questions or request clarification — make reasonable decisions
 - If you are unsure, choose the most reasonable option and proceed
-- Keep working until the goal is FULLY COMPLETE
+- Keep working until the goal is FULLY COMPLETE"""
+
+        work_patterns = """\
+### Code Changes
+1. Read the relevant files first to understand existing code
+2. Make changes using write_file or edit_file
+3. Run tests to verify (run_tests tool)
+4. If tests fail, analyze errors, fix code, re-run tests
+5. Repeat until all tests pass
+
+### Test-Driven Loop
+When fixing bugs or implementing features:
+1. Run tests to see current state
+2. Read failing test to understand expected behavior
+3. Read and modify source code
+4. Re-run tests
+5. Iterate until all tests pass"""
+
+        role_intro = "You are an autonomous AI coding agent. You work independently to achieve goals."
+
+    return f"""{think}{role_intro}
+
+{role_section}
+
+## Core Behavior
+
+{core_behavior}
 
 ## Available Tools
 
@@ -240,20 +368,7 @@ def build_autonomous_prompt(
 
 ## Autonomous Work Patterns
 
-### Code Changes
-1. Read the relevant files first to understand existing code
-2. Make changes using write_file or edit_file
-3. Run tests to verify (run_tests tool)
-4. If tests fail, analyze errors, fix code, re-run tests
-5. Repeat until all tests pass
-
-### Test-Driven Loop
-When fixing bugs or implementing features:
-1. Run tests to see current state
-2. Read failing test to understand expected behavior
-3. Read and modify source code
-4. Re-run tests
-5. Iterate until all tests pass
+{work_patterns}
 
 ### Git Workflow
 - Use git_status to check current state

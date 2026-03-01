@@ -72,9 +72,11 @@ class Agent:
     @property
     def interactive_prompt(self) -> str:
         if self._interactive_prompt is None:
+            tool_names = [t.name for t in self.tools.list_tools()]
             self._interactive_prompt = build_tool_prompt(
                 self.tools.get_prompt_description(),
                 self.config.compensation.thinking_mode,
+                available_tools=tool_names,
             )
         return self._interactive_prompt
 
@@ -86,10 +88,12 @@ class Agent:
             project_ctx = self.project.to_prompt()
             if memory_block:
                 project_ctx += f"\n\n{memory_block}"
+            tool_names = [t.name for t in self.tools.list_tools()]
             self._autonomous_prompt = build_autonomous_prompt(
                 self.tools.get_prompt_description(),
                 project_ctx,
                 self.config.compensation.thinking_mode,
+                available_tools=tool_names,
             )
         return self._autonomous_prompt
 
