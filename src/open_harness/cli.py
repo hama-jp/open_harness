@@ -715,7 +715,8 @@ def main(config_path: str | None, tier: str | None, goal_text: str | None,
                 if verbose:
                     console.print_exception()
     finally:
-        _task_queue.shutdown()
+        if _task_queue:
+            _task_queue.shutdown()
         task_store.close()
         agent.router.close()
         memory.close()

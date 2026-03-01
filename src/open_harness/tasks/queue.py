@@ -300,6 +300,10 @@ class TaskQueueManager:
             agent = self._agent_factory()
             result_text = ""
 
+            if not task.log_path:
+                self.store.mark_failed(task_id, "No log path assigned")
+                return
+
             with open(task.log_path, "w") as f:
                 f.write(f"=== Task {task_id}: {task.goal} ===\n")
                 f.write(f"=== Started: {time.strftime('%Y-%m-%d %H:%M:%S')} ===\n\n")

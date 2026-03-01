@@ -244,9 +244,15 @@ class LLMClient:
             return LLMResponse(content=f"[LLM API Error: {e}]", finish_reason="error")
 
         latency = (time.monotonic() - start) * 1000
-        data = resp.json()
+        try:
+            data = resp.json()
+        except Exception:
+            return LLMResponse(content="[LLM API Error: invalid JSON response]", finish_reason="error")
 
-        choice = data.get("choices", [{}])[0]
+        choices = data.get("choices", [])
+        if not choices:
+            return LLMResponse(content="[LLM API Error: empty choices]", finish_reason="error")
+        choice = choices[0]
         message = choice.get("message", {})
         raw_content = message.get("content", "") or ""
         finish = choice.get("finish_reason", "")
@@ -340,6 +346,13 @@ class LLMClient:
             latency = (time.monotonic() - start) * 1000
             return LLMResponse(
                 content=f"[LLM API Error: {e}]",
+                finish_reason="error",
+                latency_ms=latency,
+            )
+        except Exception as e:
+            latency = (time.monotonic() - start) * 1000
+            return LLMResponse(
+                content=f"[LLM Stream Error: {e}]",
                 finish_reason="error",
                 latency_ms=latency,
             )

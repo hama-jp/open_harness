@@ -119,4 +119,8 @@ def load_config(
             raw: dict[str, Any] = yaml.safe_load(f) or {}
         return HarnessConfig.model_validate(raw), resolved.resolve()
 
+    # Explicit path was given but file doesn't exist — report the error
+    if config_path is not None and (resolved is None or not resolved.exists()):
+        raise FileNotFoundError(f"Config file not found: {config_path}")
+
     return HarnessConfig(), None

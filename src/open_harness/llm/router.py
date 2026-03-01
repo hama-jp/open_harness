@@ -92,6 +92,9 @@ class ModelRouter:
         }
 
     def close(self):
-        for client in self._clients.values():
-            client.close()
+        for name, client in self._clients.items():
+            try:
+                client.close()
+            except Exception:
+                pass
         self._clients.clear()

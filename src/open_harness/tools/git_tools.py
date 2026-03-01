@@ -8,10 +8,9 @@ from typing import Any
 from open_harness.tools.base import Tool, ToolParameter, ToolResult
 
 
-def _git(args: str, cwd: str | None = None, timeout: int = 30) -> subprocess.CompletedProcess[str]:
+def _git(args: list[str], cwd: str | None = None, timeout: int = 30) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
-        f"git {args}",
-        shell=True,
+        ["git"] + args,
         capture_output=True,
         text=True,
         timeout=timeout,
@@ -28,8 +27,8 @@ class GitStatusTool(Tool):
 
     def execute(self, **kwargs: Any) -> ToolResult:
         cwd = kwargs.get("cwd")
-        r = _git("status --short", cwd=cwd)
-        diff = _git("diff --stat", cwd=cwd)
+        r = _git(["status", "--short"], cwd=cwd)
+        diff = _git(["diff", "--stat"], cwd=cwd)
         output = r.stdout.strip()
         if diff.stdout.strip():
             output += f"\n\nDiff summary:\n{diff.stdout.strip()}"
@@ -49,9 +48,9 @@ class GitDiffTool(Tool):
         staged = kwargs.get("staged", False)
         path = kwargs.get("path", "")
         cwd = kwargs.get("cwd")
-        cmd = "diff --staged" if staged else "diff"
+        cmd = ["diff", "--staged"] if staged else ["diff"]
         if path:
-            cmd += f" -- {path}"
+            cmd += ["--", path]
         r = _git(cmd, cwd=cwd)
         output = r.stdout.strip() or "(no changes)"
         if len(output) > 15000:
@@ -76,11 +75,11 @@ class GitCommitTool(Tool):
         if not message:
             return ToolResult(success=False, output="", error="No commit message provided")
 
-        add_r = _git(f"add {files}", cwd=cwd)
+        add_r = _git(["add"] + files.split(), cwd=cwd)
         if add_r.returncode != 0:
             return ToolResult(success=False, output="", error=f"git add failed: {add_r.stderr}")
 
-        commit_r = _git(f'commit -m "{message}"', cwd=cwd)
+        commit_r = _git(["commit", "-m", message], cwd=cwd)
         if commit_r.returncode != 0:
             stderr = commit_r.stderr.strip()
             if "nothing to commit" in stderr or "nothing to commit" in commit_r.stdout:
@@ -105,10 +104,10 @@ class GitBranchTool(Tool):
         cwd = kwargs.get("cwd")
 
         if not name:
-            r = _git("branch -a", cwd=cwd)
+            r = _git(["branch", "-a"], cwd=cwd)
             return ToolResult(success=r.returncode == 0, output=r.stdout.strip())
 
-        cmd = f"checkout -b {name}" if checkout else f"branch {name}"
+        cmd = ["checkout", "-b", name] if checkout else ["branch", name]
         r = _git(cmd, cwd=cwd)
         if r.returncode != 0:
             return ToolResult(success=False, output="", error=r.stderr.strip())
@@ -126,5 +125,5 @@ class GitLogTool(Tool):
     def execute(self, **kwargs: Any) -> ToolResult:
         count = kwargs.get("count", 10)
         cwd = kwargs.get("cwd")
-        r = _git(f"log --oneline -{count}", cwd=cwd)
+        r = _git(["log", "--oneline", f"-{count}"], cwd=cwd)
         return ToolResult(success=r.returncode == 0, output=r.stdout.strip() or "(no commits)")

@@ -136,7 +136,9 @@ def _condense_messages(messages, summary_prefix):
             break
     tool_summaries = []
     for m in messages:
-        c = m.get("content", "")
+        c = m.get("content", "") or ""
+        if isinstance(c, list):
+            c = " ".join(str(x) for x in c)
         if c.startswith("[Tool Result for "):
             first_line = c.split("\n")[0]
             preview = c[len(first_line):].strip()[:200]

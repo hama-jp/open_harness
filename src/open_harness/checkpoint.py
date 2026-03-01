@@ -21,11 +21,18 @@ from pathlib import Path
 logger = logging.getLogger(__name__)
 
 
-def _git(args: str, cwd: str, timeout: int = 15) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(
-        f"git {args}", shell=True,
-        capture_output=True, text=True, timeout=timeout, cwd=cwd,
-    )
+def _git(args: list[str], cwd: str, timeout: int = 15) -> subprocess.CompletedProcess[str]:
+    try:
+        return subprocess.run(
+            ["git"] + args,
+            capture_output=True, text=True, timeout=timeout, cwd=cwd,
+        )
+    except subprocess.TimeoutExpired:
+        logger.warning("git %s timed out after %ds", " ".join(args), timeout)
+        return subprocess.CompletedProcess(
+            args=["git"] + args, returncode=1,
+            stdout="", stderr=f"timeout after {timeout}s",
+        )
 
 
 @dataclass
@@ -69,24 +76,24 @@ class CheckpointEngine:
         self._active = True
 
         # Remember current branch
-        r = _git("rev-parse --abbrev-ref HEAD", self.cwd)
+        r = _git(["rev-parse", "--abbrev-ref", "HEAD"], self.cwd)
         self._original_branch = r.stdout.strip() if r.returncode == 0 else "main"
 
         # Stash any uncommitted changes
-        status = _git("status --porcelain", self.cwd)
+        status = _git(["status", "--porcelain"], self.cwd)
         if status.stdout.strip():
-            stash = _git("stash push -m 'open-harness: pre-goal checkpoint'", self.cwd)
+            stash = _git(["stash", "push", "-m", "open-harness: pre-goal checkpoint"], self.cwd)
             if stash.returncode == 0 and "No local changes" not in stash.stdout:
                 self._stashed = True
 
         # Create work branch for this goal
         ts = int(time.time())
         self._work_branch = f"harness/goal-{ts}"
-        branch = _git(f"checkout -b {self._work_branch}", self.cwd)
+        branch = _git(["checkout", "-b", self._work_branch], self.cwd)
         if branch.returncode != 0:
             # Branch might exist, try with suffix
             self._work_branch = f"harness/goal-{ts}-retry"
-            _git(f"checkout -b {self._work_branch}", self.cwd)
+            _git(["checkout", "-b", self._work_branch], self.cwd)
 
         parts = []
         if self._stashed:
@@ -103,19 +110,19 @@ class CheckpointEngine:
             return None
 
         # Check if there are changes to snapshot
-        status = _git("status --porcelain", self.cwd)
+        status = _git(["status", "--porcelain"], self.cwd)
         if not status.stdout.strip():
             return None
 
         # Stage and commit
-        _git("add -A", self.cwd)
+        _git(["add", "-A"], self.cwd)
         msg = f"harness-snapshot: {description}"
-        commit = _git(f"commit -m '{msg}' --allow-empty", self.cwd)
+        commit = _git(["commit", "-m", msg, "--allow-empty"], self.cwd)
         if commit.returncode != 0:
             return None
 
         # Get commit hash
-        rev = _git("rev-parse --short HEAD", self.cwd)
+        rev = _git(["rev-parse", "--short", "HEAD"], self.cwd)
         commit_hash = rev.stdout.strip()
 
         snap = Snapshot(commit_hash=commit_hash, description=description)
@@ -132,7 +139,7 @@ class CheckpointEngine:
 
         if to_snapshot:
             # Reset to specific snapshot
-            r = _git(f"reset --hard {to_snapshot.commit_hash}", self.cwd)
+            r = _git(["reset", "--hard", to_snapshot.commit_hash], self.cwd)
             if r.returncode == 0:
                 # Remove snapshots after this one
                 idx = next(
@@ -147,9 +154,9 @@ class CheckpointEngine:
             # Reset all changes on work branch
             if self._snapshots:
                 first = self._snapshots[0]
-                r = _git(f"reset --hard {first.commit_hash}~1", self.cwd)
+                r = _git(["reset", "--hard", f"{first.commit_hash}~1"], self.cwd)
             else:
-                r = _git("reset --hard HEAD", self.cwd)
+                r = _git(["reset", "--hard", "HEAD"], self.cwd)
             if r.returncode == 0:
                 self._snapshots.clear()
                 return "rolled back all goal changes"
@@ -173,16 +180,16 @@ class CheckpointEngine:
 
         if keep_changes and self._snapshots:
             # Commit any uncommitted changes on work branch before switching
-            status = _git("status --porcelain", self.cwd)
+            status = _git(["status", "--porcelain"], self.cwd)
             if status.stdout.strip():
-                _git("add -A", self.cwd)
-                _git("commit -m 'harness-snapshot: uncommitted changes at finish'", self.cwd)
+                _git(["add", "-A"], self.cwd)
+                _git(["commit", "-m", "harness-snapshot: uncommitted changes at finish"], self.cwd)
 
             # Switch back to original branch
-            checkout = _git(f"checkout {self._original_branch}", self.cwd)
+            checkout = _git(["checkout", self._original_branch], self.cwd)
             if checkout.returncode != 0:
                 # Force checkout as last resort (changes are saved in work branch commits)
-                checkout = _git(f"checkout -f {self._original_branch}", self.cwd)
+                checkout = _git(["checkout", "-f", self._original_branch], self.cwd)
                 if checkout.returncode != 0:
                     parts.append(f"checkout failed: {checkout.stderr.strip()[:100]}")
                     # Still on work branch — skip merge, just clean up
@@ -192,22 +199,24 @@ class CheckpointEngine:
                     return ", ".join(parts) if parts else "finish failed"
 
             # Squash-merge work into original branch
-            merge = _git(f"merge --squash {self._work_branch}", self.cwd)
+            merge = _git(["merge", "--squash", self._work_branch], self.cwd)
             if merge.returncode == 0:
                 # Check if there's anything to commit
-                status = _git("status --porcelain", self.cwd)
+                status = _git(["status", "--porcelain"], self.cwd)
                 if status.stdout.strip():
                     parts.append(f"merged {len(self._snapshots)} snapshots")
                 else:
                     parts.append("no net changes to merge")
             else:
-                parts.append(f"merge conflict: {merge.stderr.strip()[:100]}")
+                # Merge conflict: abort to restore clean state
+                _git(["merge", "--abort"], self.cwd)
+                parts.append(f"merge conflict (aborted): {merge.stderr.strip()[:100]}")
             # Clean up work branch
-            _git(f"branch -D {self._work_branch}", self.cwd)
+            _git(["branch", "-D", self._work_branch], self.cwd)
         elif self._work_branch:
             # Discard work branch — force checkout to discard uncommitted changes
-            _git(f"checkout -f {self._original_branch}", self.cwd)
-            _git(f"branch -D {self._work_branch}", self.cwd)
+            _git(["checkout", "-f", self._original_branch], self.cwd)
+            _git(["branch", "-D", self._work_branch], self.cwd)
             parts.append("discarded goal changes")
 
         self._cleanup_stash(parts)
@@ -218,7 +227,7 @@ class CheckpointEngine:
     def _cleanup_stash(self, parts: list[str]):
         """Restore stashed changes if any."""
         if self._stashed:
-            pop = _git("stash pop", self.cwd)
+            pop = _git(["stash", "pop"], self.cwd)
             if pop.returncode == 0:
                 parts.append("restored stashed changes")
             else:
@@ -229,5 +238,5 @@ class CheckpointEngine:
         """Get a summary of all changes since goal started."""
         if not self._active or not self.has_git:
             return ""
-        r = _git("diff --stat HEAD~{} HEAD".format(len(self._snapshots)), self.cwd)
+        r = _git(["diff", "--stat", f"HEAD~{len(self._snapshots)}", "HEAD"], self.cwd)
         return r.stdout.strip() if r.returncode == 0 else ""

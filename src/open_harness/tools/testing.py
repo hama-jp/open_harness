@@ -38,23 +38,26 @@ class TestRunnerTool(Tool):
         self.cwd = cwd
 
     def execute(self, **kwargs: Any) -> ToolResult:
+        import shlex
+
         target = kwargs.get("target", "")
         verbose = kwargs.get("verbose", False)
 
-        cmd = self.test_command
-        if verbose and "pytest" in cmd:
-            cmd += " -v"
+        cmd_parts = shlex.split(self.test_command)
+        if verbose and "pytest" in self.test_command:
+            cmd_parts.append("-v")
         if target:
-            cmd += f" {target}"
+            # Sanitize: only allow path-like targets
+            for part in shlex.split(target):
+                cmd_parts.append(part)
 
         # Add short summary for pytest
-        if "pytest" in cmd and "--tb" not in cmd:
-            cmd += " --tb=short"
+        if "pytest" in self.test_command and "--tb" not in " ".join(cmd_parts):
+            cmd_parts.append("--tb=short")
 
         try:
             result = subprocess.run(
-                cmd,
-                shell=True,
+                cmd_parts,
                 capture_output=True,
                 text=True,
                 timeout=120,

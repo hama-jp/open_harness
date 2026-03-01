@@ -290,6 +290,9 @@ class SearchFilesTool(Tool):
                 if any(part in self._SKIP_DIRS for part in parts):
                     continue
                 try:
+                    # Skip large files (likely binary or generated)
+                    if fp.stat().st_size > 1_000_000:
+                        continue
                     text = fp.read_text(errors="replace")
                     for i, line in enumerate(text.splitlines(), 1):
                         if regex.search(line):
