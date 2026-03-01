@@ -91,8 +91,16 @@ class MemoryStore:
         self._conversation.clear()
 
     def save_session(self, session_id: str):
-        """Persist current conversation to database."""
+        """Persist current conversation to database.
+
+        Uses atomic DELETE + INSERT to prevent duplicate entries when
+        the same session is saved multiple times.
+        """
         with self._lock:
+            self._conn.execute(
+                "DELETE FROM conversations WHERE session_id = ?",
+                (session_id,),
+            )
             for turn in self._conversation:
                 self._conn.execute(
                     "INSERT INTO conversations (session_id, role, content, metadata, created_at) "

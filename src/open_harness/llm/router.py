@@ -64,6 +64,7 @@ class ModelRouter:
             max_tokens=max_tokens or model_cfg.max_tokens,
             temperature=temperature,
             tools=tools,
+            context_length=model_cfg.context_length,
         )
 
     def chat_stream(
@@ -85,6 +86,7 @@ class ModelRouter:
             model=model_cfg.model,
             max_tokens=max_tokens or model_cfg.max_tokens,
             temperature=temperature,
+            context_length=model_cfg.context_length,
         )
 
     def list_tiers(self) -> dict[str, str]:

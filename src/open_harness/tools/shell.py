@@ -2,11 +2,24 @@
 
 from __future__ import annotations
 
+import os
 import subprocess
 from typing import Any
 
 from open_harness.config import ShellToolConfig
 from open_harness.tools.base import Tool, ToolParameter, ToolResult
+
+# Environment variable prefixes that should not leak to child processes
+_SENSITIVE_PREFIXES = (
+    "AWS_", "OPENAI_", "ANTHROPIC_", "GITHUB_", "GH_",
+    "AZURE_", "GOOGLE_", "HF_", "HUGGING",
+)
+
+# Exact environment variable names to strip
+_SENSITIVE_NAMES = frozenset({
+    "API_KEY", "SECRET", "TOKEN", "PASSWORD", "DATABASE_URL",
+    "SECRET_KEY", "PRIVATE_KEY",
+})
 
 
 class ShellTool(Tool):
@@ -37,6 +50,21 @@ class ShellTool(Tool):
 
     def __init__(self, config: ShellToolConfig | None = None):
         self.config = config or ShellToolConfig()
+        self._safe_env: dict[str, str] | None = None
+
+    def _build_safe_env(self) -> dict[str, str]:
+        """Build an environment dict with sensitive variables stripped.
+
+        Preserves PATH, HOME, LANG, USER, SHELL, TERM and other basic
+        variables while removing API keys, tokens, and cloud credentials.
+        """
+        if self._safe_env is None:
+            self._safe_env = {
+                k: v for k, v in os.environ.items()
+                if not any(k.startswith(p) for p in _SENSITIVE_PREFIXES)
+                and k not in _SENSITIVE_NAMES
+            }
+        return self._safe_env
 
     def _check_safety(self, command: str) -> str | None:
         """Check command against allowlist and blocklist.
@@ -79,6 +107,7 @@ class ShellTool(Tool):
                 text=True,
                 timeout=timeout,
                 cwd=cwd,
+                env=self._build_safe_env(),
             )
             output = result.stdout
             if result.stderr:

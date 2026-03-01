@@ -84,6 +84,12 @@ class PolicyConfig:
     # Tool-level disable
     disabled_tools: list[str] = field(default_factory=list)
 
+    # When True and allowed_paths is empty, auto-restrict reads to project root
+    project_scope_default: bool = True
+
+    # Per-goal token budget (0 = unlimited)
+    max_tokens_per_goal: int = 0
+
 
 # Preset policies
 PRESETS: dict[str, dict[str, Any]] = {
@@ -175,13 +181,32 @@ class PolicyEngine:
         self.config = config or PolicyConfig()
         self.budget = BudgetUsage()
         self._project_root: Path | None = None
+        self._token_usage: int = 0
 
     def set_project_root(self, root: str | Path):
         self._project_root = Path(root).resolve()
+        # Issue 5: auto-restrict reads to project scope when allowed_paths is empty
+        if self.config.project_scope_default and not self.config.allowed_paths:
+            self.config.allowed_paths = [str(self._project_root / "*")]
 
     def begin_goal(self):
         """Reset budgets for a new goal."""
         self.budget = BudgetUsage()
+        self._token_usage = 0
+
+    def record_usage(self, usage: dict[str, int]):
+        """Accumulate token usage from an LLM response."""
+        self._token_usage += usage.get("total_tokens", 0)
+
+    def check_token_budget(self) -> str | None:
+        """Return a reason string if the token budget is exceeded, else None."""
+        limit = self.config.max_tokens_per_goal
+        if limit > 0 and self._token_usage >= limit:
+            return (
+                f"Token budget exceeded: {self._token_usage}/{limit} tokens used. "
+                f"Goal terminated to prevent runaway costs."
+            )
+        return None
 
     def check(self, tool_name: str, args: dict[str, Any]) -> PolicyViolation | None:
         """Check if a tool call is allowed. Returns None if OK."""

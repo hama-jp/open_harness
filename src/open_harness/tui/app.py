@@ -180,6 +180,7 @@ class HarnessApp(App):
             "  /submit <task> - Submit to background\n"
             "  /tasks         - List background tasks\n"
             "  /result <id>   - Show task result\n"
+            "  /cancel [id]   - Cancel running/queued task\n"
             "  /model [tier]  - Show/set model tier\n"
             "  /tier [name]   - Show/set tier\n"
             "  /policy [mode] - Show/set policy\n"

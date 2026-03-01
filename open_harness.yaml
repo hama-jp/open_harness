@@ -2,36 +2,46 @@
 
 llm:
   # Default provider
-  default_provider: "lm_studio"
+  default_provider: "ollama"
 
   providers:
+    ollama:
+      base_url: "http://localhost:11434/v1"
+      api_key: "ollama"
+      api_type: "ollama"  # use native /api/chat (supports think: false)
+      extra_params:
+        think: false  # disable thinking for faster responses
+
     lm_studio:
       base_url: "http://192.168.11.3:1234/v1"
       api_key: "lm-studio"
 
-    ollama:
-      base_url: "http://localhost:11434/v1"
-      api_key: "ollama"
-
   # Model tiers for routing (small → medium → large)
+  # context_length = num_ctx (Ollama KV cache size)
+  #   32K  → fits in VRAM → fastest
+  #   65K  → VRAM + some RAM spill → balanced
+  #   131K → RAM-heavy → for orchestration with large context
   models:
     small:
-      provider: "lm_studio"
-      model: "unsloth/qwen3.5-35b-a3b@q4_k_m"
+      provider: "ollama"
+      model: "qwen3.5:27b"
       max_tokens: 4096
-      description: "Fast, simple tasks"
+      context_length: 32768
+      description: "Fast, simple tasks (32K ctx)"
 
     medium:
-      provider: "lm_studio"
-      model: "unsloth/qwen3.5-35b-a3b@q4_k_m"
+      provider: "ollama"
+      model: "qwen3.5:27b"
       max_tokens: 8192
-      description: "Balanced performance"
+      context_length: 65536
+      description: "Balanced performance (64K ctx)"
 
     large:
-      provider: "lm_studio"
-      model: "unsloth/qwen3.5-35b-a3b@q4_k_m"
+      provider: "ollama"
+      model: "qwen3.5:27b"
       max_tokens: 16384
-      description: "Complex reasoning"
+      context_length: 131072
+      description: "Complex reasoning (128K ctx)"
 
     # vision:
     #   provider: "lm_studio"
@@ -50,7 +60,7 @@ compensation:
     - "add_examples"
     - "escalate_model"
   parse_fallback: true
-  thinking_mode: "auto"  # auto, always, never
+  thinking_mode: "never"  # auto, always, never — "never" for qwen3.5 no-think mode
 
 # Tool settings
 tools:

@@ -13,12 +13,15 @@ from pydantic import BaseModel, Field
 class ProviderConfig(BaseModel):
     base_url: str
     api_key: str = "no-key"
+    api_type: str = "openai"  # "openai" or "ollama" (native /api/chat)
+    extra_params: dict[str, Any] = Field(default_factory=dict)  # merged into every request
 
 
 class ModelConfig(BaseModel):
     provider: str
     model: str
     max_tokens: int = 4096
+    context_length: int = 0  # num_ctx for Ollama (0 = provider default)
     description: str = ""
 
 

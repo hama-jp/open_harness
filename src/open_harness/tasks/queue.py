@@ -216,6 +216,7 @@ class TaskQueueManager:
         self._stop = threading.Event()
         self._worker: threading.Thread | None = None
         self._current_task_id: str | None = None
+        self._current_agent: Any | None = None  # Issue 3: track running agent
         self._lock = threading.Lock()
 
     def start(self):
@@ -268,6 +269,34 @@ class TaskQueueManager:
         """True if a task is currently executing."""
         return self.current_task_id is not None
 
+    def cancel(self, task_id: str | None = None) -> str:
+        """Cancel a running or queued task.
+
+        If *task_id* is None, cancels the currently running task.
+        Returns a status message.
+        """
+        with self._lock:
+            # Cancel the currently running task
+            if task_id is None or task_id == self._current_task_id:
+                if self._current_task_id is None:
+                    return "No task is currently running."
+                tid = self._current_task_id
+                if self._current_agent is not None:
+                    self._current_agent.cancel()
+                self.store.mark_canceled(tid)
+                return f"Task {tid} cancellation requested."
+
+        # Cancel a queued task (not yet running)
+        task = self.store.get_task(task_id)
+        if not task:
+            return f"Task '{task_id}' not found."
+        if task.is_terminal:
+            return f"Task {task_id} already finished ({task.status.value})."
+        if task.status == TaskStatus.QUEUED:
+            self.store.mark_canceled(task_id)
+            return f"Task {task_id} canceled (was queued)."
+        return f"Task {task_id} is {task.status.value}, cannot cancel."
+
     def list_tasks(self, limit: int = 20) -> list[TaskRecord]:
         return self.store.list_tasks(limit)
 
@@ -302,11 +331,15 @@ class TaskQueueManager:
 
         try:
             agent = self._agent_factory()
+            with self._lock:
+                self._current_agent = agent
             result_text = ""
 
             if not task.log_path:
                 self.store.mark_failed(task_id, "No log path assigned")
                 return
+
+            goal_success = True  # Issue 2: track success from done events
 
             with open(task.log_path, "w") as f:
                 f.write(f"=== Task {task_id}: {task.goal} ===\n")
@@ -332,11 +365,17 @@ class TaskQueueManager:
                     elif event.type == "done":
                         f.write(f"\n\n=== DONE ===\n{event.data}\n")
                         result_text = event.data
+                        # Issue 2: capture success state
+                        if not event.metadata.get("success", True):
+                            goal_success = False
                     f.flush()
 
                 f.write(f"\n=== Finished: {time.strftime('%Y-%m-%d %H:%M:%S')} ===\n")
 
-            self.store.mark_succeeded(task_id, result_text)
+            if goal_success:
+                self.store.mark_succeeded(task_id, result_text)
+            else:
+                self.store.mark_failed(task_id, result_text or "Goal did not succeed")
             logger.info(f"Task {task_id}: succeeded")
 
         except Exception as e:
@@ -355,6 +394,7 @@ class TaskQueueManager:
 
             with self._lock:
                 self._current_task_id = None
+                self._current_agent = None
 
             # Notify completion
             updated = self.store.get_task(task_id)

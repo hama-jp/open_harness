@@ -468,10 +468,11 @@ def handle_command(cmd: str, agent: Agent, config: HarnessConfig, display: Strea
                 else:
                     location = f" ({host})"
             mark = "  *" if is_current else ""
+            ctx = f" ctx={model_cfg.context_length//1024}K" if model_cfg.context_length else ""
             return (
                 f"  {tier_name}:  {model_cfg.model} "
                 f"@ {model_cfg.provider}{location} "
-                f"max_tokens={model_cfg.max_tokens}{mark}"
+                f"max_tokens={model_cfg.max_tokens}{ctx}{mark}"
             )
 
         if arg:
@@ -539,6 +540,31 @@ def handle_command(cmd: str, agent: Agent, config: HarnessConfig, display: Strea
         console.print(f"[green]Task {task.id} queued: {task.goal[:60]}[/green]")
         console.print(f"[dim]Log: {task.log_path}[/dim]")
         console.print(f"[dim]Check: /tasks | /result {task.id}[/dim]")
+        return True
+
+    elif command == "/cancel":
+        if not _task_queue:
+            console.print("[dim]Task queue not initialized.[/dim]")
+            return True
+        if arg:
+            msg = _task_queue.cancel(arg)
+        else:
+            # No argument: cancel the currently running task, or show running tasks
+            if _task_queue.is_busy():
+                msg = _task_queue.cancel()
+            else:
+                console.print("[dim]No task is currently running.[/dim]")
+                running = [t for t in _task_queue.list_tasks() if t.status == TaskStatus.RUNNING]
+                queued = [t for t in _task_queue.list_tasks() if t.status == TaskStatus.QUEUED]
+                if running:
+                    for t in running:
+                        console.print(f"  [yellow]running[/yellow] {t.id}: {t.goal[:50]}")
+                if queued:
+                    for t in queued:
+                        console.print(f"  [dim]queued[/dim]  {t.id}: {t.goal[:50]}")
+                console.print("[dim]Usage: /cancel <task_id>[/dim]")
+                return True
+        console.print(f"[yellow]{msg}[/yellow]")
         return True
 
     elif command in ("/tasks", "/status"):
@@ -666,6 +692,7 @@ def handle_command(cmd: str, agent: Agent, config: HarnessConfig, display: Strea
   /submit <task>   - Submit to background regardless of current mode
   /tasks           - List all tasks and their status
   /result <id>     - Show detailed result of a task
+  /cancel [id]     - Cancel a running or queued task
 
 [bold]File references:[/bold]
   @path/to/file    - Attach file content (Tab to complete)
@@ -693,6 +720,26 @@ def _has_user_config() -> bool:
             if (d / name).exists():
                 return True
     return False
+
+
+def _ensure_llm_server(config: HarnessConfig):
+    """Auto-start Ollama server if the default provider needs it."""
+    from open_harness.llm.ollama_autostart import ensure_ollama_running
+
+    default_tier = config.llm.default_tier
+    model_cfg = config.llm.models.get(default_tier)
+    if not model_cfg:
+        return
+    provider_cfg = config.llm.providers.get(model_cfg.provider)
+    if not provider_cfg:
+        return
+    result = ensure_ollama_running(provider_cfg.base_url)
+    if result == "auto-started":
+        console.print("[green]Ollama server auto-started.[/green]")
+    elif result and "not found" in result.lower():
+        console.print(f"[red]{result}[/red]")
+    elif result:
+        console.print(f"[yellow]Ollama: {result}[/yellow]")
 
 
 def _load_config_safe(config_path: str | None):
@@ -745,6 +792,8 @@ def init_harness(
             console.print("[dim]Using defaults. Create open_harness.yaml manually later.[/dim]")
     if tier:
         config.llm.default_tier = tier
+
+    _ensure_llm_server(config)
 
     project = ProjectContext()
     project.ensure_git()
@@ -868,6 +917,8 @@ def main(config_path: str | None, tier: str | None, goal_text: str | None,
         console.print("[dim]Config: defaults (no open_harness.yaml found)[/dim]")
     if tier:
         config.llm.default_tier = tier
+
+    _ensure_llm_server(config)
 
     # Detect project
     project = ProjectContext()

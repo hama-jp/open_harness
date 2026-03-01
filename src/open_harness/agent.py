@@ -28,6 +28,7 @@ from open_harness.planner import Plan, PlanCritic, PlanStep, Planner, StepResult
 from open_harness.policy import PolicyEngine, load_policy
 from open_harness.project import ProjectContext
 from open_harness.tools.base import ToolRegistry, ToolResult
+from open_harness.tools.output_filter import redact_secrets
 from open_harness.tools.rate_limiter import AgentRateLimiter
 
 logger = logging.getLogger(__name__)
@@ -307,6 +308,7 @@ class Agent:
         yield AgentEvent("status", f"Checkpoint: {ckpt_status}")
 
         goal_succeeded = False
+        _last_done_success: list[bool] = []  # mutable to capture from nested generator
         try:
             # Phase 1: Try to create a plan
             yield AgentEvent("status", "Planning...")
@@ -325,7 +327,8 @@ class Agent:
                 tracker.plan_steps_total = len(plan.steps)
                 yield AgentEvent("status", plan.summary())
                 yield from self._tracked_goal(
-                    self._run_planned_goal(goal, plan, ckpt), tracker)
+                    self._run_planned_goal(goal, plan, ckpt), tracker,
+                    _last_done_success)
             else:
                 # Fallback: direct execution without planning
                 reason = err.reason if err else "critic rejected"
@@ -334,10 +337,14 @@ class Agent:
                 tracker.on_event(comp_event)
                 yield comp_event
                 yield from self._tracked_goal(
-                    self._run_direct_goal(goal, ckpt), tracker)
+                    self._run_direct_goal(goal, ckpt), tracker,
+                    _last_done_success)
 
-            # Only mark as succeeded if not canceled
-            goal_succeeded = not self._cancel_event.is_set()
+            # Issue 2: use success from done event if available, fall back to cancel check
+            if _last_done_success:
+                goal_succeeded = _last_done_success[-1]
+            else:
+                goal_succeeded = not self._cancel_event.is_set()
 
         finally:
             self._cancel_event.clear()
@@ -366,6 +373,7 @@ class Agent:
         self,
         events: Generator[AgentEvent, None, None],
         tracker: GoalTracker,
+        success_capture: list[bool] | None = None,
     ) -> Generator[AgentEvent, None, None]:
         """Wrap a goal generator to feed every event into the tracker."""
         for event in events:
@@ -373,6 +381,9 @@ class Agent:
             # Track planned step results from done events
             if event.type == "done" and event.metadata.get("planned"):
                 tracker.plan_steps_ok = event.metadata.get("steps", 0)
+            # Issue 2: capture success state from done events
+            if event.type == "done" and success_capture is not None:
+                success_capture.append(event.metadata.get("success", True))
             yield event
 
     def _run_direct_goal(
@@ -637,7 +648,8 @@ class Agent:
 
             # Issue 2: Check for cancellation
             if self._cancel_event.is_set():
-                yield AgentEvent("done", "[Canceled by user]")
+                yield AgentEvent("done", "[Canceled by user]",
+                                 {"success": False})
                 return
 
             # Issue 1: Trim context window
@@ -646,6 +658,15 @@ class Agent:
             yield AgentEvent("status", f"[{step}/{max_steps}] {tier}")
 
             response = yield from self._stream_llm(messages, tier)
+
+            # Issue 7: Token budget tracking
+            if response.usage:
+                self.policy.record_usage(response.usage)
+                budget_exceeded = self.policy.check_token_budget()
+                if budget_exceeded:
+                    yield AgentEvent("done", f"[{budget_exceeded}]",
+                                     {"success": False})
+                    return
 
             # API error
             if response.finish_reason == "error":
@@ -659,7 +680,8 @@ class Agent:
                         tier = comp.escalated_tier
                     continue
                 self.memory.add_turn("assistant", response.content)
-                yield AgentEvent("done", response.content)
+                yield AgentEvent("done", response.content,
+                                 {"success": False})
                 return
 
             # Tool call(s) — Issue 4: process ALL tool calls
@@ -726,7 +748,8 @@ class Agent:
                             yield AgentEvent("compensation",
                                 "All external agents rate-limited — falling back to local tools")
 
-                    output = truncate_tool_output(result.to_message(), 8000)
+                    output = redact_secrets(
+                        truncate_tool_output(result.to_message(), 8000))
                     yield AgentEvent("tool_result", output,
                                      {"success": result.success, "tool": actual_tool})
 
@@ -781,7 +804,8 @@ class Agent:
                     else:
                         result = self.tools.execute(actual_tool, recovered_tc.arguments)
                         self.policy.record(actual_tool)
-                    output = truncate_tool_output(result.to_message(), 8000)
+                    output = redact_secrets(
+                        truncate_tool_output(result.to_message(), 8000))
                     yield AgentEvent("tool_result", output,
                                      {"success": result.success, "tool": actual_tool})
                     messages.append({"role": "assistant",
@@ -809,7 +833,8 @@ class Agent:
             # Text response — done
             self.memory.add_turn("assistant", response.content)
             yield AgentEvent("done", response.content,
-                             {"latency_ms": response.latency_ms, "steps": step})
+                             {"latency_ms": response.latency_ms, "steps": step,
+                              "success": True})
             return
 
         # Step limit — try escalation
@@ -823,7 +848,8 @@ class Agent:
             return
 
         yield AgentEvent("done",
-            f"[Reached {max_steps} steps. Use /tier large or simplify the goal.]")
+            f"[Reached {max_steps} steps. Use /tier large or simplify the goal.]",
+            {"success": False})
 
     # ------------------------------------------------------------------
     # Helpers

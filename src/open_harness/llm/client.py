@@ -158,6 +158,59 @@ def _parse_tool_calls_from_text(text: str) -> list[ToolCall]:
 
 
 # ---------------------------------------------------------------------------
+# Native tool call accumulator for streaming responses
+# ---------------------------------------------------------------------------
+
+class NativeToolCallAccumulator:
+    """Accumulate native function-calling tool_calls from streaming deltas.
+
+    OpenAI-compatible providers send tool calls as incremental chunks:
+    each chunk has an ``index``, a ``function.name`` (first chunk only),
+    and ``function.arguments`` fragments that must be concatenated.
+    """
+
+    def __init__(self):
+        self._calls: dict[int, dict[str, str]] = {}  # index -> {name, arguments}
+
+    def feed(self, delta: dict[str, Any]):
+        """Process ``delta.tool_calls`` from a single SSE chunk."""
+        tc_list = delta.get("tool_calls")
+        if not tc_list:
+            return
+        for tc in tc_list:
+            idx = tc.get("index", 0)
+            func = tc.get("function", {})
+            if idx not in self._calls:
+                self._calls[idx] = {"name": "", "arguments": ""}
+            if func.get("name"):
+                self._calls[idx]["name"] = func["name"]
+            if func.get("arguments"):
+                self._calls[idx]["arguments"] += func["arguments"]
+
+    def has_calls(self) -> bool:
+        return bool(self._calls)
+
+    def finalize(self) -> list[ToolCall]:
+        """Parse accumulated fragments into complete ToolCall objects."""
+        result: list[ToolCall] = []
+        for idx in sorted(self._calls):
+            entry = self._calls[idx]
+            name = entry["name"]
+            raw_args = entry["arguments"]
+            try:
+                args = json.loads(raw_args) if raw_args else {}
+            except json.JSONDecodeError:
+                args = {}
+            if name:
+                result.append(ToolCall(
+                    name=name,
+                    arguments=args,
+                    raw=json.dumps({"function": {"name": name, "arguments": raw_args}}),
+                ))
+        return result
+
+
+# ---------------------------------------------------------------------------
 # Stream processor: handles <think> tags and detects tool calls during streaming
 # ---------------------------------------------------------------------------
 
@@ -294,20 +347,27 @@ class LLMClient:
 
     def __init__(self, provider: ProviderConfig, timeout: float = 120):
         self.provider = provider
+        self._api_type = provider.api_type  # "openai" or "ollama"
         _headers = {
             "Authorization": f"Bearer {provider.api_key}",
             "Content-Type": "application/json",
         }
+
+        # For Ollama native API, strip /v1 from base_url
+        base_url = provider.base_url
+        if self._api_type == "ollama":
+            base_url = base_url.rstrip("/").removesuffix("/v1")
+
         # Non-streaming: generous read timeout for slow models
         self.client = httpx.Client(
-            base_url=provider.base_url,
+            base_url=base_url,
             headers=_headers,
             timeout=httpx.Timeout(timeout, connect=30, read=300),
         )
         # Streaming: shorter read timeout — chunks arrive frequently once
         # generation starts, so a 60s gap means something is wrong.
         self._stream_client = httpx.Client(
-            base_url=provider.base_url,
+            base_url=base_url,
             headers=_headers,
             timeout=httpx.Timeout(timeout, connect=30, read=60),
         )
@@ -320,8 +380,12 @@ class LLMClient:
         temperature: float = 0.3,
         tools: list[dict[str, Any]] | None = None,
         tool_choice: str | None = None,
+        context_length: int = 0,
     ) -> LLMResponse:
         """Send a non-streaming chat completion request."""
+        if self._api_type == "ollama":
+            return self._chat_ollama(messages, model, max_tokens, temperature,
+                                     tools, tool_choice, context_length)
         payload: dict[str, Any] = {
             "model": model,
             "messages": messages,
@@ -332,6 +396,9 @@ class LLMClient:
             payload["tools"] = tools
             if tool_choice:
                 payload["tool_choice"] = tool_choice
+        # Merge provider-specific extra params
+        if self.provider.extra_params:
+            payload.update(self.provider.extra_params)
 
         start = time.monotonic()
         resp = None
@@ -414,12 +481,233 @@ class LLMClient:
             latency_ms=latency,
         )
 
+    # ------------------------------------------------------------------
+    # Ollama native API (/api/chat) — supports think: false properly
+    # ------------------------------------------------------------------
+
+    def _chat_ollama(
+        self,
+        messages: list[dict[str, Any]],
+        model: str,
+        max_tokens: int = 4096,
+        temperature: float = 0.3,
+        tools: list[dict[str, Any]] | None = None,
+        tool_choice: str | None = None,
+        context_length: int = 0,
+    ) -> LLMResponse:
+        """Non-streaming chat via Ollama native API."""
+        options: dict[str, Any] = {
+            "temperature": temperature,
+            "num_predict": max_tokens,
+        }
+        if context_length > 0:
+            options["num_ctx"] = context_length
+        payload: dict[str, Any] = {
+            "model": model,
+            "messages": messages,
+            "stream": False,
+            "options": options,
+        }
+        if tools:
+            payload["tools"] = tools
+        if self.provider.extra_params:
+            payload.update(self.provider.extra_params)
+
+        start = time.monotonic()
+        resp = None
+        last_error: Exception | None = None
+        for attempt in range(_MAX_RETRIES):
+            try:
+                resp = self.client.post("/api/chat", json=payload)
+                if resp.status_code in (429, 500, 502, 503, 504):
+                    _logger.warning(
+                        "Ollama API returned %d (attempt %d/%d), retrying...",
+                        resp.status_code, attempt + 1, _MAX_RETRIES)
+                    time.sleep(_BACKOFF_BASE * (2 ** attempt))
+                    continue
+                resp.raise_for_status()
+                break
+            except httpx.TimeoutException as e:
+                last_error = e
+                _logger.warning("Ollama API timeout (attempt %d/%d): %s",
+                                attempt + 1, _MAX_RETRIES, e)
+                time.sleep(_BACKOFF_BASE * (2 ** attempt))
+            except httpx.HTTPError as e:
+                last_error = e
+                if hasattr(e, "response") and e.response is not None:
+                    if 400 <= e.response.status_code < 500 and e.response.status_code != 429:
+                        return LLMResponse(content=f"[Ollama API Error: {e}]", finish_reason="error")
+                _logger.warning("Ollama API error (attempt %d/%d): %s",
+                                attempt + 1, _MAX_RETRIES, e)
+                time.sleep(_BACKOFF_BASE * (2 ** attempt))
+        else:
+            err = last_error or "exhausted retries"
+            return LLMResponse(content=f"[Ollama API Error: {err}]", finish_reason="error")
+        if resp is None:
+            return LLMResponse(content="[Ollama API Error: no response]", finish_reason="error")
+
+        latency = (time.monotonic() - start) * 1000
+        try:
+            data = resp.json()
+        except Exception:
+            return LLMResponse(content="[Ollama API Error: invalid JSON]", finish_reason="error")
+
+        message = data.get("message", {})
+        content = message.get("content", "")
+        thinking, clean_content = _extract_thinking(content)
+
+        # Native tool calls from Ollama
+        tool_calls: list[ToolCall] = []
+        native_calls = message.get("tool_calls", [])
+        if native_calls:
+            for tc in native_calls:
+                func = tc.get("function", {})
+                args = func.get("arguments", {})
+                if isinstance(args, str):
+                    try:
+                        args = json.loads(args)
+                    except json.JSONDecodeError:
+                        args = {}
+                tool_calls.append(ToolCall(
+                    name=func.get("name", ""),
+                    arguments=args,
+                    raw=json.dumps(tc),
+                ))
+
+        if not tool_calls and clean_content:
+            tool_calls = _parse_tool_calls_from_text(clean_content)
+
+        # Build usage from Ollama-native fields
+        usage: dict[str, int] = {}
+        if "prompt_eval_count" in data:
+            usage["prompt_tokens"] = data["prompt_eval_count"]
+        if "eval_count" in data:
+            usage["completion_tokens"] = data["eval_count"]
+        if usage:
+            usage["total_tokens"] = usage.get("prompt_tokens", 0) + usage.get("completion_tokens", 0)
+
+        return LLMResponse(
+            content=clean_content,
+            thinking=thinking,
+            tool_calls=tool_calls,
+            finish_reason=data.get("done_reason", "stop"),
+            usage=usage,
+            model=data.get("model", model),
+            raw_response=data,
+            latency_ms=latency,
+        )
+
+    def _chat_stream_ollama(
+        self,
+        messages: list[dict[str, Any]],
+        model: str,
+        max_tokens: int = 4096,
+        temperature: float = 0.3,
+        context_length: int = 0,
+    ) -> Generator[tuple[str, str], None, LLMResponse]:
+        """Streaming chat via Ollama native API."""
+        options: dict[str, Any] = {
+            "temperature": temperature,
+            "num_predict": max_tokens,
+        }
+        if context_length > 0:
+            options["num_ctx"] = context_length
+        payload: dict[str, Any] = {
+            "model": model,
+            "messages": messages,
+            "stream": True,
+            "options": options,
+        }
+        if self.provider.extra_params:
+            payload.update(self.provider.extra_params)
+
+        start = time.monotonic()
+        processor = StreamProcessor()
+        model_name = model
+        stream_usage: dict[str, int] = {}
+
+        for attempt in range(_MAX_RETRIES):
+            try:
+                with self._stream_client.stream(
+                    "POST", "/api/chat", json=payload
+                ) as resp:
+                    if resp.status_code in (429, 500, 502, 503, 504):
+                        _logger.warning("Ollama stream returned %d, retrying...",
+                                        resp.status_code)
+                        time.sleep(_BACKOFF_BASE * (2 ** attempt))
+                        processor = StreamProcessor()
+                        continue
+
+                    for line in resp.iter_lines():
+                        if not line.strip():
+                            continue
+                        try:
+                            data = json.loads(line)
+                        except json.JSONDecodeError:
+                            continue
+
+                        msg = data.get("message", {})
+                        chunk = msg.get("content", "")
+                        model_name = data.get("model", model)
+
+                        # Final chunk — extract usage
+                        if data.get("done"):
+                            if "prompt_eval_count" in data:
+                                stream_usage["prompt_tokens"] = data["prompt_eval_count"]
+                            if "eval_count" in data:
+                                stream_usage["completion_tokens"] = data["eval_count"]
+                            if stream_usage:
+                                stream_usage["total_tokens"] = (
+                                    stream_usage.get("prompt_tokens", 0) +
+                                    stream_usage.get("completion_tokens", 0))
+                            break
+
+                        if not chunk:
+                            continue
+
+                        for event in processor.feed(chunk):
+                            yield event
+                break  # success
+            except httpx.TimeoutException:
+                _logger.warning("Ollama stream timeout (attempt %d/%d)",
+                                attempt + 1, _MAX_RETRIES)
+                time.sleep(_BACKOFF_BASE * (2 ** attempt))
+                processor = StreamProcessor()
+            except httpx.HTTPError as e:
+                if hasattr(e, "response") and e.response is not None:
+                    if 400 <= e.response.status_code < 500 and e.response.status_code != 429:
+                        return LLMResponse(content=f"[Ollama Error: {e}]", finish_reason="error")
+                _logger.warning("Ollama stream error (attempt %d/%d): %s",
+                                attempt + 1, _MAX_RETRIES, e)
+                time.sleep(_BACKOFF_BASE * (2 ** attempt))
+                processor = StreamProcessor()
+        else:
+            return LLMResponse(content="[Ollama Error: exhausted retries]", finish_reason="error")
+
+        latency = (time.monotonic() - start) * 1000
+        thinking, content, tool_calls = processor.finish()
+
+        return LLMResponse(
+            content=content,
+            thinking=thinking,
+            tool_calls=tool_calls,
+            finish_reason="stop",
+            usage=stream_usage,
+            model=model_name,
+            latency_ms=latency,
+        )
+
+    # ------------------------------------------------------------------
+    # OpenAI-compatible streaming
+    # ------------------------------------------------------------------
+
     def chat_stream(
         self,
         messages: list[dict[str, Any]],
         model: str,
         max_tokens: int = 4096,
         temperature: float = 0.3,
+        context_length: int = 0,
     ) -> Generator[tuple[str, str], None, LLMResponse]:
         """Streaming chat completion. Yields (event_type, data) tuples.
 
@@ -429,6 +717,9 @@ class LLMClient:
         or iterate to completion — the return value is accessible via
         StopIteration.value).
         """
+        if self._api_type == "ollama":
+            return (yield from self._chat_stream_ollama(
+                messages, model, max_tokens, temperature, context_length))
         payload: dict[str, Any] = {
             "model": model,
             "messages": messages,
@@ -436,10 +727,15 @@ class LLMClient:
             "temperature": temperature,
             "stream": True,
         }
+        # Merge provider-specific extra params (e.g. think: false for Ollama)
+        if self.provider.extra_params:
+            payload.update(self.provider.extra_params)
 
         start = time.monotonic()
         processor = StreamProcessor()
+        native_tc = NativeToolCallAccumulator()
         model_name = model
+        stream_usage: dict[str, int] = {}
 
         try:
             # Retry only the connection phase. Once we start yielding chunks,
@@ -471,11 +767,19 @@ class LLMClient:
 
                             choice = data.get("choices", [{}])[0]
                             delta = choice.get("delta", {})
+
+                            # Issue 1: accumulate native tool call chunks
+                            native_tc.feed(delta)
+
                             chunk = delta.get("content", "")
                             if not chunk:
                                 continue
 
                             model_name = data.get("model", model)
+
+                            # Issue 7: capture usage from final chunk
+                            if "usage" in data and data["usage"]:
+                                stream_usage = data["usage"]
 
                             for event in processor.feed(chunk):
                                 _chunks_yielded = True
@@ -497,6 +801,7 @@ class LLMClient:
                     if _attempt < _MAX_RETRIES - 1:
                         time.sleep(_BACKOFF_BASE * (2 ** _attempt))
                         processor = StreamProcessor()
+                        native_tc = NativeToolCallAccumulator()
                         continue
                     latency = (time.monotonic() - start) * 1000
                     return LLMResponse(
@@ -541,11 +846,16 @@ class LLMClient:
         latency = (time.monotonic() - start) * 1000
         thinking, content, tool_calls = processor.finish()
 
+        # Issue 1: merge native function-calling tool calls
+        if native_tc.has_calls():
+            tool_calls = native_tc.finalize() + tool_calls
+
         return LLMResponse(
             content=content,
             thinking=thinking,
             tool_calls=tool_calls,
             finish_reason="stop",
+            usage=stream_usage,
             model=model_name,
             latency_ms=latency,
         )
