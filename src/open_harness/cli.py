@@ -26,7 +26,7 @@ from rich.table import Table
 
 from open_harness.agent import Agent, AgentEvent
 from open_harness.completer import AtFileCompleter
-from open_harness.config import HarnessConfig, load_config
+from open_harness.config import CONFIG_FILENAME, HarnessConfig, _CONFIG_NAMES, load_config
 from open_harness.memory.store import MemoryStore
 from open_harness.project import ProjectContext
 from open_harness.tasks.queue import TaskQueueManager, TaskRecord, TaskStatus, TaskStore
@@ -625,6 +625,15 @@ def handle_command(cmd: str, agent: Agent, config: HarnessConfig, display: Strea
     return False
 
 
+def _has_user_config() -> bool:
+    """Check if user has their own config (CWD or ~/.open_harness/), ignoring package fallback."""
+    for d in [Path.cwd(), Path.home() / ".open_harness"]:
+        for name in _CONFIG_NAMES:
+            if (d / name).exists():
+                return True
+    return False
+
+
 def init_harness(
     config_path: str | None,
     tier: str | None,
@@ -643,7 +652,7 @@ def init_harness(
     version = get_version()
 
     config, config_file = load_config(config_path)
-    if config_file is None and config_path is None:
+    if config_path is None and not _has_user_config():
         console.print("[yellow]No open_harness.yaml found.[/yellow]")
         if click.confirm("Run setup wizard to create one?", default=True):
             from open_harness.setup_wizard import run_setup_wizard
@@ -761,7 +770,7 @@ def main(config_path: str | None, tier: str | None, goal_text: str | None,
     )
 
     config, config_file = load_config(config_path)
-    if config_file is None and config_path is None and not goal_text:
+    if config_path is None and not goal_text and not _has_user_config():
         console.print("[yellow]No open_harness.yaml found.[/yellow]")
         if click.confirm("Run setup wizard to create one?", default=True):
             from open_harness.setup_wizard import run_setup_wizard
