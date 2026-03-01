@@ -81,7 +81,7 @@ class HarnessApp(App):
         self.version = version
 
         # State
-        self._modes = ["chat", "goal", "submit"]
+        self._modes = ["plan", "goal"]
         self._mode_index = 0
         self._agent_running = False
         self._instruction_queue: list[str] = []
@@ -172,9 +172,8 @@ class HarnessApp(App):
         output = self.query_one("#output", RichLog)
         output.write(Panel(
             "[bold]Modes (Tab outside input to cycle):[/bold]\n"
-            "  chat    - Chat with the agent\n"
-            "  goal    - Agent works autonomously\n"
-            "  submit  - Submit goal to background queue\n\n"
+            "  plan    - Discuss, explore, and plan with the agent\n"
+            "  goal    - Agent works autonomously\n\n"
             "[bold]Commands:[/bold]\n"
             "  /goal <task>   - Run a goal\n"
             "  /submit <task> - Submit to background\n"
@@ -279,7 +278,7 @@ class HarnessApp(App):
         worker = get_current_worker()
         gen = (
             self.agent.run_stream(user_input)
-            if mode == "chat"
+            if mode == "plan"
             else self.agent.run_goal(user_input)
         )
         try:

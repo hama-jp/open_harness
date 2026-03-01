@@ -282,6 +282,7 @@ def build_tool_prompt(
     thinking_mode: str = "auto",
     available_tools: list[str] | None = None,
     agent_configs: dict | None = None,
+    mode: str = "plan",
 ) -> str:
     """System prompt for interactive (conversational) mode."""
     think = ""
@@ -311,11 +312,24 @@ def build_tool_prompt(
             "- Be concise but thorough"
         )
 
+    plan_context = ""
+    if mode == "plan":
+        plan_context = """
+## Planning Context
+
+You are in PLAN mode. Help the user explore, discuss, and build toward a goal.
+- Ask clarifying questions when the goal is ambiguous
+- Delegate planning tasks to external agents (claude_code, codex, gemini_cli) — they can analyze code, draft plans, and investigate issues. You judge the results and present them to the user.
+- Use local tools (read_file, shell, project_tree) for quick checks
+- Suggest concrete steps and potential pitfalls based on what you learn
+- This conversation carries over to GOAL mode for autonomous execution
+"""
+
     return f"""{think}{role}
 {orchestrator}
 
 {_current_datetime()}
-
+{plan_context}
 ## Available Tools
 
 {tools_description}

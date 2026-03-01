@@ -56,6 +56,7 @@ class ExternalAgentConfig(BaseModel):
     command: str = ""
     description: str = ""  # Human-readable description for the orchestrator
     strengths: list[str] = Field(default_factory=list)  # Task categories this agent excels at
+    timeout: int = 600  # Max seconds per invocation (default 10 min)
 
 
 class MemoryConfig(BaseModel):

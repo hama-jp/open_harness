@@ -27,6 +27,7 @@ from rich.table import Table
 from open_harness.agent import Agent, AgentEvent
 from open_harness.completer import AtFileCompleter
 from open_harness.config import CONFIG_FILENAME, HarnessConfig, _CONFIG_NAMES, load_config
+from open_harness.diagnostics import SessionLogger
 from open_harness.memory.store import MemoryStore
 from open_harness.project import ProjectContext
 from open_harness.tasks.queue import TaskQueueManager, TaskRecord, TaskStatus, TaskStore
@@ -163,7 +164,7 @@ def setup_tools(
     ]:
         ext_cfg = config.external_agents.get(flag_key)
         if ext_cfg and ext_cfg.enabled:
-            tool = tool_cls(ext_cfg.command)
+            tool = tool_cls(ext_cfg.command, timeout=ext_cfg.timeout)
             if tool.available:
                 registry.register(tool)
 
@@ -683,13 +684,12 @@ def handle_command(cmd: str, agent: Agent, config: HarnessConfig, display: Strea
     elif command == "/help":
         console.print("""
 [bold]Modes (Shift+Tab to cycle):[/bold]
-  chat    [green]>[/green]       - Chat with the agent, it will use tools as needed
+  plan    [green]>[/green]       - Discuss, explore, and plan with the agent
   goal    [yellow]goal>[/yellow]  - Agent works autonomously until task is complete
-  submit  [blue]bg>[/blue]    - Submit goal to background queue
 
 [bold]Autonomous:[/bold]
   /goal <task>     - Run a goal regardless of current mode
-  /submit <task>   - Submit to background regardless of current mode
+  /submit <task>   - Submit goal to background queue (power user)
   /tasks           - List all tasks and their status
   /result <id>     - Show detailed result of a task
   /cancel [id]     - Cancel a running or queued task
@@ -820,9 +820,10 @@ def init_harness(
 @click.option("--update", "-u", "do_update", is_flag=True, help="Update Open Harness to latest version and exit")
 @click.option("--tui", is_flag=True, help="Launch Textual TUI")
 @click.option("--fresh", is_flag=True, help="Start fresh without restoring previous session")
+@click.option("--log-session", is_flag=True, help="Enable session diagnostics logging (JSONL)")
 @click.option("--verbose", "-v", is_flag=True, help="Verbose logging")
 def main(config_path: str | None, tier: str | None, goal_text: str | None,
-         do_update: bool, tui: bool, fresh: bool, verbose: bool):
+         do_update: bool, tui: bool, fresh: bool, log_session: bool, verbose: bool):
     """Open Harness - self-driving AI agent for local LLMs."""
     global _task_queue, _input_queue
 
@@ -899,7 +900,7 @@ def main(config_path: str | None, tier: str | None, goal_text: str | None,
         "  [dim]Self-driving AI agent for local LLMs[/dim]"
     )
     console.print(
-        "  [dim]Type /help for commands, /goal <task> for autonomous mode[/dim]\n"
+        "  [dim]Type /help for commands, Shift+Tab to switch between plan and goal modes[/dim]\n"
     )
 
     config, config_file = _load_config_safe(config_path)
@@ -971,7 +972,20 @@ def main(config_path: str | None, tier: str | None, goal_text: str | None,
         except Exception:
             pass  # no previous session
 
-    agent = Agent(config, tools, memory, project, user_input_fn=_ask_user_cli)
+    # Session diagnostics logging
+    _session_logger: SessionLogger | None = None
+    if log_session or verbose:
+        _session_logger = SessionLogger()
+        console.print(f"[dim]Session log: {_session_logger.path}[/dim]")
+        _session_logger.log_session_start({
+            "version": version,
+            "project": str(project.root),
+            "tier": config.llm.default_tier,
+            "mode": "goal" if goal_text else "interactive",
+        })
+
+    agent = Agent(config, tools, memory, project, user_input_fn=_ask_user_cli,
+                  session_logger=_session_logger)
     display = StreamingDisplay(console)
 
     tool_names = [t.name for t in tools.list_tools()]
@@ -1001,7 +1015,11 @@ def main(config_path: str | None, tier: str | None, goal_text: str | None,
                 display.handle(event)
         finally:
             signal.signal(signal.SIGINT, old_handler)
-        console.print(f"\n[dim]({time.monotonic() - start:.1f}s)[/dim]")
+        elapsed = time.monotonic() - start
+        console.print(f"\n[dim]({elapsed:.1f}s)[/dim]")
+        if _session_logger:
+            _session_logger.log_session_end({"elapsed_s": round(elapsed, 1), "mode": "goal"})
+            _session_logger.close()
         _task_queue.shutdown()
         task_store.close()
         agent.router.close()
@@ -1009,14 +1027,13 @@ def main(config_path: str | None, tier: str | None, goal_text: str | None,
         return
 
     # Interactive REPL with mode cycling (Shift+Tab)
-    _modes = ["chat", "goal", "submit"]
+    _modes = ["plan", "goal"]
     _mode_index = [0]  # list to allow mutation in closure
 
-    _mode_colors = {"chat": "ansigreen", "goal": "ansiyellow", "submit": "ansiblue"}
+    _mode_colors = {"plan": "ansigreen", "goal": "ansiyellow"}
     _mode_labels = {
-        "chat": "chat",
+        "plan": "plan",
         "goal": "goal (autonomous)",
-        "submit": "background",
     }
 
     def _get_prompt():
@@ -1095,7 +1112,7 @@ def main(config_path: str | None, tier: str | None, goal_text: str | None,
             try:
                 start = time.monotonic()
 
-                if mode == "chat":
+                if mode == "plan":
                     input_queue.start()
                     for event in agent.run_stream(user_input):
                         display.handle(event)
@@ -1112,16 +1129,6 @@ def main(config_path: str | None, tier: str | None, goal_text: str | None,
                     input_queue.stop()
                     console.print(f"\n[dim]Goal completed in {time.monotonic() - start:.1f}s[/dim]\n")
 
-                elif mode == "submit":
-                    # submit returns immediately, no need for input queuing
-                    if not _task_queue:
-                        console.print("[red]Task queue not initialized.[/red]")
-                        continue
-                    task = _task_queue.submit(user_input)
-                    console.print(f"[green]Task {task.id} queued: {task.goal[:60]}[/green]")
-                    console.print(f"[dim]Log: {task.log_path}[/dim]")
-                    console.print(f"[dim]Check: /tasks | /result {task.id}[/dim]")
-
             except Exception as e:
                 input_queue.stop()
                 console.print(f"[red]Error: {e}[/red]")
@@ -1134,6 +1141,9 @@ def main(config_path: str | None, tier: str | None, goal_text: str | None,
                 memory.save_session(_session_id)
             except Exception:
                 pass
+        if _session_logger:
+            _session_logger.log_session_end({"mode": "interactive"})
+            _session_logger.close()
         agent.close()  # finish session checkpoint (merge git changes)
         if _task_queue:
             _task_queue.shutdown()
