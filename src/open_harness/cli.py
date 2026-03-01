@@ -10,8 +10,9 @@ import time
 from pathlib import Path
 
 import click
-from prompt_toolkit import prompt as pt_prompt
+from prompt_toolkit import PromptSession
 from prompt_toolkit.formatted_text import HTML
+from prompt_toolkit.key_binding import KeyBindings
 from rich.console import Console
 from rich.markdown import Markdown
 from rich.panel import Panel
@@ -429,12 +430,14 @@ def handle_command(cmd: str, agent: Agent, config: HarnessConfig, display: Strea
 
     elif command == "/help":
         console.print("""
-[bold]Interactive:[/bold]
-  (type normally)  - Chat with the agent, it will use tools as needed
+[bold]Modes (Shift+Tab to cycle):[/bold]
+  chat    [green]>[/green]       - Chat with the agent, it will use tools as needed
+  goal    [yellow]goal>[/yellow]  - Agent works autonomously until task is complete
+  submit  [blue]bg>[/blue]    - Submit goal to background queue
 
 [bold]Autonomous:[/bold]
-  /goal <task>     - Agent works autonomously until task is complete
-  /submit <task>   - Submit goal to background queue
+  /goal <task>     - Run a goal regardless of current mode
+  /submit <task>   - Submit to background regardless of current mode
   /tasks           - List all tasks and their status
   /result <id>     - Show detailed result of a task
 
@@ -534,11 +537,43 @@ def main(config_path: str | None, tier: str | None, goal_text: str | None,
         memory.close()
         return
 
-    # Interactive REPL
+    # Interactive REPL with mode cycling (Shift+Tab)
+    _modes = ["chat", "goal", "submit"]
+    _mode_index = [0]  # list to allow mutation in closure
+
+    _mode_prompts = {
+        "chat": HTML("<ansigreen><b>&gt; </b></ansigreen>"),
+        "goal": HTML("<ansiyellow><b>goal&gt; </b></ansiyellow>"),
+        "submit": HTML("<ansiblue><b>bg&gt; </b></ansiblue>"),
+    }
+    _mode_labels = {
+        "chat": "chat",
+        "goal": "goal (autonomous)",
+        "submit": "background",
+    }
+
+    def _get_prompt():
+        return _mode_prompts[_modes[_mode_index[0]]]
+
+    def _get_toolbar():
+        mode = _modes[_mode_index[0]]
+        return HTML(
+            f"  <b>{_mode_labels[mode]}</b> mode"
+            f"  <dim>(shift+tab to cycle)</dim>"
+        )
+
+    kb = KeyBindings()
+
+    @kb.add("s-tab")
+    def _cycle_mode(event):
+        _mode_index[0] = (_mode_index[0] + 1) % len(_modes)
+
+    session = PromptSession(key_bindings=kb, bottom_toolbar=_get_toolbar)
+
     try:
         while True:
             try:
-                user_input = pt_prompt(HTML("<ansigreen><b>&gt; </b></ansigreen>")).strip()
+                user_input = session.prompt(_get_prompt).strip()
             except (EOFError, KeyboardInterrupt):
                 console.print("\n[dim]Goodbye![/dim]")
                 break
@@ -549,6 +584,7 @@ def main(config_path: str | None, tier: str | None, goal_text: str | None,
 
             _drain_notifications()
 
+            # Slash commands work in any mode
             if user_input.startswith("/"):
                 result = handle_command(user_input, agent, config, display)
                 if result == "quit":
@@ -557,11 +593,32 @@ def main(config_path: str | None, tier: str | None, goal_text: str | None,
                 if result:
                     continue
 
+            mode = _modes[_mode_index[0]]
             try:
                 start = time.monotonic()
-                for event in agent.run_stream(user_input):
-                    display.handle(event)
-                console.print(f"\n[dim]({time.monotonic() - start:.1f}s)[/dim]\n")
+
+                if mode == "chat":
+                    for event in agent.run_stream(user_input):
+                        display.handle(event)
+                    console.print(f"\n[dim]({time.monotonic() - start:.1f}s)[/dim]\n")
+
+                elif mode == "goal":
+                    if _task_queue and _task_queue.is_busy():
+                        console.print("[yellow]Warning: a background task is running. "
+                                      "LLM requests may queue.[/yellow]")
+                    for event in agent.run_goal(user_input):
+                        display.handle(event)
+                    console.print(f"\n[dim]Goal completed in {time.monotonic() - start:.1f}s[/dim]\n")
+
+                elif mode == "submit":
+                    if not _task_queue:
+                        console.print("[red]Task queue not initialized.[/red]")
+                        continue
+                    task = _task_queue.submit(user_input)
+                    console.print(f"[green]Task {task.id} queued: {task.goal[:60]}[/green]")
+                    console.print(f"[dim]Log: {task.log_path}[/dim]")
+                    console.print(f"[dim]Check: /tasks | /result {task.id}[/dim]")
+
             except Exception as e:
                 console.print(f"[red]Error: {e}[/red]")
                 if verbose:
