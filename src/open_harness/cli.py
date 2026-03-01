@@ -102,13 +102,18 @@ def self_update() -> bool:
     if pull.stdout.strip():
         console.print(f"[dim]{pull.stdout.strip()}[/dim]")
 
-    # 3. pip install -e . (pick up dependency changes)
-    console.print("[dim]pip install -e . ...[/dim]")
+    # 3. reinstall package (prefer uv, fall back to pip)
+    if shutil.which("uv"):
+        install_cmd = ["uv", "pip", "install", "-e", str(repo), "-q"]
+        install_label = "uv pip install -e ."
+    else:
+        install_cmd = [sys.executable, "-m", "pip", "install", "-e", str(repo), "-q"]
+        install_label = "pip install -e ."
+    console.print(f"[dim]{install_label} ...[/dim]")
     pip = subprocess.run(
-        [sys.executable, "-m", "pip", "install", "-e", str(repo), "-q"],
-        cwd=repo, capture_output=True, text=True, timeout=120)
+        install_cmd, cwd=repo, capture_output=True, text=True, timeout=120)
     if pip.returncode != 0:
-        console.print(f"[yellow]pip install warning: {pip.stderr.strip()[:200]}[/yellow]")
+        console.print(f"[yellow]{install_label} warning: {pip.stderr.strip()[:200]}[/yellow]")
 
     new_ver = get_version()
     console.print(f"[green]Updated: v{current_ver} -> v{new_ver}[/green]")
