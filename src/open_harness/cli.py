@@ -9,6 +9,8 @@ import time
 from pathlib import Path
 
 import click
+from prompt_toolkit import prompt as pt_prompt
+from prompt_toolkit.formatted_text import HTML
 from rich.console import Console
 from rich.markdown import Markdown
 from rich.panel import Panel
@@ -447,7 +449,7 @@ def main(config_path: str | None, tier: str | None, goal_text: str | None, verbo
     try:
         while True:
             try:
-                user_input = console.input("[bold green]> [/bold green]").strip()
+                user_input = pt_prompt(HTML("<ansigreen><b>&gt; </b></ansigreen>")).strip()
             except (EOFError, KeyboardInterrupt):
                 console.print("\n[dim]Goodbye![/dim]")
                 break
