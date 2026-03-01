@@ -15,7 +15,7 @@ from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.timer import Timer
-from textual.widgets import Collapsible, Footer, Header, Input, RichLog, Static
+from textual.widgets import Collapsible, Footer, Header, Input, OptionList, RichLog, Static
 from textual.worker import get_current_worker
 
 from open_harness.agent import Agent, AgentEvent
@@ -104,6 +104,9 @@ class HarnessApp(App):
         self._active_agents: dict[str, float] = {}  # tool_name → start_time
         self._agent_panel_timer: Timer | None = None
 
+        # Input history: (display_text, scroll_anchor)
+        self._input_history: list[tuple[str, int]] = []
+
     @property
     def current_mode(self) -> str:
         return self._modes[self._mode_index]
@@ -119,6 +122,8 @@ class HarnessApp(App):
                 yield RichLog(id="output", highlight=True, markup=True, wrap=True)
                 yield RichLog(id="agent-panel", highlight=True, markup=True, wrap=True)
             with VerticalScroll(id="sidebar"):
+                with Collapsible(title="History", collapsed=False):
+                    yield OptionList(id="history-list")
                 with Collapsible(title="Plan", collapsed=False):
                     yield Static("No plan yet.", id="plan-content")
                 with Collapsible(title="Queue", collapsed=False):
@@ -155,7 +160,9 @@ class HarnessApp(App):
             f"[dim]Mode: {self.current_mode} (Tab to cycle)[/dim]\n"
         )
         # Agent panel starts hidden
-        self.query_one("#agent-panel", RichLog).display = False
+        agent_panel = self.query_one("#agent-panel", RichLog)
+        agent_panel.border_title = "Sub-Agent Streaming Output"
+        agent_panel.display = False
         self.query_one("#user-input", Input).focus()
         self.set_interval(2.0, self._check_task_notifications)
 
@@ -179,6 +186,14 @@ class HarnessApp(App):
     def action_toggle_agent_panel(self) -> None:
         panel = self.query_one("#agent-panel", RichLog)
         panel.display = not panel.display
+
+    def on_option_list_option_selected(self, event: OptionList.OptionSelected) -> None:
+        if event.option_list.id == "history-list":
+            idx = event.option_index
+            if 0 <= idx < len(self._input_history):
+                _, anchor = self._input_history[idx]
+                output = self.query_one("#output", RichLog)
+                output.scroll_to(y=anchor, animate=True)
 
     def action_clear_log(self) -> None:
         self.query_one("#output", RichLog).clear()
@@ -283,6 +298,16 @@ class HarnessApp(App):
         self._agent_running = True
         self._text_buffer = ""
         self._agent_start_time = time.monotonic()
+
+        # Record input history with scroll anchor
+        output = self.query_one("#output", RichLog)
+        anchor = output.line_count
+        mode_tag = f"[dim]({mode})[/dim] " if mode != self.current_mode else ""
+        output.write(f"[bold bright_white]> {mode_tag}{text[:120]}[/bold bright_white]")
+        display = f"[{mode}] {text[:40]}" if len(text) > 40 else f"[{mode}] {text}"
+        self._input_history.append((display, anchor))
+        self._refresh_history_section()
+
         self.run_agent(text, mode)
 
     # ------------------------------------------------------------------
@@ -487,6 +512,12 @@ class HarnessApp(App):
                     pass
         elif "finished" in status_text.lower() and "step" in status_text.lower():
             pass  # will be updated on next Step N/M status
+
+    def _refresh_history_section(self) -> None:
+        option_list = self.query_one("#history-list", OptionList)
+        option_list.clear_options()
+        for i, (display, _) in enumerate(self._input_history):
+            option_list.add_option(f"{i + 1}. {display}")
 
     def _refresh_queue_section(self) -> None:
         queue_widget = self.query_one("#queue-content", Static)

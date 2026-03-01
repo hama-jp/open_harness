@@ -32,6 +32,11 @@ Screen {
     padding: 0;
 }
 
+#history-list {
+    height: auto;
+    max-height: 16;
+}
+
 #plan-content, #queue-content, #agents-content, #tasks-content, #stats-content {
     padding: 0 1;
 }
