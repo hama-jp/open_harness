@@ -22,6 +22,7 @@ from rich.panel import Panel
 from rich.table import Table
 
 from open_harness.agent import Agent, AgentEvent
+from open_harness.completer import AtFileCompleter
 from open_harness.config import HarnessConfig, load_config
 from open_harness.memory.store import MemoryStore
 from open_harness.project import ProjectContext
@@ -222,6 +223,16 @@ class StreamingDisplay:
                 self.con.print()
                 self.con.print(Markdown(event.data))
 
+        elif event.type == "summary":
+            self._flush()
+            self.con.print()
+            self.con.print(Panel(
+                event.data,
+                title="Goal Summary",
+                border_style="cyan",
+                expand=False,
+            ))
+
     def _flush(self):
         if self._streaming:
             self.con.print()
@@ -260,6 +271,65 @@ def _drain_notifications():
             console.print(f"[dim]{task.result_text[:100]}[/dim]")
         elif task.error_text:
             console.print(f"[red]{task.error_text[:100]}[/red]")
+
+
+def _list_dir_tree(path: Path, max_depth: int = 2, _prefix: str = "", _depth: int = 0) -> str:
+    """Return a simple tree listing of a directory."""
+    if _depth >= max_depth:
+        return ""
+    lines: list[str] = []
+    try:
+        entries = sorted(path.iterdir(), key=lambda p: (not p.is_dir(), p.name.lower()))
+    except PermissionError:
+        return f"{_prefix}(permission denied)\n"
+    for entry in entries:
+        if entry.name.startswith(".") or entry.name in ("__pycache__", "node_modules", ".venv"):
+            continue
+        if entry.is_dir():
+            lines.append(f"{_prefix}{entry.name}/")
+            lines.append(_list_dir_tree(entry, max_depth, _prefix + "  ", _depth + 1))
+        else:
+            lines.append(f"{_prefix}{entry.name}")
+    return "\n".join(lines)
+
+
+def _expand_at_references(text: str, project_root: Path, max_size: int = 50_000) -> str:
+    """Expand @path references into inline file content."""
+    import re
+
+    pattern = r"(?<![a-zA-Z0-9])@([\w./\-_]+)"
+    refs = re.findall(pattern, text)
+    if not refs:
+        return text
+
+    attachments: list[str] = []
+    clean_text = text
+    seen: set[str] = set()
+    for ref in refs:
+        if ref in seen:
+            continue
+        seen.add(ref)
+        p = (project_root / ref).resolve()
+        # Security: don't allow traversal outside project root
+        try:
+            p.relative_to(project_root)
+        except ValueError:
+            continue
+        if p.is_file():
+            try:
+                content = p.read_text(errors="replace")[:max_size]
+            except OSError:
+                continue
+            attachments.append(f"[File: {ref}]\n```\n{content}\n```")
+            clean_text = clean_text.replace(f"@{ref}", f"`{ref}`", 1)
+        elif p.is_dir():
+            listing = _list_dir_tree(p, max_depth=2)
+            attachments.append(f"[Directory: {ref}]\n{listing}")
+            clean_text = clean_text.replace(f"@{ref}", f"`{ref}/`", 1)
+
+    if attachments:
+        return clean_text + "\n\n" + "\n\n".join(attachments)
+    return text
 
 
 def handle_command(cmd: str, agent: Agent, config: HarnessConfig, display: StreamingDisplay) -> bool | str:
@@ -337,6 +407,7 @@ def handle_command(cmd: str, agent: Agent, config: HarnessConfig, display: Strea
         if _task_queue and _task_queue.is_busy():
             console.print("[yellow]Warning: a background task is running. "
                           "LLM requests may queue.[/yellow]")
+        arg = _expand_at_references(arg, agent.project.root)
         start = time.monotonic()
         for event in agent.run_goal(arg):
             display.handle(event)
@@ -351,6 +422,7 @@ def handle_command(cmd: str, agent: Agent, config: HarnessConfig, display: Strea
         if not _task_queue:
             console.print("[red]Task queue not initialized.[/red]")
             return True
+        arg = _expand_at_references(arg, agent.project.root)
         task = _task_queue.submit(arg)
         console.print(f"[green]Task {task.id} queued: {task.goal[:60]}[/green]")
         console.print(f"[dim]Log: {task.log_path}[/dim]")
@@ -483,6 +555,9 @@ def handle_command(cmd: str, agent: Agent, config: HarnessConfig, display: Strea
   /tasks           - List all tasks and their status
   /result <id>     - Show detailed result of a task
 
+[bold]File references:[/bold]
+  @path/to/file    - Attach file content (Tab to complete)
+
 [bold]Settings:[/bold]
   /model [tier]    - Show all model tiers with details, or switch tier
   /tier [name]     - Show or set model tier (small/medium/large)
@@ -568,6 +643,13 @@ def main(config_path: str | None, tier: str | None, goal_text: str | None,
     console.print(f"[dim]Project: {pinfo['type']} @ {pinfo['root']}[/dim]")
     if pinfo.get("test_command"):
         console.print(f"[dim]Tests: {pinfo['test_command']}[/dim]")
+
+    # Ensure project is under git so file edits can be reverted
+    git_status = project.ensure_git()
+    if git_status == "auto-initialized git":
+        console.print(f"[yellow]Git: auto-initialized (to allow safe file editing)[/yellow]")
+    else:
+        console.print(f"[dim]Git: {git_status}[/dim]")
 
     try:
         model_cfg = config.llm.models.get(config.llm.default_tier)
@@ -656,7 +738,10 @@ def main(config_path: str | None, tier: str | None, goal_text: str | None,
     _pt_style = Style.from_dict({"bottom-toolbar": "noreverse"})
     history_path = Path(os.path.expanduser("~/.open_harness/history"))
     history_path.parent.mkdir(parents=True, exist_ok=True)
+    completer = AtFileCompleter(project.root)
     session = PromptSession(
+        completer=completer,
+        complete_while_typing=False,
         key_bindings=kb, bottom_toolbar=_get_toolbar, style=_pt_style,
         history=FileHistory(str(history_path)),
     )
@@ -683,6 +768,9 @@ def main(config_path: str | None, tier: str | None, goal_text: str | None,
                     break
                 if result:
                     continue
+
+            # Expand @file references
+            user_input = _expand_at_references(user_input, project.root)
 
             mode = _modes[_mode_index[0]]
             try:
@@ -715,6 +803,7 @@ def main(config_path: str | None, tier: str | None, goal_text: str | None,
                 if verbose:
                     console.print_exception()
     finally:
+        agent.close()  # finish session checkpoint (merge git changes)
         if _task_queue:
             _task_queue.shutdown()
         task_store.close()

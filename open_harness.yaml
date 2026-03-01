@@ -61,17 +61,26 @@ tools:
   file:
     max_read_size: 100000  # bytes
 
-# External agents
+# External agents — task routing for orchestrator mode
+# Each agent has built-in defaults for description and strengths.
+# Override below to customize routing based on your preferences.
+# See docs/external_agents.md for benchmark data and routing recommendations.
 external_agents:
   codex:
     enabled: true
     command: "codex"
+    # description: "Fast coding and security review"
+    # strengths: ["fast_coding", "code_review_security", "ci_cd"]
   gemini:
     enabled: true
     command: "gemini"
+    # description: "Large codebase understanding and abstract reasoning"
+    # strengths: ["large_codebase", "abstract_reasoning", "science"]
   claude:
     enabled: true
     command: "claude"
+    # description: "Complex refactoring, Japanese text, planning"
+    # strengths: ["refactoring", "japanese_text", "planning", "code_review_logic"]
 
 # Execution policy — automatic guardrails for autonomous mode
 # Modes: safe (strict budgets), balanced (default), full (no limits)

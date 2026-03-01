@@ -173,20 +173,74 @@ RULES:
 - Prefer shell pipes and chaining to minimize tool calls"""
 
 
-_EXTERNAL_AGENTS = {
-    "claude_code": "Best for code generation, code analysis, refactoring, and complex reasoning",
-    "codex": "Best for code generation, debugging, and autonomous coding tasks",
-    "gemini_cli": "Best for code review, analysis, and alternative perspectives",
+# Built-in defaults: tool_name -> (description, [strengths])
+# Users can override via external_agents.*.description / strengths in config.
+_DEFAULT_AGENT_INFO: dict[str, tuple[str, list[str]]] = {
+    "claude_code": (
+        "Complex refactoring, multi-file changes, planning, Japanese/multilingual text, "
+        "code review (logic/IDOR/XSS). Has Plan Mode and Extended Thinking.",
+        ["refactoring", "planning", "japanese_text", "code_review_logic",
+         "bug_fix", "architecture"],
+    ),
+    "codex": (
+        "Fast coding, security-focused code review (path traversal/SSRF), "
+        "CI/CD integration, sandbox execution. Fastest response time.",
+        ["fast_coding", "code_review_security", "ci_cd", "sandbox"],
+    ),
+    "gemini_cli": (
+        "Large codebase understanding (1M context), abstract reasoning, "
+        "science tasks, spec-to-task decomposition. Free tier available.",
+        ["large_codebase", "abstract_reasoning", "science",
+         "spec_decomposition"],
+    ),
 }
 
+# Task routing guidance embedded in the orchestrator prompt.
+_ROUTING_GUIDE = """\
+### Task Routing Guide
 
-def _build_orchestrator_section(available_tools: list[str] | None) -> str:
+Choose the best agent for each task type:
+
+| Task | Best Agent | Reason |
+|------|-----------|--------|
+| Complex refactoring / multi-file changes | claude_code | Plan Mode, SWE-bench top tier |
+| Security review (path traversal, SSRF) | codex | Highest detection rate |
+| Logic review (IDOR, XSS, auth) | claude_code | Context-dependent analysis |
+| Japanese / multilingual docs | claude_code | WMT24 translation winner |
+| Large codebase understanding | gemini_cli | 1M context, lower cost |
+| Speed-critical simple tasks | codex | Fastest response |
+| Abstract reasoning / science | gemini_cli | ARC-AGI-2 77%, GPQA 94% |
+| Planning / architecture design | claude_code | Plan Mode, Extended Thinking |
+
+If one agent fails, try a different agent for the same task."""
+
+
+def _build_orchestrator_section(
+    available_tools: list[str] | None,
+    agent_configs: dict | None = None,
+) -> str:
     """Build orchestrator role section only if external agents are available."""
     if not available_tools:
         return ""
-    agents = {k: v for k, v in _EXTERNAL_AGENTS.items() if k in available_tools}
+
+    # Collect agent info: config overrides > built-in defaults
+    agents: dict[str, str] = {}
+    for name in available_tools:
+        if name not in _DEFAULT_AGENT_INFO:
+            continue
+        default_desc, _default_strengths = _DEFAULT_AGENT_INFO[name]
+        # Check if user provided a custom description in config
+        if agent_configs:
+            # agent_configs is dict[str, ExternalAgentConfig] — map tool name to config key
+            cfg = _find_agent_config(name, agent_configs)
+            if cfg and cfg.description:
+                agents[name] = cfg.description
+                continue
+        agents[name] = default_desc
+
     if not agents:
         return ""
+
     lines = [
         "\n## Your Role\n",
         "You are a LOCAL LLM acting as an orchestrator. Your strengths are planning, judgment,",
@@ -196,17 +250,38 @@ def _build_orchestrator_section(available_tools: list[str] | None) -> str:
     ]
     for name, desc in agents.items():
         lines.append(f"- **{name}**: {desc}")
-    lines.append(
-        "\nWhen a task involves writing or analyzing code, prefer delegating to an external agent"
-        "\nrather than attempting it yourself."
-    )
+
+    lines.append(f"\n{_ROUTING_GUIDE}")
+
     return "\n".join(lines)
+
+
+def _find_agent_config(tool_name: str, agent_configs: dict):
+    """Map a tool name (e.g. 'claude_code') to its ExternalAgentConfig."""
+    # Config keys: codex, claude, gemini -> tool names: codex, claude_code, gemini_cli
+    _KEY_TO_TOOL = {"claude": "claude_code", "gemini": "gemini_cli", "codex": "codex"}
+    for key, cfg in agent_configs.items():
+        if _KEY_TO_TOOL.get(key) == tool_name or key == tool_name:
+            return cfg
+    return None
+
+
+def _current_datetime() -> str:
+    """Return the current date and time as a human-readable string."""
+    from datetime import datetime, timezone
+    now = datetime.now()
+    utc = datetime.now(timezone.utc)
+    return (
+        f"Current date/time: {now.strftime('%Y-%m-%d %H:%M')} (local), "
+        f"{utc.strftime('%Y-%m-%d %H:%M')} (UTC)"
+    )
 
 
 def build_tool_prompt(
     tools_description: str,
     thinking_mode: str = "auto",
     available_tools: list[str] | None = None,
+    agent_configs: dict | None = None,
 ) -> str:
     """System prompt for interactive (conversational) mode."""
     think = ""
@@ -215,7 +290,7 @@ def build_tool_prompt(
     elif thinking_mode == "auto":
         think = "Use <think>...</think> for complex reasoning. Skip for simple tasks.\n"
 
-    orchestrator = _build_orchestrator_section(available_tools)
+    orchestrator = _build_orchestrator_section(available_tools, agent_configs)
     if orchestrator:
         role = "You are an orchestrator — a planning and coordination AI with access to tools."
         style = (
@@ -239,6 +314,8 @@ def build_tool_prompt(
     return f"""{think}{role}
 {orchestrator}
 
+{_current_datetime()}
+
 ## Available Tools
 
 {tools_description}
@@ -257,6 +334,7 @@ def build_autonomous_prompt(
     project_context: str,
     thinking_mode: str = "auto",
     available_tools: list[str] | None = None,
+    agent_configs: dict | None = None,
 ) -> str:
     """System prompt for autonomous goal-driven mode.
 
@@ -271,11 +349,19 @@ def build_autonomous_prompt(
 
     has_external = bool(
         available_tools
-        and any(t in _EXTERNAL_AGENTS for t in available_tools)
+        and any(t in _DEFAULT_AGENT_INFO for t in available_tools)
     )
 
     if has_external:
-        agents = {k: v for k, v in _EXTERNAL_AGENTS.items() if k in available_tools}
+        # Build agent descriptions from config overrides or defaults
+        agents: dict[str, str] = {}
+        for name in available_tools:
+            if name not in _DEFAULT_AGENT_INFO:
+                continue
+            default_desc, _ = _DEFAULT_AGENT_INFO[name]
+            cfg = _find_agent_config(name, agent_configs) if agent_configs else None
+            agents[name] = cfg.description if (cfg and cfg.description) else default_desc
+
         agent_lines = "\n".join(f"- **{k}**: {v}" for k, v in agents.items())
         role_section = f"""## Your Role
 
@@ -285,14 +371,16 @@ or debugging, delegate to external agent tools.
 
 ## External Agent Strengths
 
-{agent_lines}"""
+{agent_lines}
+
+{_ROUTING_GUIDE}"""
 
         core_behavior = """\
 - Work step by step toward the goal WITHOUT asking for user confirmation
-- Delegate code generation, analysis, and debugging to external agents
+- Choose the BEST external agent for each sub-task based on the routing guide
 - Use file/shell tools for simple reads, checks, and verification
 - After each tool result, evaluate progress and decide your next action
-- If one external agent fails, try a different one
+- If one external agent fails, try a different one for the same task
 - When the goal is fully achieved, write a clear summary of what you did
 - DO NOT ask questions or request clarification — make reasonable decisions
 - Keep working until the goal is FULLY COMPLETE"""
@@ -301,7 +389,10 @@ or debugging, delegate to external agent tools.
         work_patterns = f"""\
 ### Code Changes (Orchestrator Style)
 1. Read the relevant files first to understand the context
-2. Delegate code generation/modification to an external agent ({agent_names})
+2. Delegate code generation/modification to the best external agent ({agent_names})
+   - Complex refactoring / multi-file → claude_code
+   - Speed-critical simple changes → codex
+   - Large codebase context needed → gemini_cli
 3. Verify the changes by reading modified files
 4. Run tests to verify (run_tests tool)
 5. If tests fail, delegate the fix to an external agent with error context
@@ -309,8 +400,15 @@ or debugging, delegate to external agent tools.
 
 ### Code Review
 1. Read the relevant files
-2. Delegate review to an external agent ({agent_names})
+2. Delegate review to the best agent:
+   - Security review → codex
+   - Logic / architecture review → claude_code
+   - Large codebase review → gemini_cli
 3. Summarize findings
+
+### Japanese / Multilingual Text
+- Prefer claude_code for Japanese documentation, comments, and commit messages
+- gemini_cli is a good alternative for multilingual tasks
 
 ### Test-Driven Loop
 1. Run tests to see current state
@@ -349,6 +447,8 @@ When fixing bugs or implementing features:
         role_intro = "You are an autonomous AI coding agent. You work independently to achieve goals."
 
     return f"""{think}{role_intro}
+
+{_current_datetime()}
 
 {role_section}
 

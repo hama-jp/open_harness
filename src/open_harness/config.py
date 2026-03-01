@@ -51,6 +51,8 @@ class ToolsConfig(BaseModel):
 class ExternalAgentConfig(BaseModel):
     enabled: bool = False
     command: str = ""
+    description: str = ""  # Human-readable description for the orchestrator
+    strengths: list[str] = Field(default_factory=list)  # Task categories this agent excels at
 
 
 class MemoryConfig(BaseModel):

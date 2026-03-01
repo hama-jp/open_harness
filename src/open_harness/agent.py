@@ -27,19 +27,130 @@ from open_harness.planner import Plan, PlanCritic, PlanStep, Planner, StepResult
 from open_harness.policy import PolicyEngine, load_policy
 from open_harness.project import ProjectContext
 from open_harness.tools.base import ToolRegistry, ToolResult
+from open_harness.tools.rate_limiter import AgentRateLimiter
 
 logger = logging.getLogger(__name__)
 
 MAX_INTERACTIVE_STEPS = 15
 MAX_GOAL_STEPS = 50  # Autonomous mode gets more room
 
+# Tool names that correspond to external agents (used for rate-limit detection).
+_EXTERNAL_AGENT_TOOLS = {"codex", "claude_code", "gemini_cli"}
+
 
 @dataclass
 class AgentEvent:
     """Event emitted during agent execution."""
-    type: str  # thinking, text, tool_call, tool_result, compensation, status, done
+    type: str  # thinking, text, tool_call, tool_result, compensation, status, done, summary
     data: str = ""
     metadata: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class GoalTracker:
+    """Collects statistics during a goal execution for the final summary."""
+
+    tool_calls: int = 0
+    tool_successes: int = 0
+    tool_failures: int = 0
+    tool_counts: dict[str, int] = field(default_factory=dict)
+    compensations: list[str] = field(default_factory=list)
+    rollbacks: int = 0
+    snapshots: int = 0
+    planned: bool = False
+    plan_steps_total: int = 0
+    plan_steps_ok: int = 0
+    replans: int = 0
+    direct_fallback: bool = False
+    rate_limit_fallbacks: int = 0
+    files_written: list[str] = field(default_factory=list)
+
+    def on_event(self, event: AgentEvent):
+        """Update tracker from an agent event."""
+        if event.type == "tool_call":
+            self.tool_calls += 1
+            name = event.metadata.get("tool", "?")
+            self.tool_counts[name] = self.tool_counts.get(name, 0) + 1
+            # Track file writes
+            if name in ("write_file", "edit_file"):
+                args = event.metadata.get("args", {})
+                path = args.get("path", "") if isinstance(args, dict) else ""
+                if path:
+                    self.files_written.append(path)
+        elif event.type == "tool_result":
+            if event.metadata.get("success"):
+                self.tool_successes += 1
+            else:
+                self.tool_failures += 1
+        elif event.type == "compensation":
+            self.compensations.append(event.data)
+            if "rolling back" in event.data.lower() or "rollback" in event.data.lower():
+                self.rollbacks += 1
+            if "direct mode" in event.data.lower():
+                self.direct_fallback = True
+            if "rate-limited" in event.data.lower() or "retrying with" in event.data.lower():
+                self.rate_limit_fallbacks += 1
+        elif event.type == "status":
+            if event.data.startswith("Snapshot:"):
+                self.snapshots += 1
+            elif event.data.startswith("Replanned:"):
+                self.replans += 1
+
+    def build_summary(self) -> str:
+        """Build a human-readable summary of the goal execution."""
+        lines: list[str] = []
+
+        # Execution mode
+        if self.planned:
+            lines.append(
+                f"Plan: {self.plan_steps_ok}/{self.plan_steps_total} steps succeeded")
+            if self.replans:
+                lines.append(f"Replans: {self.replans}")
+            if self.direct_fallback:
+                lines.append("Fell back to direct mode")
+        else:
+            lines.append("Mode: direct (no plan)")
+
+        # Tools
+        lines.append(
+            f"Tool calls: {self.tool_calls} "
+            f"(OK: {self.tool_successes}, FAIL: {self.tool_failures})")
+        if self.tool_counts:
+            top = sorted(self.tool_counts.items(), key=lambda x: -x[1])[:5]
+            breakdown = ", ".join(f"{n}: {c}" for n, c in top)
+            lines.append(f"  {breakdown}")
+
+        # Files
+        unique_files = list(dict.fromkeys(self.files_written))
+        if unique_files:
+            lines.append(f"Files modified: {len(unique_files)}")
+            for f in unique_files[:10]:
+                lines.append(f"  {f}")
+            if len(unique_files) > 10:
+                lines.append(f"  ... and {len(unique_files) - 10} more")
+
+        # Snapshots / Rollbacks
+        if self.snapshots or self.rollbacks:
+            parts = []
+            if self.snapshots:
+                parts.append(f"snapshots: {self.snapshots}")
+            if self.rollbacks:
+                parts.append(f"rollbacks: {self.rollbacks}")
+            lines.append(f"Checkpoints: {', '.join(parts)}")
+
+        # Rate limit fallbacks
+        if self.rate_limit_fallbacks:
+            lines.append(f"Rate-limit fallbacks: {self.rate_limit_fallbacks}")
+
+        # Compensations (trial & error)
+        non_rollback = [c for c in self.compensations
+                        if "rolling back" not in c.lower() and "rollback" not in c.lower()]
+        if non_rollback:
+            lines.append(f"Compensations: {len(non_rollback)}")
+            for c in non_rollback[:5]:
+                lines.append(f"  ~ {c}")
+
+        return "\n".join(lines)
 
 
 class Agent:
@@ -65,6 +176,18 @@ class Agent:
         self.project_memory_store = ProjectMemoryStore(config.memory.db_path)
         self.project_memory = ProjectMemoryEngine(
             self.project_memory_store, str(self.project.root))
+        # Rate-limit fallback for external agents
+        available_ext = [
+            t.name for t in self.tools.list_tools()
+            if t.name in _EXTERNAL_AGENT_TOOLS
+        ]
+        self.rate_limiter = AgentRateLimiter(available_agents=available_ext)
+        # Session-level checkpoint for interactive mode git protection
+        self._session_checkpoint = CheckpointEngine(
+            self.project.root,
+            has_git=self.project.info.get("has_git", False),
+        )
+        self._session_checkpoint_started = False
         self._interactive_prompt: str | None = None
         self._autonomous_prompt: str | None = None
         self._interaction_count: int = 0
@@ -77,6 +200,7 @@ class Agent:
                 self.tools.get_prompt_description(),
                 self.config.compensation.thinking_mode,
                 available_tools=tool_names,
+                agent_configs=self.config.external_agents,
             )
         return self._interactive_prompt
 
@@ -94,6 +218,7 @@ class Agent:
                 project_ctx,
                 self.config.compensation.thinking_mode,
                 available_tools=tool_names,
+                agent_configs=self.config.external_agents,
             )
         return self._autonomous_prompt
 
@@ -101,6 +226,12 @@ class Agent:
         """Call after tools or project context change."""
         self._interactive_prompt = None
         self._autonomous_prompt = None
+
+    def close(self):
+        """Finish the session checkpoint (merge changes back)."""
+        if self._session_checkpoint_started:
+            self._session_checkpoint.finish(keep_changes=True)
+            self._session_checkpoint_started = False
 
     # ------------------------------------------------------------------
     # Interactive mode (existing behavior)
@@ -115,11 +246,21 @@ class Agent:
         self._interaction_count += 1
         if self._interaction_count % 20 == 0:
             self.project_memory.on_session_end()
+
+        # Lazy-start session checkpoint for git protection
+        if not self._session_checkpoint_started:
+            status = self._session_checkpoint.begin()
+            self._session_checkpoint_started = True
+            logger.info("Session checkpoint: %s", status)
+
         messages = [
             {"role": "system", "content": self.interactive_prompt},
             *self.memory.get_messages(),
         ]
-        yield from self._agent_loop(messages, MAX_INTERACTIVE_STEPS)
+        yield from self._agent_loop(
+            messages, MAX_INTERACTIVE_STEPS,
+            checkpoint=self._session_checkpoint,
+        )
 
     def run(self, user_message: str) -> str:
         final = ""
@@ -137,9 +278,13 @@ class Agent:
 
         Attempts to plan first (break into steps), then execute each step.
         Falls back to direct execution if planning fails.
+
+        Emits a ``summary`` event at the end with trial-and-error statistics.
         """
         self.compensator.reset()
         self.policy.begin_goal()
+
+        tracker = GoalTracker()
 
         yield AgentEvent("status", f"Goal: {goal} [policy: {self.policy.config.mode}]")
         yield AgentEvent("status", f"Project: {self.project.info['type']} @ {self.project.info['root']}")
@@ -166,23 +311,53 @@ class Agent:
                     plan = None
 
             if plan:
+                tracker.planned = True
+                tracker.plan_steps_total = len(plan.steps)
                 yield AgentEvent("status", plan.summary())
-                yield from self._run_planned_goal(goal, plan, ckpt)
+                yield from self._tracked_goal(
+                    self._run_planned_goal(goal, plan, ckpt), tracker)
             else:
                 # Fallback: direct execution without planning
                 reason = err.reason if err else "critic rejected"
-                yield AgentEvent("compensation",
+                comp_event = AgentEvent("compensation",
                     f"Planning failed ({reason}); switching to direct mode")
-                yield from self._run_direct_goal(goal, ckpt)
+                tracker.on_event(comp_event)
+                yield comp_event
+                yield from self._tracked_goal(
+                    self._run_direct_goal(goal, ckpt), tracker)
 
         finally:
             yield AgentEvent("status", f"Budget: {self.policy.budget.summary()}")
             finish_status = ckpt.finish(keep_changes=True)
             if finish_status:
                 yield AgentEvent("status", f"Finish: {finish_status}")
+
+            # Emit goal summary
+            summary_text = tracker.build_summary()
+            yield AgentEvent("summary", summary_text, {
+                "tool_calls": tracker.tool_calls,
+                "tool_failures": tracker.tool_failures,
+                "rollbacks": tracker.rollbacks,
+                "compensations": len(tracker.compensations),
+                "files_modified": len(set(tracker.files_written)),
+            })
+
             # Flush learned memories and invalidate cached prompt
             self.project_memory.on_session_end()
             self._autonomous_prompt = None
+
+    def _tracked_goal(
+        self,
+        events: Generator[AgentEvent, None, None],
+        tracker: GoalTracker,
+    ) -> Generator[AgentEvent, None, None]:
+        """Wrap a goal generator to feed every event into the tracker."""
+        for event in events:
+            tracker.on_event(event)
+            # Track planned step results from done events
+            if event.type == "done" and event.metadata.get("planned"):
+                tracker.plan_steps_ok = event.metadata.get("steps", 0)
+            yield event
 
     def _run_direct_goal(
         self, goal: str, ckpt: CheckpointEngine,
@@ -390,29 +565,66 @@ class Agent:
             # Tool call
             if response.has_tool_call:
                 tc = response.tool_calls[0]
-                yield AgentEvent("tool_call", tc.name, {"tool": tc.name, "args": tc.arguments})
+
+                # --- Rate-limit pre-check: swap to fallback before execution ---
+                actual_tool = tc.name
+                fallback_reason: str | None = None
+                if tc.name in _EXTERNAL_AGENT_TOOLS:
+                    actual_tool, fallback_reason = self.rate_limiter.get_best_agent(tc.name)
+                    if fallback_reason:
+                        yield AgentEvent("compensation", fallback_reason)
+
+                yield AgentEvent("tool_call", actual_tool, {"tool": actual_tool, "args": tc.arguments})
 
                 # Policy check before execution
-                violation = self.policy.check(tc.name, tc.arguments)
+                violation = self.policy.check(actual_tool, tc.arguments)
                 if violation:
                     result = ToolResult(
                         success=False, output="",
                         error=f"[Policy: {violation.rule}] {violation.message}",
                     )
                 else:
-                    result = self.tools.execute(tc.name, tc.arguments)
-                    self.policy.record(tc.name)
+                    result = self.tools.execute(actual_tool, tc.arguments)
+                    self.policy.record(actual_tool)
+
+                # --- Rate-limit post-check: detect limit hit in output ---
+                if (actual_tool in _EXTERNAL_AGENT_TOOLS
+                        and not result.success
+                        and AgentRateLimiter.is_rate_limit_error(result.to_message())):
+                    entry = self.rate_limiter.record_rate_limit(
+                        actual_tool, result.to_message())
+                    yield AgentEvent("compensation",
+                        f"{actual_tool} rate-limited (cooldown {entry.human_remaining()})")
+
+                    # Try another fallback
+                    retry_agent = self.rate_limiter.get_fallback(actual_tool)
+                    if retry_agent:
+                        yield AgentEvent("compensation",
+                            f"Retrying with {retry_agent}")
+                        yield AgentEvent("tool_call", retry_agent,
+                            {"tool": retry_agent, "args": tc.arguments})
+                        result = self.tools.execute(retry_agent, tc.arguments)
+                        self.policy.record(retry_agent)
+                        actual_tool = retry_agent
+
+                        # Check if retry also hit rate limit
+                        if (not result.success
+                                and AgentRateLimiter.is_rate_limit_error(result.to_message())):
+                            self.rate_limiter.record_rate_limit(
+                                retry_agent, result.to_message())
+                            yield AgentEvent("compensation",
+                                f"{retry_agent} also rate-limited")
 
                 output = truncate_tool_output(result.to_message(), 8000)
                 yield AgentEvent("tool_result", output,
-                                 {"success": result.success, "tool": tc.name})
+                                 {"success": result.success, "tool": actual_tool})
 
                 # Auto-learn from tool usage
                 self.project_memory.on_tool_result(
-                    tc.name, tc.arguments, result.success, output)
+                    actual_tool, tc.arguments, result.success, output)
 
                 # Auto-snapshot after file writes (every 5 writes)
-                if checkpoint and tc.name in ("write_file", "edit_file") and result.success:
+                if checkpoint and actual_tool in ("write_file", "edit_file") and result.success:
                     _writes_since_snapshot += 1
                     if _writes_since_snapshot >= 5:
                         snap = checkpoint.snapshot(f"after {_writes_since_snapshot} writes (step {step})")
@@ -421,7 +633,7 @@ class Agent:
                         _writes_since_snapshot = 0
 
                 # Auto-rollback on test failure (if checkpoint active)
-                if (checkpoint and tc.name == "run_tests"
+                if (checkpoint and actual_tool == "run_tests"
                         and not result.success and checkpoint.snapshots):
                     yield AgentEvent("compensation",
                         "Tests failed — rolling back to last snapshot")
@@ -429,17 +641,17 @@ class Agent:
                     yield AgentEvent("status", f"Rollback: {rb}")
                     # Tell the LLM about the rollback
                     messages.append({"role": "assistant",
-                        "content": f'{{"tool": "{tc.name}", "args": {_safe_json(tc.arguments)}}}'})
+                        "content": f'{{"tool": "{actual_tool}", "args": {_safe_json(tc.arguments)}}}'})
                     messages.append({"role": "user",
-                        "content": f"[Tool Result for {tc.name}]\n{output}\n\n"
+                        "content": f"[Tool Result for {actual_tool}]\n{output}\n\n"
                                    f"[ROLLBACK] Changes have been rolled back to the last "
                                    f"snapshot. Try a different approach."})
                     continue
 
                 messages.append({"role": "assistant",
-                    "content": f'{{"tool": "{tc.name}", "args": {_safe_json(tc.arguments)}}}'})
+                    "content": f'{{"tool": "{actual_tool}", "args": {_safe_json(tc.arguments)}}}'})
                 messages.append({"role": "user",
-                    "content": f"[Tool Result for {tc.name}]\n{output}"})
+                    "content": f"[Tool Result for {actual_tool}]\n{output}"})
                 continue
 
             # Malformed tool call
