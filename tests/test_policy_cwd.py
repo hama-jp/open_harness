@@ -26,11 +26,11 @@ class TestCwdPolicy:
         v = pe.check("shell", {"command": "ls", "cwd": "/home/user/project"})
         assert v is None
 
-    def test_no_cwd_no_check(self):
+    def test_no_cwd_no_violation(self):
         pe = _make_engine("/home/user/project")
         v = pe.check("shell", {"command": "ls"})
-        # No cwd arg — should not trigger cwd check
-        assert v is None or v.rule != "cwd_outside_project"
+        # No cwd arg — should not trigger any cwd violation
+        assert v is None
 
     def test_cwd_applies_to_git_tools(self):
         pe = _make_engine("/home/user/project")
@@ -45,17 +45,17 @@ class TestCwdPolicy:
         assert v is not None
         assert v.rule == "cwd_invalid_type"
 
-    def test_empty_cwd_string_no_check(self):
+    def test_empty_cwd_string(self):
         pe = _make_engine("/home/user/project")
         v = pe.check("shell", {"command": "ls", "cwd": ""})
-        # Empty string is falsy, should skip check
-        assert v is None or v.rule != "cwd_outside_project"
+        # Empty string is falsy, should skip cwd check — no cwd violation
+        assert v is None
 
-    def test_no_project_root(self):
+    def test_no_project_root_allows_any_cwd(self):
         pe = PolicyEngine(PolicyConfig())
-        # No project root set — cwd check should pass
+        # No project root set — cwd check should not trigger cwd_outside_project
         v = pe.check("shell", {"command": "ls", "cwd": "/anywhere"})
-        assert v is None or v.rule != "cwd_outside_project"
+        assert v is None
 
 
 class TestProjectTreePolicy:

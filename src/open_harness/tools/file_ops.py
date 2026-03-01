@@ -397,7 +397,7 @@ class AskUserTool(Tool):
             )
         try:
             answer = self._user_input_fn(question)
-            return ToolResult(success=True, output=answer)
+            return ToolResult(success=True, output=str(answer) if answer is not None else "")
         except (EOFError, KeyboardInterrupt):
             return ToolResult(success=True, output="[User declined to answer]")
         except Exception as e:

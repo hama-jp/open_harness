@@ -1,5 +1,6 @@
 """Tests for Issue 10: Session Persistence."""
 
+import os
 import tempfile
 
 from open_harness.memory.store import MemoryStore
@@ -7,12 +8,12 @@ from open_harness.memory.store import MemoryStore
 
 class TestSessionPersistence:
     def setup_method(self):
-        self.db_path = tempfile.mktemp(suffix=".db")
+        fd, self.db_path = tempfile.mkstemp(suffix=".db")
+        os.close(fd)
         self.store = MemoryStore(self.db_path, max_turns=50)
 
     def teardown_method(self):
         self.store.close()
-        import os
         try:
             os.unlink(self.db_path)
         except OSError:

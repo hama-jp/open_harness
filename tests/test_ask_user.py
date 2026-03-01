@@ -50,6 +50,20 @@ class TestAskUserTool:
         assert result.success
         assert "declined" in result.output
 
+    def test_callback_returns_none(self):
+        """None return from callback should be handled gracefully."""
+        tool = AskUserTool(user_input_fn=lambda q: None)
+        result = tool.execute(question="test")
+        assert result.success
+        assert result.output == ""
+
+    def test_callback_returns_int(self):
+        """Integer return from callback should be converted to string."""
+        tool = AskUserTool(user_input_fn=lambda q: 42)
+        result = tool.execute(question="test")
+        assert result.success
+        assert result.output == "42"
+
     def test_schema(self):
         tool = AskUserTool()
         schema = tool.to_openai_schema()

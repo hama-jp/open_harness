@@ -1,6 +1,7 @@
 """Tests for Issue 11: ProjectTreeTool."""
 
 import os
+import shutil
 import tempfile
 
 from open_harness.tools.file_ops import ProjectTreeTool
@@ -30,6 +31,9 @@ class TestProjectTreeTool:
         open(os.path.join(self.tmpdir, "docs", "readme.txt"), "w").close()
         open(os.path.join(self.tmpdir, ".git", "config"), "w").close()
         open(os.path.join(self.tmpdir, "__pycache__", "foo.pyc"), "w").close()
+
+    def teardown_method(self):
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
 
     def test_basic_tree(self):
         result = self.tool.execute(path=self.tmpdir, max_depth=3)
@@ -66,7 +70,7 @@ class TestProjectTreeTool:
         result = self.tool.execute(path=self.tmpdir, max_depth=2)
         # Should contain tree characters
         lines = result.output.split("\n")
-        assert any("├" in line or "└" in line for line in lines)
+        assert any("\u251c" in line or "\u2514" in line for line in lines)
 
     def test_schema(self):
         schema = self.tool.to_openai_schema()

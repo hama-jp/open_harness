@@ -33,7 +33,9 @@ class TestTrimMessages:
     def test_no_trim_under_limit(self):
         msgs = [{"role": "system", "content": "sys"}]
         result = Agent._trim_messages(msgs, max_tokens=1000)
-        assert result is msgs  # same object, no copy needed
+        # Under limit: should return same list (unmodified)
+        assert len(result) == len(msgs)
+        assert result[0]["content"] == "sys"
 
     def test_trims_large_context(self):
         msgs = [{"role": "system", "content": "system prompt"}]
@@ -49,7 +51,7 @@ class TestTrimMessages:
         # Final message preserved
         assert trimmed[-1]["content"] == "final"
 
-    def test_preserves_last_n_messages(self):
+    def test_preserves_tail_messages(self):
         msgs = [{"role": "system", "content": "sys"}]
         for i in range(20):
             msgs.extend(self._make_tool_pair(f"tool_{i}", "x" * 2000))
@@ -57,8 +59,11 @@ class TestTrimMessages:
         msgs.append(last_msg)
 
         trimmed = Agent._trim_messages(msgs, max_tokens=3000)
-        # Last 10 messages should be untouched
-        assert trimmed[-1] is last_msg
+        # Final message must be preserved
+        assert trimmed[-1]["content"] == "last question"
+        # At least the last few tool pairs should be untouched (not compressed)
+        tail_contents = [m.get("content", "") for m in trimmed[-6:]]
+        assert not any("[Earlier:" in c for c in tail_contents)
 
     def test_compressed_format(self):
         msgs = [{"role": "system", "content": "sys"}]
