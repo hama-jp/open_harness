@@ -1,6 +1,7 @@
 """Tests for Issue 3: EditFileTool Fuzzy Matching."""
 
 import os
+import shutil
 import tempfile
 
 from open_harness.tools.file_ops import EditFileTool
@@ -10,6 +11,7 @@ class TestEditFileFuzzy:
     def setup_method(self):
         self.tool = EditFileTool()
         self._tmp_files = []
+        self._tmp_dirs = []
 
     def teardown_method(self):
         for path in self._tmp_files:
@@ -17,6 +19,8 @@ class TestEditFileFuzzy:
                 os.unlink(path)
             except OSError:
                 pass
+        for d in self._tmp_dirs:
+            shutil.rmtree(d, ignore_errors=True)
 
     def _write_tmp(self, content: str) -> str:
         fd, path = tempfile.mkstemp(suffix=".txt")
@@ -96,7 +100,7 @@ class TestEditFileFuzzy:
 
     def test_path_is_directory(self):
         tmpdir = tempfile.mkdtemp()
-        self._tmp_files.append(tmpdir)  # will fail unlink but that's ok
+        self._tmp_dirs.append(tmpdir)
         result = self.tool.execute(path=tmpdir, old_string="x", new_string="y")
         assert not result.success
 

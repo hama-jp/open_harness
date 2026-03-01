@@ -35,14 +35,16 @@ class TestConfigLoading:
         try:
             with os.fdopen(fd, "w") as f:
                 f.write("invalid: yaml: content: [[[")
-            with pytest.raises((yaml.YAMLError, Exception)):
+            with pytest.raises(yaml.YAMLError):
                 load_config(path)
         finally:
             os.unlink(path)
 
-    def test_defaults_when_no_config(self):
+    def test_defaults_when_no_config(self, monkeypatch, tmp_path):
         """load_config(None) should return defaults if no config file exists."""
-        # Temporarily rename any real config to avoid interference
+        # Use a clean temp dir as CWD and HOME to avoid picking up real configs
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv("HOME", str(tmp_path))
         config, path = load_config(None)
         assert config is not None
 
