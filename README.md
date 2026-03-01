@@ -53,6 +53,7 @@ harness --config ~/myproject/open_harness.yaml
 /submit <task>     Submit to background queue
 /tasks             List background tasks
 /result <id>       Show task result
+/model [tier]      Show model details for all tiers, or switch tier
 /tier [name]       Switch model tier (small/medium/large)
 /policy [mode]     Switch safety policy (safe/balanced/full)
 /tools             List available tools

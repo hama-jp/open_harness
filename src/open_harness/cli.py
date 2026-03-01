@@ -13,6 +13,7 @@ from pathlib import Path
 import click
 from prompt_toolkit import PromptSession
 from prompt_toolkit.formatted_text import HTML
+from prompt_toolkit.history import FileHistory
 from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit.styles import Style
 from rich.console import Console
@@ -280,6 +281,39 @@ def handle_command(cmd: str, agent: Agent, config: HarnessConfig, display: Strea
                 console.print(f"  {name}: {desc}{m}")
         return True
 
+    elif command == "/model":
+        from urllib.parse import urlparse
+
+        def _tier_line(tier_name: str, model_cfg, is_current: bool) -> str:
+            provider_cfg = config.llm.providers.get(model_cfg.provider)
+            location = ""
+            if provider_cfg:
+                host = urlparse(provider_cfg.base_url).hostname or ""
+                if host in ("localhost", "127.0.0.1", "::1"):
+                    location = " (local)"
+                else:
+                    location = f" ({host})"
+            mark = "  *" if is_current else ""
+            return (
+                f"  {tier_name}:  {model_cfg.model} "
+                f"@ {model_cfg.provider}{location} "
+                f"max_tokens={model_cfg.max_tokens}{mark}"
+            )
+
+        if arg:
+            prev = agent.router.current_tier
+            agent.router.current_tier = arg
+            if agent.router.current_tier == prev and arg != prev:
+                console.print(f"[red]Unknown tier: {arg}[/red]")
+            else:
+                mcfg = agent.router.get_model_config()
+                console.print(_tier_line(agent.router.current_tier, mcfg, True))
+        else:
+            console.print("[bold]Model tiers:[/bold]")
+            for name, _mcfg in config.llm.models.items():
+                console.print(_tier_line(name, _mcfg, name == agent.router.current_tier))
+        return True
+
     elif command == "/tools":
         for tool in agent.tools.list_tools():
             console.print(f"  [bold]{tool.name}[/bold]: {tool.description[:80]}")
@@ -444,6 +478,7 @@ def handle_command(cmd: str, agent: Agent, config: HarnessConfig, display: Strea
   /result <id>     - Show detailed result of a task
 
 [bold]Settings:[/bold]
+  /model [tier]    - Show all model tiers with details, or switch tier
   /tier [name]     - Show or set model tier (small/medium/large)
   /policy [mode]   - Show or set policy (safe/balanced/full)
   /tools           - List available tools
@@ -480,12 +515,38 @@ def main(config_path: str | None, tier: str | None, goal_text: str | None,
         return
 
     version = get_version()
-    console.print(Panel(
-        f"[bold]Open Harness[/bold] v{version}\n"
-        "Self-driving AI agent for local LLMs\n"
-        "[dim]Type /help for commands, /goal <task> for autonomous mode[/dim]",
-        border_style="blue",
-    ))
+
+    # Gradient ASCII art banner
+    _banner_lines = [
+        r"   ____                      _   _                                ",
+        r"  / __ \                    | | | |                               ",
+        r" | |  | |_ __   ___ _ __   | |_| | __ _ _ __ _ __   ___  ___ ___ ",
+        r" | |  | | '_ \ / _ \ '_ \  |  _  |/ _` | '__| '_ \ / _ \/ __/ __|",
+        r" | |__| | |_) |  __/ | | | | | | | (_| | |  | | | |  __/\__ \__ \\",
+        r"  \____/| .__/ \___|_| |_| |_| |_|\__,_|_|  |_| |_|\___||___/___/",
+        r"        | |                                                       ",
+        r"        |_|                                                       ",
+    ]
+    # Blue-cyan gradient using Rich markup
+    _gradient = [
+        "bold bright_blue",
+        "bold blue",
+        "bold cyan",
+        "bold bright_cyan",
+        "bold cyan",
+        "bold blue",
+        "bold bright_blue",
+        "bold blue",
+    ]
+    for line, style in zip(_banner_lines, _gradient):
+        console.print(f"[{style}]{line}[/{style}]")
+    console.print(
+        f"  [bold bright_white]v{version}[/bold bright_white]"
+        "  [dim]Self-driving AI agent for local LLMs[/dim]"
+    )
+    console.print(
+        "  [dim]Type /help for commands, /goal <task> for autonomous mode[/dim]\n"
+    )
 
     config, config_file = load_config(config_path)
     if config_file:
@@ -587,8 +648,11 @@ def main(config_path: str | None, tier: str | None, goal_text: str | None,
         _mode_index[0] = (_mode_index[0] + 1) % len(_modes)
 
     _pt_style = Style.from_dict({"bottom-toolbar": "noreverse"})
+    history_path = Path(os.path.expanduser("~/.open_harness/history"))
+    history_path.parent.mkdir(parents=True, exist_ok=True)
     session = PromptSession(
         key_bindings=kb, bottom_toolbar=_get_toolbar, style=_pt_style,
+        history=FileHistory(str(history_path)),
     )
 
     try:

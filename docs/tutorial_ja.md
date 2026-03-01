@@ -272,6 +272,7 @@ cli.py の main 関数は Click を使って CLI をセットアップしてい�
 | `/submit <タスク>` | ゴールをバックグラウンドキューに送信 |
 | `/tasks` | すべてのタスクとステータスを一覧表示 |
 | `/result <id>` | タスクの詳細結果を表示 |
+| `/model [ティア]` | 全ティアのモデル名・プロバイダー・ホスト・max_tokensを表示、またはティア切替 |
 | `/tier [名前]` | モデルティアの表示・切替 |
 | `/policy [モード]` | 安全ポリシーの表示・切替 |
 | `/tools` | 利用可能なツールを一覧表示 |
@@ -460,6 +461,21 @@ Open Harness は速度と能力のバランスを取るために複数のモデ�
 | `small` | 簡単なタスク、計画作成 | 4096 |
 | `medium` | 汎用タスク（デフォルト） | 8192 |
 | `large` | 複雑な推論 | 16384 |
+
+### 実行時のティア詳細表示
+
+`/model` で各ティアのモデル名・プロバイダー・接続先ホスト・max_tokens を確認できます：
+
+```
+> /model
+Model tiers:
+  small:  qwen3.5-35b-a3b @ lm_studio (192.168.11.3) max_tokens=4096
+  medium: qwen3.5-35b-a3b @ lm_studio (192.168.11.3) max_tokens=8192  *
+  large:  qwen3.5-35b-a3b @ lm_studio (192.168.11.3) max_tokens=16384
+
+> /model large
+  large:  qwen3.5-35b-a3b @ lm_studio (192.168.11.3) max_tokens=16384  *
+```
 
 ### 実行時のティア切替
 

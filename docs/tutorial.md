@@ -272,6 +272,7 @@ Type `/help` to see all commands:
 | `/submit <task>` | Submit goal to background queue |
 | `/tasks` | List all tasks and their status |
 | `/result <id>` | Show detailed result of a task |
+| `/model [tier]` | Show all model tiers with provider, host, and max_tokens; or switch tier |
 | `/tier [name]` | Show or switch model tier |
 | `/policy [mode]` | Show or set safety policy |
 | `/tools` | List available tools |
@@ -464,6 +465,21 @@ Open Harness supports multiple model tiers to balance speed and capability.
 | `small` | Simple tasks, planning | 4096 |
 | `medium` | General tasks (default) | 8192 |
 | `large` | Complex reasoning | 16384 |
+
+### View tier details at runtime
+
+Use `/model` to see model name, provider, host, and max_tokens for every tier:
+
+```
+> /model
+Model tiers:
+  small:  qwen3.5-35b-a3b @ lm_studio (192.168.11.3) max_tokens=4096
+  medium: qwen3.5-35b-a3b @ lm_studio (192.168.11.3) max_tokens=8192  *
+  large:  qwen3.5-35b-a3b @ lm_studio (192.168.11.3) max_tokens=16384
+
+> /model large
+  large:  qwen3.5-35b-a3b @ lm_studio (192.168.11.3) max_tokens=16384  *
+```
 
 ### Switch tiers at runtime
 
