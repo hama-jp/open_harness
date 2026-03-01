@@ -21,6 +21,9 @@ A comprehensive guide to using Open Harness — a self-driving AI agent harness 
 13. [Per-Project Configuration](#13-per-project-configuration)
 14. [Practical Examples](#14-practical-examples)
 15. [Troubleshooting](#15-troubleshooting)
+16. [@file References and Tab Completion](#16-file-references-and-tab-completion)
+17. [Mode Switching](#17-mode-switching)
+18. [Rate-Limit Fallback](#18-rate-limit-fallback)
 
 ---
 
@@ -216,7 +219,7 @@ On startup, Open Harness displays:
 
 ```
 ╭──────────────────────────────────────────────────╮
-│ Open Harness v0.2.0                              │
+│ Open Harness v0.3.3                              │
 │ Self-driving AI agent for local LLMs             │
 │ Type /help for commands, /goal <task> for auto    │
 ╰──────────────────────────────────────────────────╯
@@ -225,8 +228,11 @@ Project: python @ /home/you/project
 Tests: python3 -m pytest
 Model: qwen/qwen3.5-35b-a3b (medium)
 Tools (14): shell, read_file, write_file, ...
+Git: already initialized
 Task queue: ready
 ```
+
+> **Tip**: Press **Shift+Tab** to cycle between input modes (chat / goal / submit). See [Mode Switching](#17-mode-switching).
 
 ### Basic conversation
 
@@ -284,6 +290,7 @@ Type `/help` to see all commands:
 | `/tools` | List available tools |
 | `/project` | Show detected project context |
 | `/memory` | Show learned project memories |
+| `/update` | Self-update Open Harness from git |
 | `/clear` | Clear conversation history |
 | `/quit` | Exit |
 
@@ -305,6 +312,7 @@ The agent will:
 3. Take git snapshots after each successful step
 4. Replan if a step fails
 5. Fall back to direct execution if planning fails
+6. Display a summary showing tool calls, compensations, rollbacks, and files modified
 
 ### Example: Bug fix
 
@@ -697,7 +705,22 @@ This means `/goal` always attempts to complete the task, even with a weak LLM.
 
 ## 10. Checkpoint and Rollback
 
-In git repositories, autonomous mode uses git-based checkpoints for safe, reversible execution.
+Checkpoints now work in **both interactive and goal modes**. In git repositories, Open Harness uses git-based checkpoints for safe, reversible execution.
+
+### Git auto-initialization
+
+If you open a project that is **not** a git repository, Open Harness automatically runs `git init` to enable checkpoint support. The startup display shows:
+
+```
+Git: already initialized     ← existing repo
+Git: initialized (new)       ← auto-initialized by Open Harness
+```
+
+This ensures that checkpoints and rollback are always available, even in new projects.
+
+### Interactive mode protection
+
+In interactive (chat) mode, Open Harness creates a **session-level checkpoint** when the session starts. If the agent makes file changes during conversation that you want to undo, the session checkpoint provides a safe rollback point. This is lighter-weight than the full branch workflow used in goal mode.
 
 ### Automatic behavior
 
@@ -842,6 +865,25 @@ external_agents:
     enabled: true
     command: "gemini"
 ```
+
+### Configurable routing
+
+You can customize agent descriptions and declare their strengths for smarter routing:
+
+```yaml
+external_agents:
+  claude:
+    enabled: true
+    command: "claude"
+    description: "Complex refactoring, Japanese text, planning"
+    strengths: ["refactoring", "japanese_text", "planning"]
+```
+
+The orchestrator uses these hints to pick the best agent for each sub-task.
+
+### Rate-limit fallback
+
+When an external agent hits its usage quota, Open Harness detects the error (via patterns like `429`, `"rate limit"`, `"quota exceeded"`), records the cooldown time, and automatically routes the task to the next available agent. When the cooldown expires, it switches back to the original agent. See [Rate-Limit Fallback](#18-rate-limit-fallback) for full details.
 
 ### Policy limits
 
@@ -1118,6 +1160,84 @@ The task may be stuck on an LLM call. On next restart, stale running tasks are a
 If you see SQLite locking errors:
 
 **Fix**: Only one `harness` process should run per machine. The database uses WAL mode for concurrency between the main thread and background tasks, but not between processes.
+
+---
+
+## 16. @file References and Tab Completion
+
+You can attach file contents to your message using `@path/to/file`:
+
+```
+> Review this file @src/open_harness/cli.py
+```
+
+The file content is automatically expanded and attached to the message sent to the LLM.
+
+### Tab completion
+
+Press Tab after `@` to get file/directory completion:
+
+```
+> @src/[Tab]
+  src/open_harness/     (directory)
+
+> @src/open_harness/[Tab]
+  __init__.py           (328B)
+  cli.py                (19KB)
+  agent.py              (12KB)
+  ...
+```
+
+- Directories show `/` suffix for further navigation
+- File sizes are shown as metadata
+- `.git`, `__pycache__`, `node_modules`, `.venv` are excluded
+- Path traversal outside the project root is blocked
+
+---
+
+## 17. Mode Switching
+
+The REPL has three input modes, cycled with **Shift+Tab**:
+
+| Mode | Indicator | Behavior |
+|------|-----------|----------|
+| chat | green `>` | Interactive conversation (default) |
+| goal | yellow `>` | Autonomous execution -- input becomes a goal |
+| submit | blue `>` | Background queue -- input is submitted as a task |
+
+The current mode is shown in the bottom toolbar. Press Shift+Tab to cycle through modes, then type your message and press Enter.
+
+---
+
+## 18. Rate-Limit Fallback
+
+When an external agent hits its usage quota, Open Harness automatically:
+
+1. **Detects** the rate limit (patterns: "429", "rate limit", "quota exceeded", "too many requests", etc.)
+2. **Records** the cooldown period (parsed from "try again in X minutes" hints, default 15 min)
+3. **Routes** the task to the next available fallback agent
+4. **Recovers** -- switches back to the original agent when its cooldown expires
+
+### Fallback order
+
+| Primary | Fallback 1 | Fallback 2 |
+|---------|-----------|-----------|
+| claude_code | codex | gemini_cli |
+| codex | claude_code | gemini_cli |
+| gemini_cli | claude_code | codex |
+
+### Example
+
+```
+> /goal Refactor the auth module
+
+[compensation] codex rate-limited (cooldown 15m)
+[compensation] Retrying with claude_code
+> claude_code "Refactor the auth module..."
+OK claude_code
+```
+
+If all agents are rate-limited, the task proceeds with the original agent (which will likely fail and trigger the compensation engine's retry strategies).
 
 ---
 
