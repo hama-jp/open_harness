@@ -39,6 +39,7 @@ class Tool(ABC):
     name: str
     description: str
     parameters: list[ToolParameter]
+    max_output: int = 5000  # Per-tool output limit (chars). Override in subclasses.
 
     @abstractmethod
     def execute(self, **kwargs: Any) -> ToolResult:
@@ -89,6 +90,14 @@ class Tool(ABC):
         params_str = "\n".join(params_desc) if params_desc else "  (none)"
         return f"### {self.name}\n{self.description}\nParameters:\n{params_str}"
 
+    def to_compact_description(self) -> str:
+        """One-line compact description for token-efficient prompts."""
+        params = ", ".join(
+            f"{p.name}: {p.type}" + ("?" if not p.required else "")
+            for p in self.parameters
+        )
+        return f"{self.name}({params}) - {self.description}"
+
 
 class ToolRegistry:
     """Registry of available tools."""
@@ -112,6 +121,14 @@ class ToolRegistry:
         descs = [t.to_prompt_description() for t in self._tools.values()]
         return "\n\n".join(descs)
 
+    def get_compact_prompt_description(self) -> str:
+        """Compact one-line-per-tool description for token-efficient prompts."""
+        return "\n".join(t.to_compact_description() for t in self._tools.values())
+
+    def tool_names(self) -> list[str]:
+        """Return list of registered tool names."""
+        return list(self._tools.keys())
+
     def execute(self, tool_name: str, arguments: dict[str, Any]) -> ToolResult:
         tool = self._tools.get(tool_name)
         if tool is None:
@@ -121,10 +138,37 @@ class ToolRegistry:
                 error=f"Unknown tool: {tool_name}. Available: {', '.join(self._tools.keys())}",
             )
         try:
-            return tool.execute(**arguments)
+            result = tool.execute(**arguments)
+            # Apply per-tool output truncation immediately after execution
+            max_out = getattr(tool, "max_output", 5000)
+            if max_out > 0 and len(result.output) > max_out:
+                result = ToolResult(
+                    success=result.success,
+                    output=_smart_truncate(result.output, max_out),
+                    error=result.error,
+                    metadata=result.metadata,
+                )
+            return result
         except Exception as e:
             return ToolResult(
                 success=False,
                 output="",
                 error=f"Tool '{tool_name}' execution failed: {type(e).__name__}: {e}",
             )
+
+
+def _smart_truncate(text: str, max_length: int) -> str:
+    """Intelligent truncation: keep head and tail with middle summary.
+
+    For shell-like output, keeps first 25% + last 75% for error visibility.
+    """
+    if len(text) <= max_length:
+        return text
+    head_size = max_length // 4
+    tail_size = max_length - head_size
+    omitted = len(text) - max_length
+    return (
+        text[:head_size]
+        + f"\n\n... [{omitted} chars truncated] ...\n\n"
+        + text[-tail_size:]
+    )

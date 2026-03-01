@@ -5,12 +5,16 @@ from __future__ import annotations
 import json
 import logging
 import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Any, Callable, Generator
 
 from open_harness.checkpoint import CheckpointEngine
+from open_harness.context_compactor import build_context_summary
 from open_harness.config import HarnessConfig
-from open_harness.llm.client import LLMResponse, ToolCall, _extract_balanced_json, _parse_tool_calls_from_text
+from open_harness.diagnostics import SessionLogger
+from open_harness.llm.client import LLMResponse, ToolCall, ToolCallParser, _extract_balanced_json, _parse_tool_calls_from_text
 from open_harness.llm.compensator import (
     Compensator,
     build_autonomous_prompt,
@@ -24,7 +28,7 @@ from open_harness.memory.project_memory import (
     build_memory_block,
 )
 from open_harness.memory.store import MemoryStore
-from open_harness.planner import Plan, PlanCritic, PlanStep, Planner, StepResult
+from open_harness.planner import GoalComplexityEstimator, Plan, PlanCritic, PlanStep, Planner, StepResult
 from open_harness.policy import PolicyEngine, load_policy
 from open_harness.project import ProjectContext
 from open_harness.tools.base import ToolRegistry, ToolResult
@@ -40,10 +44,132 @@ MAX_GOAL_STEPS = 50  # Autonomous mode gets more room
 _EXTERNAL_AGENT_TOOLS = {"codex", "claude_code", "gemini_cli"}
 
 
+class ContextManager:
+    """Manages context window trimming with two-level compression.
+
+    L1: Tool call/result pairs → short summary ("[Earlier: used X → status]")
+    L2: Consecutive L1 summaries → aggregate ("[Earlier: N tool calls, M succeeded]")
+
+    Supports adaptive threshold based on model context_length.
+    """
+
+    @staticmethod
+    def adaptive_threshold(context_length: int) -> int:
+        """Compute trim threshold from model context_length.
+
+        Default: 12000 tokens. Scales to 75% of (context_length / 4).
+        """
+        if context_length <= 0:
+            return 12000
+        return max(4000, int(context_length * 0.75 / 4))
+
+    @staticmethod
+    def trim(
+        messages: list[dict[str, Any]],
+        max_tokens: int = 12000,
+    ) -> list[dict[str, Any]]:
+        """Trim old messages when context exceeds max_tokens.
+
+        Two-level compression:
+          L1: Adjacent tool call + result pairs → one-line summary
+          L2: Consecutive L1 summaries → aggregated count
+        """
+        est = sum(len(m.get("content") or "") for m in messages) // 4
+        if est <= max_tokens:
+            return messages
+
+        # Protect system prompt (index 0) and last 10 messages
+        protected_tail = 10
+        if len(messages) <= protected_tail + 1:
+            return messages
+
+        head = messages[:1]  # system prompt
+        tail = messages[-protected_tail:]
+        middle = messages[1:-protected_tail]
+
+        # L1: Compress tool call + result pairs into one-line summaries
+        l1_compressed: list[dict[str, Any]] = []
+        i = 0
+        while i < len(middle):
+            msg = middle[i]
+            content = msg.get("content", "")
+            # Detect tool call (assistant) followed by tool result (user)
+            if (msg.get("role") == "assistant"
+                    and content.startswith("{")
+                    and i + 1 < len(middle)
+                    and middle[i + 1].get("role") == "user"
+                    and "[Tool Result" in middle[i + 1].get("content", "")):
+                try:
+                    tc_data = json.loads(content)
+                    tool_name = tc_data.get("tool", "unknown")
+                except (json.JSONDecodeError, AttributeError):
+                    tool_name = "unknown"
+                result_content = middle[i + 1].get("content", "")
+                success = "FAIL" not in result_content[:100]
+                status = "success" if success else "fail"
+                l1_compressed.append({
+                    "role": "user",
+                    "content": f"[Earlier: used {tool_name} → {status}]",
+                    "_l1": True,  # marker for L2 aggregation
+                })
+                i += 2
+            else:
+                l1_compressed.append(msg)
+                i += 1
+
+        # Context summary: extract structured information before aggregation
+        summary = build_context_summary(middle)
+
+        # L2: Aggregate consecutive L1 summaries into a single count
+        l2_compressed: list[dict[str, Any]] = []
+        run: list[dict[str, Any]] = []
+        for msg in l1_compressed:
+            if msg.get("_l1"):
+                run.append(msg)
+            else:
+                if run:
+                    l2_compressed.append(_aggregate_l1_run(run))
+                    run = []
+                l2_compressed.append(msg)
+        if run:
+            l2_compressed.append(_aggregate_l1_run(run))
+
+        # Prepend structured summary if available
+        if summary:
+            l2_compressed.insert(0, {"role": "user", "content": summary})
+
+        # Strip internal markers
+        for msg in l2_compressed:
+            msg.pop("_l1", None)
+
+        return head + l2_compressed + tail
+
+
+def _aggregate_l1_run(run: list[dict[str, Any]]) -> dict[str, Any]:
+    """Aggregate a consecutive run of L1 summaries into a single message."""
+    if len(run) == 1:
+        msg = dict(run[0])
+        msg.pop("_l1", None)
+        return msg
+    total = len(run)
+    successes = sum(1 for m in run if "success" in m.get("content", ""))
+    return {
+        "role": "user",
+        "content": f"[Earlier: {total} tool calls, {successes} succeeded]",
+    }
+
+
+@dataclass
+class _LoopState:
+    """Mutable state shared across tool-call processing within a single agent loop iteration."""
+    writes_since_snapshot: int = 0
+    test_failed_in_batch: bool = False
+
+
 @dataclass
 class AgentEvent:
     """Event emitted during agent execution."""
-    type: str  # thinking, text, tool_call, tool_result, compensation, status, done, summary
+    type: str  # thinking, text, tool_call, tool_result, compensation, status, done, summary, agent_progress, agent_done
     data: str = ""
     metadata: dict[str, Any] = field(default_factory=dict)
 
@@ -66,6 +192,8 @@ class GoalTracker:
     direct_fallback: bool = False
     rate_limit_fallbacks: int = 0
     files_written: list[str] = field(default_factory=list)
+    start_time: float = field(default_factory=time.time)
+    elapsed: float = 0.0
 
     def on_event(self, event: AgentEvent):
         """Update tracker from an agent event."""
@@ -98,9 +226,21 @@ class GoalTracker:
             elif event.data.startswith("Replanned:"):
                 self.replans += 1
 
+    def stop(self):
+        """Record elapsed time. Call when the goal finishes."""
+        self.elapsed = time.time() - self.start_time
+
     def build_summary(self) -> str:
         """Build a human-readable summary of the goal execution."""
         lines: list[str] = []
+
+        # Elapsed time
+        if self.elapsed > 0:
+            mins, secs = divmod(self.elapsed, 60)
+            if mins >= 1:
+                lines.append(f"Duration: {int(mins)}m {secs:.1f}s")
+            else:
+                lines.append(f"Duration: {secs:.1f}s")
 
         # Execution mode
         if self.planned:
@@ -165,14 +305,17 @@ class Agent:
         memory: MemoryStore,
         project: ProjectContext | None = None,
         user_input_fn: Callable[[str], str] | None = None,
+        session_logger: SessionLogger | None = None,
     ):
         self.config = config
         self.tools = tools
         self.memory = memory
         self.project = project or ProjectContext()
         self.user_input_fn = user_input_fn
+        self.session_logger = session_logger
         self.router = ModelRouter(config)
-        self.compensator = Compensator(config.compensation)
+        self.compensator = Compensator(
+            config.compensation, tool_names=tools.tool_names())
         self.policy = PolicyEngine(load_policy(config.policy))
         self.policy.set_project_root(self.project.root)
         self.planner = Planner(self.router)
@@ -186,6 +329,8 @@ class Agent:
             if t.name in _EXTERNAL_AGENT_TOOLS
         ]
         self.rate_limiter = AgentRateLimiter(available_agents=available_ext)
+        # Schema-aware tool call parser
+        self.tool_parser = ToolCallParser(self.tools.tool_names())
         # Session-level checkpoint for interactive mode git protection
         self._session_checkpoint = CheckpointEngine(
             self.project.root,
@@ -207,6 +352,7 @@ class Agent:
                 self.config.compensation.thinking_mode,
                 available_tools=tool_names,
                 agent_configs=self.config.external_agents,
+                mode="plan",
             )
         return self._interactive_prompt
 
@@ -243,6 +389,12 @@ class Agent:
             self._session_checkpoint.finish(keep_changes=True)
             self._session_checkpoint_started = False
 
+    def _emit(self, event: AgentEvent) -> AgentEvent:
+        """Log an event to the session logger if active."""
+        if self.session_logger:
+            self.session_logger.log_event(event)
+        return event
+
     # ------------------------------------------------------------------
     # Interactive mode (existing behavior)
     # ------------------------------------------------------------------
@@ -262,6 +414,9 @@ class Agent:
             status = self._session_checkpoint.begin()
             self._session_checkpoint_started = True
             logger.info("Session checkpoint: %s", status)
+
+        if self.session_logger:
+            self.session_logger.log_system_prompt(self.interactive_prompt, "plan")
 
         messages = [
             {"role": "system", "content": self.interactive_prompt},
@@ -294,9 +449,12 @@ class Agent:
         self.compensator.reset()
         self.policy.begin_goal()
 
+        if self.session_logger:
+            self.session_logger.log_system_prompt(self.autonomous_prompt, "goal")
+
         tracker = GoalTracker()
 
-        yield AgentEvent("status", f"Goal: {goal} [policy: {self.policy.config.mode}]")
+        yield self._emit(AgentEvent("status", f"Goal: {goal} [policy: {self.policy.config.mode}]"))
         yield AgentEvent("status", f"Project: {self.project.info['type']} @ {self.project.info['root']}")
 
         # Checkpoint engine for transactional safety
@@ -356,6 +514,7 @@ class Agent:
                 yield AgentEvent("status", f"Finish: {finish_status}")
 
             # Emit goal summary
+            tracker.stop()
             summary_text = tracker.build_summary()
             yield AgentEvent("summary", summary_text, {
                 "tool_calls": tracker.tool_calls,
@@ -363,6 +522,7 @@ class Agent:
                 "rollbacks": tracker.rollbacks,
                 "compensations": len(tracker.compensations),
                 "files_modified": len(set(tracker.files_written)),
+                "elapsed": round(tracker.elapsed, 1),
             })
 
             # Flush learned memories and invalidate cached prompt
@@ -568,61 +728,20 @@ class Agent:
     ) -> list[dict[str, Any]]:
         """Trim old tool_call/tool_result pairs when context grows too large.
 
-        Keeps: system message (first), last 5 user/assistant turns.
-        Compresses older tool exchanges into short summaries.
+        Delegates to ContextManager for two-level compression.
         """
-        est = Agent._estimate_tokens(messages)
-        if est <= max_tokens:
-            return messages
-
-        # Protect system prompt (index 0) and last 10 messages
-        protected_tail = 10
-        if len(messages) <= protected_tail + 1:
-            return messages
-
-        head = messages[:1]  # system prompt
-        tail = messages[-protected_tail:]
-        middle = messages[1:-protected_tail]
-
-        # Compress the middle: replace adjacent tool pairs with summaries
-        compressed: list[dict[str, Any]] = []
-        i = 0
-        while i < len(middle):
-            msg = middle[i]
-            content = msg.get("content", "")
-            # Detect tool call pattern (assistant) followed by tool result (user)
-            if (msg.get("role") == "assistant"
-                    and content.startswith("{")
-                    and i + 1 < len(middle)
-                    and middle[i + 1].get("role") == "user"
-                    and "[Tool Result" in middle[i + 1].get("content", "")):
-                # Summarize the pair
-                try:
-                    tc_data = json.loads(content)
-                    tool_name = tc_data.get("tool", "unknown")
-                except (json.JSONDecodeError, AttributeError):
-                    tool_name = "unknown"
-                result_content = middle[i + 1].get("content", "")
-                success = "FAIL" not in result_content[:100]
-                status = "success" if success else "fail"
-                compressed.append({
-                    "role": "user",
-                    "content": f"[Earlier: used {tool_name} → {status}]",
-                })
-                i += 2
-            else:
-                compressed.append(msg)
-                i += 1
-
-        return head + compressed + tail
+        return ContextManager.trim(messages, max_tokens)
 
     # ------------------------------------------------------------------
     # Tool call recovery (Issue 12)
     # ------------------------------------------------------------------
 
     def _recover_tool_call(self, content: str) -> ToolCall | None:
-        """Try to extract a valid tool call from malformed LLM output."""
-        calls = _parse_tool_calls_from_text(content)
+        """Try to extract a valid tool call from malformed LLM output.
+
+        Uses the schema-aware parser for faster matching with known tool names.
+        """
+        calls = self.tool_parser.parse(content)
         if calls:
             return calls[0]
         return None
@@ -641,7 +760,14 @@ class Agent:
         """Core ReAct loop shared by interactive and goal modes."""
         tier = tier or self.router.current_tier
         step = 0
-        _writes_since_snapshot = 0
+        loop_state = _LoopState()
+
+        # Compute adaptive trim threshold from model's context_length
+        try:
+            model_cfg = self.router.get_model_config(tier)
+            trim_threshold = ContextManager.adaptive_threshold(model_cfg.context_length)
+        except (ValueError, AttributeError):
+            trim_threshold = 12000
 
         while step < max_steps:
             step += 1
@@ -652,12 +778,22 @@ class Agent:
                                  {"success": False})
                 return
 
-            # Issue 1: Trim context window
-            messages = self._trim_messages(messages)
+            # Issue 1: Trim context window (adaptive threshold)
+            messages = self._trim_messages(messages, trim_threshold)
 
             yield AgentEvent("status", f"[{step}/{max_steps}] {tier}")
 
             response = yield from self._stream_llm(messages, tier)
+
+            # Session diagnostics: log LLM turn
+            if self.session_logger:
+                self.session_logger.log_llm_turn(
+                    tier=tier,
+                    usage=response.usage or None,
+                    latency_ms=response.latency_ms,
+                    messages_count=len(messages),
+                    response_preview=response.content[:200] if response.content else "",
+                )
 
             # Issue 7: Token budget tracking
             if response.usage:
@@ -686,104 +822,33 @@ class Agent:
 
             # Tool call(s) — Issue 4: process ALL tool calls
             if response.has_tool_call:
-                _test_failed_in_batch = False
-                for tc in response.tool_calls:
-                    # --- Rate-limit pre-check: swap to fallback before execution ---
-                    actual_tool = tc.name
-                    fallback_reason: str | None = None
-                    if tc.name in _EXTERNAL_AGENT_TOOLS:
-                        actual_tool, fallback_reason = self.rate_limiter.get_best_agent(tc.name)
-                        if fallback_reason:
-                            yield AgentEvent("compensation", fallback_reason)
+                loop_state.test_failed_in_batch = False
 
-                    yield AgentEvent("tool_call", actual_tool, {"tool": actual_tool, "args": tc.arguments})
+                # Split into local and external tool calls
+                local_calls = [tc for tc in response.tool_calls
+                               if tc.name not in _EXTERNAL_AGENT_TOOLS]
+                external_calls = [tc for tc in response.tool_calls
+                                  if tc.name in _EXTERNAL_AGENT_TOOLS]
 
-                    # Policy check before execution
-                    violation = self.policy.check(actual_tool, tc.arguments)
-                    if violation:
-                        result = ToolResult(
-                            success=False, output="",
-                            error=f"[Policy: {violation.rule}] {violation.message}",
-                        )
-                    else:
-                        result = self.tools.execute(actual_tool, tc.arguments)
-                        self.policy.record(actual_tool)
+                # Process local tool calls sequentially
+                for tc in local_calls:
+                    yield from self._process_local_tool_call(
+                        tc, messages, checkpoint, step, loop_state)
 
-                    # --- Rate-limit post-check: detect limit hit in output ---
-                    if (actual_tool in _EXTERNAL_AGENT_TOOLS
-                            and not result.success
-                            and AgentRateLimiter.is_rate_limit_error(result.to_message())):
-                        entry = self.rate_limiter.record_rate_limit(
-                            actual_tool, result.to_message())
-                        yield AgentEvent("compensation",
-                            f"{actual_tool} rate-limited (cooldown {entry.human_remaining()})")
-
-                        retry_agent = self.rate_limiter.get_fallback(actual_tool)
-                        if retry_agent:
-                            yield AgentEvent("compensation",
-                                f"Retrying with {retry_agent}")
-                            yield AgentEvent("tool_call", retry_agent,
-                                {"tool": retry_agent, "args": tc.arguments})
-                            result = self.tools.execute(retry_agent, tc.arguments)
-                            self.policy.record(retry_agent)
-                            actual_tool = retry_agent
-
-                            if (not result.success
-                                    and AgentRateLimiter.is_rate_limit_error(result.to_message())):
-                                self.rate_limiter.record_rate_limit(
-                                    retry_agent, result.to_message())
-                                yield AgentEvent("compensation",
-                                    f"{retry_agent} also rate-limited")
-                        else:
-                            cooldown_info = self.rate_limiter.status_summary()
-                            result = ToolResult(
-                                success=False, output="",
-                                error=(
-                                    f"All external agents are rate-limited. "
-                                    f"{cooldown_info} "
-                                    f"Use local tools (shell, read_file, write_file, "
-                                    f"edit_file) to proceed without external agents."
-                                ),
-                            )
-                            yield AgentEvent("compensation",
-                                "All external agents rate-limited — falling back to local tools")
-
-                    output = redact_secrets(
-                        truncate_tool_output(result.to_message(), 8000))
-                    yield AgentEvent("tool_result", output,
-                                     {"success": result.success, "tool": actual_tool})
-
-                    # Auto-learn from tool usage
-                    self.project_memory.on_tool_result(
-                        actual_tool, tc.arguments, result.success, output)
-
-                    # Auto-snapshot after file writes (every 5 writes)
-                    if checkpoint and actual_tool in ("write_file", "edit_file") and result.success:
-                        _writes_since_snapshot += 1
-                        if _writes_since_snapshot >= 5:
-                            snap = checkpoint.snapshot(f"after {_writes_since_snapshot} writes (step {step})")
-                            if snap:
-                                yield AgentEvent("status", f"Snapshot: {snap.commit_hash}")
-                            _writes_since_snapshot = 0
-
-                    messages.append({"role": "assistant",
-                        "content": f'{{"tool": "{actual_tool}", "args": {_safe_json(tc.arguments)}}}'})
-                    messages.append({"role": "user",
-                        "content": f"[Tool Result for {actual_tool}]\n{output}"})
-
-                    # Track test failures using ToolResult.success flag
-                    if actual_tool == "run_tests" and not result.success:
-                        _test_failed_in_batch = True
+                # Process external tool calls in parallel
+                if external_calls:
+                    yield from self._execute_external_parallel(
+                        external_calls, messages, checkpoint, step, loop_state)
 
                 # Auto-rollback on test failure (check ANY run_tests in this batch)
-                if checkpoint and checkpoint.snapshots and _test_failed_in_batch:
-                        yield AgentEvent("compensation",
-                            "Tests failed — rolling back to last snapshot")
-                        rb = checkpoint.rollback(checkpoint.snapshots[-1])
-                        yield AgentEvent("status", f"Rollback: {rb}")
-                        messages[-1]["content"] += (
-                            "\n\n[ROLLBACK] Changes have been rolled back to the last "
-                            "snapshot. Try a different approach.")
+                if checkpoint and checkpoint.snapshots and loop_state.test_failed_in_batch:
+                    yield AgentEvent("compensation",
+                        "Tests failed — rolling back to last snapshot")
+                    rb = checkpoint.rollback(checkpoint.snapshots[-1])
+                    yield AgentEvent("status", f"Rollback: {rb}")
+                    messages[-1]["content"] += (
+                        "\n\n[ROLLBACK] Changes have been rolled back to the last "
+                        "snapshot. Try a different approach.")
                 continue
 
             # Malformed tool call — Issue 12: try recovery first
@@ -825,7 +890,7 @@ class Agent:
                     continue
 
             # Auto-snapshot before finishing (capture final state)
-            if checkpoint and _writes_since_snapshot > 0:
+            if checkpoint and loop_state.writes_since_snapshot > 0:
                 snap = checkpoint.snapshot(f"goal complete (step {step})")
                 if snap:
                     yield AgentEvent("status", f"Final snapshot: {snap.commit_hash}")
@@ -850,6 +915,220 @@ class Agent:
         yield AgentEvent("done",
             f"[Reached {max_steps} steps. Use /tier large or simplify the goal.]",
             {"success": False})
+
+    # ------------------------------------------------------------------
+    # Tool call processors
+    # ------------------------------------------------------------------
+
+    def _process_local_tool_call(
+        self,
+        tc: ToolCall,
+        messages: list[dict[str, Any]],
+        checkpoint: CheckpointEngine | None,
+        step: int,
+        loop_state: _LoopState,
+    ) -> Generator[AgentEvent, None, None]:
+        """Process a single local (non-external-agent) tool call."""
+        actual_tool = tc.name
+        yield AgentEvent("tool_call", actual_tool,
+                         {"tool": actual_tool, "args": tc.arguments})
+
+        # Policy check before execution
+        violation = self.policy.check(actual_tool, tc.arguments)
+        if violation:
+            result = ToolResult(
+                success=False, output="",
+                error=f"[Policy: {violation.rule}] {violation.message}",
+            )
+        else:
+            result = self.tools.execute(actual_tool, tc.arguments)
+            self.policy.record(actual_tool)
+
+        output = redact_secrets(
+            truncate_tool_output(result.to_message(), 5000))
+        yield AgentEvent("tool_result", output,
+                         {"success": result.success, "tool": actual_tool})
+
+        # Auto-learn from tool usage
+        self.project_memory.on_tool_result(
+            actual_tool, tc.arguments, result.success, output)
+
+        # Auto-snapshot after file writes (every 10 writes)
+        if checkpoint and actual_tool in ("write_file", "edit_file") and result.success:
+            loop_state.writes_since_snapshot += 1
+            if loop_state.writes_since_snapshot >= 10:
+                snap = checkpoint.snapshot(
+                    f"after {loop_state.writes_since_snapshot} writes (step {step})")
+                if snap:
+                    yield AgentEvent("status", f"Snapshot: {snap.commit_hash}")
+                loop_state.writes_since_snapshot = 0
+
+        messages.append({"role": "assistant",
+            "content": f'{{"tool": "{actual_tool}", "args": {_safe_json(tc.arguments)}}}'})
+        messages.append({"role": "user",
+            "content": f"[Tool Result for {actual_tool}]\n{output}"})
+
+        # Track test failures
+        if actual_tool == "run_tests" and not result.success:
+            loop_state.test_failed_in_batch = True
+
+    def _execute_external_parallel(
+        self,
+        external_calls: list[ToolCall],
+        messages: list[dict[str, Any]],
+        checkpoint: CheckpointEngine | None,
+        step: int,
+        loop_state: _LoopState,
+    ) -> Generator[AgentEvent, None, None]:
+        """Execute external agent tool calls in parallel using threads.
+
+        Single call:  runs on main thread with real-time streaming progress.
+        Multiple calls: runs in parallel threads, progress collected per-thread.
+
+        Thread safety: only ``self.tools.execute()`` runs in worker threads
+        (subprocess.Popen releases the GIL). All rate-limiter queries, policy
+        checks, event yields, and message appends happen on the main thread.
+        """
+        # Phase 1 (main thread): pre-check rate limits + policy for each call
+        prepared: list[tuple[int, ToolCall, str, ToolResult | None]] = []
+        for idx, tc in enumerate(external_calls):
+            actual_tool, fallback_reason = self.rate_limiter.get_best_agent(tc.name)
+            if fallback_reason:
+                yield AgentEvent("compensation", fallback_reason)
+
+            yield AgentEvent("tool_call", actual_tool,
+                             {"tool": actual_tool, "args": tc.arguments})
+
+            violation = self.policy.check(actual_tool, tc.arguments)
+            if violation:
+                result = ToolResult(
+                    success=False, output="",
+                    error=f"[Policy: {violation.rule}] {violation.message}",
+                )
+                prepared.append((idx, tc, actual_tool, result))
+            else:
+                self.policy.record(actual_tool)
+                prepared.append((idx, tc, actual_tool, None))  # None = needs execution
+
+        # Phase 2: execute tool calls that passed policy
+        to_execute = [(i, tc, tool) for i, tc, tool, res in prepared if res is None]
+
+        results_map: dict[int, ToolResult] = {}
+        # Collect streaming progress events per tool (thread-safe list append)
+        progress_events: dict[int, list[AgentEvent]] = {i: [] for i, _, _ in to_execute}
+
+        if len(to_execute) == 1:
+            # Single call: stream progress on main thread in real time
+            idx, tc, tool = to_execute[0]
+            def _on_progress(line: str):
+                # Truncate long lines for display
+                display = line[:120] + "..." if len(line) > 120 else line
+                yield_events.append(AgentEvent("agent_progress", display, {"tool": tool}))
+
+            yield_events: list[AgentEvent] = []
+            args_with_cb = dict(tc.arguments)
+            args_with_cb["progress_callback"] = _on_progress
+            result = self.tools.execute(tool, args_with_cb)
+            results_map[idx] = result
+            # Yield collected progress events
+            for ev in yield_events:
+                yield ev
+
+        elif to_execute:
+            # Multiple calls: run in parallel, collect progress per-thread
+            max_workers = min(3, len(to_execute))
+
+            def _make_callback(call_idx: int, tool_name: str):
+                def cb(line: str):
+                    display = line[:120] + "..." if len(line) > 120 else line
+                    progress_events[call_idx].append(
+                        AgentEvent("agent_progress", display, {"tool": tool_name}))
+                return cb
+
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                futures = {}
+                for idx, tc, tool in to_execute:
+                    args_with_cb = dict(tc.arguments)
+                    args_with_cb["progress_callback"] = _make_callback(idx, tool)
+                    futures[executor.submit(self.tools.execute, tool, args_with_cb)] = idx
+
+                for future in futures:
+                    idx = futures[future]
+                    try:
+                        results_map[idx] = future.result()
+                    except Exception as e:
+                        results_map[idx] = ToolResult(
+                            success=False, output="",
+                            error=f"Execution error: {e}",
+                        )
+
+            # Yield progress events from all threads (interleaved by completion)
+            for idx, tc, tool in to_execute:
+                for ev in progress_events.get(idx, []):
+                    yield ev
+
+        # Merge policy-rejected results
+        for idx, tc, tool, pre_result in prepared:
+            if pre_result is not None:
+                results_map[idx] = pre_result
+
+        # Phase 3 (main thread): process results in original order
+        for idx, tc, actual_tool, _ in prepared:
+            result = results_map[idx]
+
+            # Rate-limit post-check: detect limit hit in output
+            if (not result.success
+                    and AgentRateLimiter.is_rate_limit_error(result.to_message())):
+                entry = self.rate_limiter.record_rate_limit(
+                    actual_tool, result.to_message())
+                yield AgentEvent("compensation",
+                    f"{actual_tool} rate-limited (cooldown {entry.human_remaining()})")
+
+                retry_agent = self.rate_limiter.get_fallback(actual_tool)
+                if retry_agent:
+                    yield AgentEvent("compensation",
+                        f"Retrying with {retry_agent}")
+                    yield AgentEvent("tool_call", retry_agent,
+                        {"tool": retry_agent, "args": tc.arguments})
+                    result = self.tools.execute(retry_agent, tc.arguments)
+                    self.policy.record(retry_agent)
+                    actual_tool = retry_agent
+
+                    if (not result.success
+                            and AgentRateLimiter.is_rate_limit_error(result.to_message())):
+                        self.rate_limiter.record_rate_limit(
+                            retry_agent, result.to_message())
+                        yield AgentEvent("compensation",
+                            f"{retry_agent} also rate-limited")
+                else:
+                    cooldown_info = self.rate_limiter.status_summary()
+                    result = ToolResult(
+                        success=False, output="",
+                        error=(
+                            f"All external agents are rate-limited. "
+                            f"{cooldown_info} "
+                            f"Use local tools (shell, read_file, write_file, "
+                            f"edit_file) to proceed without external agents."
+                        ),
+                    )
+                    yield AgentEvent("compensation",
+                        "All external agents rate-limited — falling back to local tools")
+
+            output = redact_secrets(
+                truncate_tool_output(result.to_message(), 8000))
+            yield AgentEvent("tool_result", output,
+                             {"success": result.success, "tool": actual_tool})
+            yield AgentEvent("agent_done", "",
+                             {"tool": actual_tool, "success": result.success})
+
+            # Auto-learn from tool usage
+            self.project_memory.on_tool_result(
+                actual_tool, tc.arguments, result.success, output)
+
+            messages.append({"role": "assistant",
+                "content": f'{{"tool": "{actual_tool}", "args": {_safe_json(tc.arguments)}}}'})
+            messages.append({"role": "user",
+                "content": f"[Tool Result for {actual_tool}]\n{output}"})
 
     # ------------------------------------------------------------------
     # Helpers

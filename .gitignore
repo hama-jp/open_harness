@@ -18,3 +18,9 @@ venv/
 
 # Test install clone (root-level only, not src/open_harness/)
 /open_harness/
+
+# Draft articles
+docs/note_article.md
+
+# Test fixtures (manual helper scripts)
+tests/fixtures/

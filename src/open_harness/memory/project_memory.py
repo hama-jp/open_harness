@@ -65,6 +65,7 @@ class ProjectMemoryStore:
         # WAL mode for better concurrent read/write performance
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA busy_timeout=5000")
+        self._pending_commits = 0
         self._init_schema()
 
     def _init_schema(self):
@@ -113,7 +114,11 @@ class ProjectMemoryStore:
 
     def upsert(self, project_root: str, kind: str, key: str, value: str,
                score: float = 0.5):
-        """Insert or update a memory item."""
+        """Insert or update a memory item.
+
+        Uses batched commits: accumulates writes and commits every 10
+        upserts to reduce fsync overhead.
+        """
         pid = self._project_id(project_root)
         now = time.time()
         self._conn.execute("""
@@ -126,7 +131,10 @@ class ProjectMemoryStore:
                 seen_count = seen_count + 1,
                 updated_at = excluded.updated_at
         """, (pid, kind, key, value, score, now, now))
-        self._conn.commit()
+        self._pending_commits += 1
+        if self._pending_commits >= 10:
+            self._conn.commit()
+            self._pending_commits = 0
 
     def get_memories(self, project_root: str,
                      kind: str | None = None,
@@ -153,6 +161,12 @@ class ProjectMemoryStore:
             for r in rows
         ]
 
+    def flush(self):
+        """Commit any pending writes immediately."""
+        if self._pending_commits > 0:
+            self._conn.commit()
+            self._pending_commits = 0
+
     def upsert_runbook(self, project_root: str, slug: str, title: str,
                        trigger: str, steps: list[str]):
         """Insert or update a runbook."""
@@ -168,7 +182,10 @@ class ProjectMemoryStore:
                 steps_json = excluded.steps_json,
                 updated_at = excluded.updated_at
         """, (pid, slug, title, trigger, json.dumps(steps), now, now))
-        self._conn.commit()
+        self._pending_commits += 1
+        if self._pending_commits >= 10:
+            self._conn.commit()
+            self._pending_commits = 0
 
     def get_runbooks(self, project_root: str, limit: int = 10) -> list[Runbook]:
         """Get runbooks for a project."""
@@ -200,10 +217,15 @@ class ProjectMemoryStore:
                 "WHERE project_id = ? AND slug = ?",
                 (time.time(), pid, slug),
             )
-        self._conn.commit()
+        self._pending_commits += 1
+        if self._pending_commits >= 10:
+            self._conn.commit()
+            self._pending_commits = 0
 
     def prune(self, project_root: str):
         """Remove stale, low-score memories to prevent bloat."""
+        # Flush pending writes before pruning
+        self.flush()
         pid = self._project_id(project_root)
         cutoff = time.time() - (STALE_DAYS * 86400)
 
@@ -226,6 +248,7 @@ class ProjectMemoryStore:
         self._conn.commit()
 
     def close(self):
+        self.flush()
         self._conn.close()
 
 

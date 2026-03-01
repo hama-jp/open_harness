@@ -118,19 +118,35 @@ class CheckpointEngine:
         """Create a lightweight snapshot of current state.
 
         Returns the snapshot, or None if nothing to snapshot.
+        Uses git diff --quiet for fast no-change detection and commit -a
+        to combine staging and commit into fewer subprocess calls.
         """
         if not self._active or not self.has_git:
             return None
 
-        # Check if there are changes to snapshot
-        status = _git(["status", "--porcelain"], self.cwd)
-        if not status.stdout.strip():
+        # Fast check: any tracked file changes? (avoids full status scan)
+        diff_check = _git(["diff", "--quiet", "HEAD"], self.cwd)
+        # Also check for untracked files (diff --quiet doesn't catch these)
+        status = _git(["status", "--porcelain", "-uno"], self.cwd)
+        has_tracked_changes = diff_check.returncode != 0 or bool(status.stdout.strip())
+
+        # Check untracked files separately
+        untracked = _git(["ls-files", "--others", "--exclude-standard"], self.cwd)
+        has_untracked = bool(untracked.stdout.strip())
+
+        if not has_tracked_changes and not has_untracked:
             return None
 
-        # Stage and commit
-        _git(["add", "-A"], self.cwd)
-        msg = f"harness-snapshot: {description}"
-        commit = _git(["commit", "-m", msg, "--allow-empty"], self.cwd)
+        # Stage untracked files if any, then commit all
+        if has_untracked:
+            _git(["add", "-A"], self.cwd)
+            msg = f"harness-snapshot: {description}"
+            commit = _git(["commit", "-m", msg], self.cwd)
+        else:
+            # Use commit -a to combine staging and commit (saves one subprocess)
+            msg = f"harness-snapshot: {description}"
+            commit = _git(["commit", "-a", "-m", msg], self.cwd)
+
         if commit.returncode != 0:
             return None
 
@@ -182,6 +198,9 @@ class CheckpointEngine:
         If keep_changes=True, merges work into original branch.
         If keep_changes=False, discards work branch.
 
+        Always makes a definitive merge-or-discard decision so that no
+        work branch is left in a half-finished state.
+
         Returns a status message.
         """
         if not self._active or not self.has_git:
@@ -191,41 +210,52 @@ class CheckpointEngine:
         self._active = False
         parts = []
 
-        if keep_changes and self._snapshots:
+        if keep_changes and self._work_branch:
             # Commit any uncommitted changes on work branch before switching
             status = _git(["status", "--porcelain"], self.cwd)
             if status.stdout.strip():
                 _git(["add", "-A"], self.cwd)
                 _git(["commit", "-m", "harness-snapshot: uncommitted changes at finish"], self.cwd)
 
-            # Switch back to original branch
-            checkout = _git(["checkout", self._original_branch], self.cwd)
-            if checkout.returncode != 0:
-                # Force checkout as last resort (changes are saved in work branch commits)
-                checkout = _git(["checkout", "-f", self._original_branch], self.cwd)
-                if checkout.returncode != 0:
-                    parts.append(f"checkout failed: {checkout.stderr.strip()[:100]}")
-                    # Still on work branch — skip merge, just clean up
-                    self._cleanup_stash(parts)
-                    self._snapshots.clear()
-                    self._work_branch = None
-                    return ", ".join(parts) if parts else "finish failed"
+            # Check if work branch has any commits beyond the branch point
+            has_work = bool(self._snapshots)
+            if not has_work:
+                diff = _git(["diff", self._original_branch, "HEAD", "--stat"], self.cwd)
+                has_work = bool(diff.stdout.strip())
 
-            # Squash-merge work into original branch
-            merge = _git(["merge", "--squash", self._work_branch], self.cwd)
-            if merge.returncode == 0:
-                # Check if there's anything to commit
-                status = _git(["status", "--porcelain"], self.cwd)
-                if status.stdout.strip():
-                    parts.append(f"merged {len(self._snapshots)} snapshots")
+            if has_work:
+                # Switch back to original branch
+                checkout = _git(["checkout", self._original_branch], self.cwd)
+                if checkout.returncode != 0:
+                    checkout = _git(["checkout", "-f", self._original_branch], self.cwd)
+                    if checkout.returncode != 0:
+                        parts.append(f"checkout failed: {checkout.stderr.strip()[:100]}")
+                        self._cleanup_stash(parts)
+                        self._snapshots.clear()
+                        self._work_branch = None
+                        return ", ".join(parts) if parts else "finish failed"
+
+                # Squash-merge work into original branch
+                merge = _git(["merge", "--squash", self._work_branch], self.cwd)
+                if merge.returncode == 0:
+                    status = _git(["status", "--porcelain"], self.cwd)
+                    if status.stdout.strip():
+                        n = len(self._snapshots) or 1
+                        # Auto-commit so changes are never left staged-but-uncommitted
+                        _git(["commit", "-m", f"harness: goal completed ({n} snapshots merged)"], self.cwd)
+                        parts.append(f"merged {n} snapshots")
+                    else:
+                        parts.append("no net changes to merge")
                 else:
-                    parts.append("no net changes to merge")
+                    _git(["merge", "--abort"], self.cwd)
+                    parts.append(f"merge conflict (aborted): {merge.stderr.strip()[:100]}")
+                # Always delete work branch
+                _git(["branch", "-D", self._work_branch], self.cwd)
             else:
-                # Merge conflict: abort to restore clean state
-                _git(["merge", "--abort"], self.cwd)
-                parts.append(f"merge conflict (aborted): {merge.stderr.strip()[:100]}")
-            # Clean up work branch
-            _git(["branch", "-D", self._work_branch], self.cwd)
+                # No changes on work branch — clean discard
+                _git(["checkout", self._original_branch], self.cwd)
+                _git(["branch", "-D", self._work_branch], self.cwd)
+                parts.append("no changes to merge")
         elif self._work_branch:
             # Discard work branch — force checkout to discard uncommitted changes
             _git(["checkout", "-f", self._original_branch], self.cwd)
@@ -303,3 +333,35 @@ class CheckpointEngine:
             return ""
         r = _git(["diff", "--stat", f"HEAD~{len(self._snapshots)}", "HEAD"], self.cwd)
         return r.stdout.strip() if r.returncode == 0 else ""
+
+    @staticmethod
+    def cleanup_orphan_branches(project_root: str | Path) -> list[str]:
+        """Delete leftover harness/goal-* branches from crashed sessions.
+
+        Should be called on startup to ensure no half-finished branches
+        remain from previous interrupted runs.
+
+        Returns list of cleaned-up branch names.
+        """
+        cwd = str(Path(project_root).resolve())
+        r = _git(["branch", "--list", "harness/goal-*"], cwd)
+        if r.returncode != 0 or not r.stdout.strip():
+            return []
+
+        # Get the current branch to avoid deleting it
+        cur = _git(["rev-parse", "--abbrev-ref", "HEAD"], cwd)
+        current_branch = cur.stdout.strip() if cur.returncode == 0 else ""
+
+        cleaned: list[str] = []
+        for line in r.stdout.strip().splitlines():
+            branch = line.strip().lstrip("* ")
+            if not branch or branch == current_branch:
+                continue
+            # If we're ON an orphan harness branch, switch to main/master first
+            if branch == current_branch:
+                continue
+            d = _git(["branch", "-D", branch], cwd)
+            if d.returncode == 0:
+                cleaned.append(branch)
+                logger.info("Cleaned up orphan branch: %s", branch)
+        return cleaned

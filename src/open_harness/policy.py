@@ -182,12 +182,27 @@ class PolicyEngine:
         self.budget = BudgetUsage()
         self._project_root: Path | None = None
         self._token_usage: int = 0
+        # Pre-compiled denied path patterns: [(expanded_str, parent_str, raw_pattern)]
+        self._compiled_denied: list[tuple[str, str, str]] = []
+        self._denied_cache: dict[str, bool] = {}  # path_str -> is_denied
+        self._compile_denied_patterns()
+
+    def _compile_denied_patterns(self) -> None:
+        """Pre-expand denied_paths into (expanded, parent, raw) tuples."""
+        self._compiled_denied = []
+        for pattern in self.config.denied_paths:
+            expanded = str(Path(pattern).expanduser())
+            parent = expanded.removesuffix("/*").removesuffix("*")
+            self._compiled_denied.append((expanded, parent, pattern))
+        self._denied_cache.clear()
 
     def set_project_root(self, root: str | Path):
         self._project_root = Path(root).resolve()
         # Issue 5: auto-restrict reads to project scope when allowed_paths is empty
         if self.config.project_scope_default and not self.config.allowed_paths:
             self.config.allowed_paths = [str(self._project_root / "*")]
+        # Invalidate caches when project root changes
+        self._denied_cache.clear()
 
     def begin_goal(self):
         """Reset budgets for a new goal."""
@@ -294,24 +309,38 @@ class PolicyEngine:
 
     def _check_denied(self, path_str: str, resolved: Path, path: str,
                        tool_name: str, category: str) -> PolicyViolation | None:
-        """Check if a path matches any denied pattern (shared by read/write)."""
-        for pattern in self.config.denied_paths:
-            expanded = str(Path(pattern).expanduser())
-            # Check exact match, glob match, and parent-of match
-            # e.g. "/etc/*" should block both "/etc" and "/etc/passwd"
-            parent = expanded.removesuffix("/*").removesuffix("*")
+        """Check if a path matches any denied pattern (shared by read/write).
+
+        Uses pre-compiled patterns and a result cache for fast repeated checks.
+        """
+        # Check cache first (keyed by resolved path string)
+        cached = self._denied_cache.get(path_str)
+        if cached is not None:
+            if not cached:
+                return None
+            # Cache says denied but we need to find which pattern for the message.
+            # Fall through to the loop below.
+
+        resolved_name = resolved.name
+        for expanded, parent, raw_pattern in self._compiled_denied:
             if (
                 fnmatch.fnmatch(path_str, expanded)
                 or path_str == parent
                 or path_str.startswith(parent + "/")
-                or fnmatch.fnmatch(resolved.name, pattern)
+                or fnmatch.fnmatch(resolved_name, raw_pattern)
             ):
+                # Cache as denied (limit cache size to avoid memory bloat)
+                if len(self._denied_cache) < 256:
+                    self._denied_cache[path_str] = True
                 return PolicyViolation(
                     rule="denied_path",
-                    message=f"Access to '{path}' is denied by policy (matches '{pattern}'). "
+                    message=f"Access to '{path}' is denied by policy (matches '{raw_pattern}'). "
                             f"Use a different path or approach.",
                     tool=tool_name, category=category,
                 )
+        # Cache as not-denied
+        if len(self._denied_cache) < 256:
+            self._denied_cache[path_str] = False
         return None
 
     def _check_read_path(self, path: str, tool_name: str, category: str) -> PolicyViolation | None:

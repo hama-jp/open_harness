@@ -6,11 +6,14 @@ Strategies:
 3. Model escalation - try larger models
 4. Output truncation - reduce tool output size
 5. Step-limit escalation - auto-escalate on step limits
+6. Error classification - class-specific retry strategies
 """
 
 from __future__ import annotations
 
+import json
 import logging
+import re
 from dataclasses import dataclass
 from typing import Any
 
@@ -19,6 +22,75 @@ from open_harness.config import CompensationConfig
 logger = logging.getLogger(__name__)
 
 TIER_ORDER = ["small", "medium", "large"]
+
+
+# -----------------------------------------------------------------------
+# Error classification for smarter retry
+# -----------------------------------------------------------------------
+
+class ErrorClassifier:
+    """Classify LLM failures to select the optimal retry strategy.
+
+    Error classes:
+      malformed_json  - JSON syntax error (repairable without LLM retry)
+      wrong_tool_name - tool name not in registry (fuzzy match suggestion)
+      missing_args    - required arguments missing
+      empty_response  - no content at all (escalate model immediately)
+      prose_wrapped   - JSON wrapped in prose (parser handles it, skip compensation)
+      unknown         - unrecognized error pattern
+    """
+
+    def __init__(self, tool_names: list[str] | None = None):
+        self._tool_names = set(tool_names) if tool_names else set()
+
+    def classify(self, error_context: str, failed_response: str) -> str:
+        """Return the error class string."""
+        if not failed_response or not failed_response.strip():
+            return "empty_response"
+
+        # Check for JSON syntax issues
+        stripped = failed_response.strip()
+        if stripped.startswith("{"):
+            try:
+                json.loads(stripped)
+            except json.JSONDecodeError:
+                return "malformed_json"
+
+        # Check for wrong tool name
+        if self._tool_names and "Unknown tool" in error_context:
+            return "wrong_tool_name"
+
+        # Check for missing args
+        if "missing" in error_context.lower() and "arg" in error_context.lower():
+            return "missing_args"
+
+        # Check if it looks like prose-wrapped JSON
+        if re.search(r'\{[^}]*"tool"', failed_response):
+            return "prose_wrapped"
+
+        return "unknown"
+
+    def suggest_tool(self, wrong_name: str) -> str | None:
+        """Fuzzy match a wrong tool name to the closest registered tool."""
+        if not self._tool_names:
+            return None
+        wrong_lower = wrong_name.lower().replace("-", "_").replace(" ", "_")
+        best_match = None
+        best_score = 0
+        for name in self._tool_names:
+            # Simple substring/prefix matching
+            name_lower = name.lower()
+            if wrong_lower in name_lower or name_lower in wrong_lower:
+                score = len(name_lower)
+                if score > best_score:
+                    best_score = score
+                    best_match = name
+            elif wrong_lower[:4] == name_lower[:4]:
+                score = 1
+                if score > best_score:
+                    best_score = score
+                    best_match = name
+        return best_match
 
 
 @dataclass
@@ -33,10 +105,11 @@ class CompensationResult:
 class Compensator:
     """Engine that compensates for weak LLM responses."""
 
-    def __init__(self, config: CompensationConfig):
+    def __init__(self, config: CompensationConfig, tool_names: list[str] | None = None):
         self.config = config
         self._attempt_count = 0
         self._step_escalation_used = False
+        self._error_classifier = ErrorClassifier(tool_names)
 
     def reset(self):
         self._attempt_count = 0
@@ -52,6 +125,33 @@ class Compensator:
         if self._attempt_count >= self.config.max_retries:
             return None
         self._attempt_count += 1
+
+        # Error classification: choose strategy based on error type
+        error_class = self._error_classifier.classify(error_context, failed_response)
+
+        if error_class == "empty_response":
+            # Skip retry strategies, go straight to model escalation
+            return self._escalate_model(current_tier)
+
+        if error_class == "prose_wrapped":
+            # Parser should handle this — skip compensation entirely
+            return None
+
+        if error_class == "wrong_tool_name":
+            suggestion = self._error_classifier.suggest_tool(
+                error_context.split("Unknown tool:")[-1].strip().split(".")[0]
+                if "Unknown tool:" in error_context else ""
+            )
+            hint = f" Did you mean '{suggestion}'?" if suggestion else ""
+            return self._refine_prompt(
+                messages, failed_response,
+                f"{error_context}{hint}\nAvailable tools: {', '.join(sorted(self._error_classifier._tool_names))}",
+            )
+
+        if error_class == "missing_args":
+            return self._refine_prompt(messages, failed_response, error_context)
+
+        # Default: use configured strategy order
         strategies = self.config.retry_strategies
         if self._attempt_count <= len(strategies):
             strategy = strategies[self._attempt_count - 1]
@@ -282,6 +382,8 @@ def build_tool_prompt(
     thinking_mode: str = "auto",
     available_tools: list[str] | None = None,
     agent_configs: dict | None = None,
+    mode: str = "plan",
+    tier: str = "medium",
 ) -> str:
     """System prompt for interactive (conversational) mode."""
     think = ""
@@ -311,11 +413,24 @@ def build_tool_prompt(
             "- Be concise but thorough"
         )
 
+    plan_context = ""
+    if mode == "plan":
+        plan_context = """
+## Planning Context
+
+You are in PLAN mode. Help the user explore, discuss, and build toward a goal.
+- Ask clarifying questions when the goal is ambiguous
+- Delegate planning tasks to external agents (claude_code, codex, gemini_cli) — they can analyze code, draft plans, and investigate issues. You judge the results and present them to the user.
+- Use local tools (read_file, shell, project_tree) for quick checks
+- Suggest concrete steps and potential pitfalls based on what you learn
+- This conversation carries over to GOAL mode for autonomous execution
+"""
+
     return f"""{think}{role}
 {orchestrator}
 
 {_current_datetime()}
-
+{plan_context}
 ## Available Tools
 
 {tools_description}
@@ -335,11 +450,14 @@ def build_autonomous_prompt(
     thinking_mode: str = "auto",
     available_tools: list[str] | None = None,
     agent_configs: dict | None = None,
+    tier: str = "medium",
 ) -> str:
     """System prompt for autonomous goal-driven mode.
 
     Key difference from interactive: the agent works until the goal is achieved
     without asking the user for permission or clarification.
+
+    Tier-aware: "small" tier gets a minimal prompt to save tokens.
     """
     think = ""
     if thinking_mode == "never":
@@ -351,6 +469,27 @@ def build_autonomous_prompt(
         available_tools
         and any(t in _DEFAULT_AGENT_INFO for t in available_tools)
     )
+
+    # Small tier: minimal prompt (no routing guide, no work patterns)
+    if tier == "small":
+        role_intro = "You are an autonomous AI agent. Work step by step to achieve the goal."
+        core = ("- Work toward the goal without asking for clarification\n"
+                "- After each tool result, decide next action\n"
+                "- When done, write a summary")
+        return f"""{think}{role_intro}
+
+{_current_datetime()}
+
+## Tools
+{tools_description}
+
+{_TOOL_FORMAT}
+
+## Context
+{project_context}
+
+## Behavior
+{core}"""
 
     if has_external:
         # Build agent descriptions from config overrides or defaults

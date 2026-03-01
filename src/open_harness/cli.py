@@ -27,6 +27,7 @@ from rich.table import Table
 from open_harness.agent import Agent, AgentEvent
 from open_harness.completer import AtFileCompleter
 from open_harness.config import CONFIG_FILENAME, HarnessConfig, _CONFIG_NAMES, load_config
+from open_harness.diagnostics import SessionLogger
 from open_harness.memory.store import MemoryStore
 from open_harness.project import ProjectContext
 from open_harness.tasks.queue import TaskQueueManager, TaskRecord, TaskStatus, TaskStore
@@ -88,26 +89,69 @@ def self_update() -> bool:
     remote = subprocess.run(
         ["git", "rev-parse", "@{u}"], cwd=repo, capture_output=True, text=True)
 
-    if remote.returncode != 0:
-        console.print("[yellow]No upstream branch configured. Trying git pull anyway.[/yellow]")
+    no_upstream = remote.returncode != 0
+    if no_upstream:
+        console.print("[yellow]No upstream branch configured. Will pull origin/main.[/yellow]")
     elif local.stdout.strip() == remote.stdout.strip():
         console.print(f"[green]Already up-to-date (v{current_ver}).[/green]")
         return False
 
-    # 2. git pull
-    console.print("[dim]git pull ...[/dim]")
-    pull = subprocess.run(
-        ["git", "pull", "--ff-only"], cwd=repo, capture_output=True, text=True, timeout=60)
+    # 2. Stash local changes so pull doesn't fail on dirty working tree
+    status = subprocess.run(
+        ["git", "status", "--porcelain"], cwd=repo, capture_output=True, text=True)
+    stashed = False
+    if status.stdout.strip():
+        console.print("[dim]Stashing local changes ...[/dim]")
+        stash = subprocess.run(
+            ["git", "stash", "push", "-m", "open-harness: pre-update stash"],
+            cwd=repo, capture_output=True, text=True, timeout=15)
+        if stash.returncode == 0 and "No local changes" not in stash.stdout:
+            stashed = True
+
+    # 3. git pull — use explicit remote/branch when no upstream is set
+    if no_upstream:
+        # Determine the default branch on origin (usually main or master)
+        default_branch = "main"
+        for candidate in ("main", "master"):
+            check = subprocess.run(
+                ["git", "rev-parse", "--verify", f"origin/{candidate}"],
+                cwd=repo, capture_output=True, text=True)
+            if check.returncode == 0:
+                default_branch = candidate
+                break
+        console.print(f"[dim]git pull origin {default_branch} ...[/dim]")
+        pull = subprocess.run(
+            ["git", "pull", "--ff-only", "origin", default_branch],
+            cwd=repo, capture_output=True, text=True, timeout=60)
+    else:
+        console.print("[dim]git pull ...[/dim]")
+        pull = subprocess.run(
+            ["git", "pull", "--ff-only"], cwd=repo, capture_output=True, text=True, timeout=60)
+
     if pull.returncode != 0:
         console.print(f"[red]git pull failed: {pull.stderr.strip()}[/red]")
-        console.print("[dim]Hint: commit or stash local changes first.[/dim]")
+        if stashed:
+            subprocess.run(["git", "stash", "pop"], cwd=repo, capture_output=True, text=True)
+            console.print("[dim]Restored stashed changes.[/dim]")
+        else:
+            console.print("[dim]Hint: commit or stash local changes first.[/dim]")
         return False
 
     # Show what changed
     if pull.stdout.strip():
         console.print(f"[dim]{pull.stdout.strip()}[/dim]")
 
-    # 3. reinstall package (prefer uv, fall back to pip)
+    # Restore stashed changes after successful pull
+    if stashed:
+        pop = subprocess.run(
+            ["git", "stash", "pop"], cwd=repo, capture_output=True, text=True)
+        if pop.returncode == 0:
+            console.print("[dim]Restored stashed changes.[/dim]")
+        else:
+            console.print(f"[yellow]Stash pop failed: {pop.stderr.strip()[:100]}[/yellow]")
+            console.print("[dim]Your changes are still in git stash.[/dim]")
+
+    # 4. reinstall package (prefer uv, fall back to pip)
     if shutil.which("uv"):
         install_cmd = ["uv", "pip", "install", "-e", str(repo), "-q"]
         install_label = "uv pip install -e ."
@@ -163,7 +207,7 @@ def setup_tools(
     ]:
         ext_cfg = config.external_agents.get(flag_key)
         if ext_cfg and ext_cfg.enabled:
-            tool = tool_cls(ext_cfg.command)
+            tool = tool_cls(ext_cfg.command, timeout=ext_cfg.timeout)
             if tool.available:
                 registry.register(tool)
 
@@ -232,6 +276,16 @@ class StreamingDisplay:
             elif event.data:
                 self.con.print()
                 self.con.print(Markdown(event.data))
+
+        elif event.type == "agent_progress":
+            tool = event.metadata.get("tool", "?")
+            self.con.print(f"[dim][{tool}] {event.data}[/dim]", end="\r")
+
+        elif event.type == "agent_done":
+            tool = event.metadata.get("tool", "?")
+            ok = event.metadata.get("success", False)
+            icon = "[green]OK[/green]" if ok else "[red]FAIL[/red]"
+            self.con.print(f"[dim]{icon} {tool} finished[/dim]")
 
         elif event.type == "summary":
             self._flush()
@@ -683,13 +737,12 @@ def handle_command(cmd: str, agent: Agent, config: HarnessConfig, display: Strea
     elif command == "/help":
         console.print("""
 [bold]Modes (Shift+Tab to cycle):[/bold]
-  chat    [green]>[/green]       - Chat with the agent, it will use tools as needed
+  plan    [green]>[/green]       - Discuss, explore, and plan with the agent
   goal    [yellow]goal>[/yellow]  - Agent works autonomously until task is complete
-  submit  [blue]bg>[/blue]    - Submit goal to background queue
 
 [bold]Autonomous:[/bold]
   /goal <task>     - Run a goal regardless of current mode
-  /submit <task>   - Submit to background regardless of current mode
+  /submit <task>   - Submit goal to background queue (power user)
   /tasks           - List all tasks and their status
   /result <id>     - Show detailed result of a task
   /cancel [id]     - Cancel a running or queued task
@@ -820,9 +873,10 @@ def init_harness(
 @click.option("--update", "-u", "do_update", is_flag=True, help="Update Open Harness to latest version and exit")
 @click.option("--tui", is_flag=True, help="Launch Textual TUI")
 @click.option("--fresh", is_flag=True, help="Start fresh without restoring previous session")
+@click.option("--log-session", is_flag=True, help="Enable session diagnostics logging (JSONL)")
 @click.option("--verbose", "-v", is_flag=True, help="Verbose logging")
 def main(config_path: str | None, tier: str | None, goal_text: str | None,
-         do_update: bool, tui: bool, fresh: bool, verbose: bool):
+         do_update: bool, tui: bool, fresh: bool, log_session: bool, verbose: bool):
     """Open Harness - self-driving AI agent for local LLMs."""
     global _task_queue, _input_queue
 
@@ -899,7 +953,7 @@ def main(config_path: str | None, tier: str | None, goal_text: str | None,
         "  [dim]Self-driving AI agent for local LLMs[/dim]"
     )
     console.print(
-        "  [dim]Type /help for commands, /goal <task> for autonomous mode[/dim]\n"
+        "  [dim]Type /help for commands, Shift+Tab to switch between plan and goal modes[/dim]\n"
     )
 
     config, config_file = _load_config_safe(config_path)
@@ -933,6 +987,13 @@ def main(config_path: str | None, tier: str | None, goal_text: str | None,
         console.print(f"[yellow]Git: auto-initialized (to allow safe file editing)[/yellow]")
     else:
         console.print(f"[dim]Git: {git_status}[/dim]")
+
+    # Clean up orphan branches from crashed sessions
+    if project.info.get("has_git"):
+        from open_harness.checkpoint import CheckpointEngine
+        orphans = CheckpointEngine.cleanup_orphan_branches(project.root)
+        if orphans:
+            console.print(f"[yellow]Cleaned up {len(orphans)} orphan branch(es) from previous session[/yellow]")
 
     model_cfg = config.llm.models.get(config.llm.default_tier)
     if model_cfg:
@@ -971,7 +1032,20 @@ def main(config_path: str | None, tier: str | None, goal_text: str | None,
         except Exception:
             pass  # no previous session
 
-    agent = Agent(config, tools, memory, project, user_input_fn=_ask_user_cli)
+    # Session diagnostics logging
+    _session_logger: SessionLogger | None = None
+    if log_session or verbose:
+        _session_logger = SessionLogger()
+        console.print(f"[dim]Session log: {_session_logger.path}[/dim]")
+        _session_logger.log_session_start({
+            "version": version,
+            "project": str(project.root),
+            "tier": config.llm.default_tier,
+            "mode": "goal" if goal_text else "interactive",
+        })
+
+    agent = Agent(config, tools, memory, project, user_input_fn=_ask_user_cli,
+                  session_logger=_session_logger)
     display = StreamingDisplay(console)
 
     tool_names = [t.name for t in tools.list_tools()]
@@ -1001,7 +1075,11 @@ def main(config_path: str | None, tier: str | None, goal_text: str | None,
                 display.handle(event)
         finally:
             signal.signal(signal.SIGINT, old_handler)
-        console.print(f"\n[dim]({time.monotonic() - start:.1f}s)[/dim]")
+        elapsed = time.monotonic() - start
+        console.print(f"\n[dim]({elapsed:.1f}s)[/dim]")
+        if _session_logger:
+            _session_logger.log_session_end({"elapsed_s": round(elapsed, 1), "mode": "goal"})
+            _session_logger.close()
         _task_queue.shutdown()
         task_store.close()
         agent.router.close()
@@ -1009,14 +1087,13 @@ def main(config_path: str | None, tier: str | None, goal_text: str | None,
         return
 
     # Interactive REPL with mode cycling (Shift+Tab)
-    _modes = ["chat", "goal", "submit"]
+    _modes = ["plan", "goal"]
     _mode_index = [0]  # list to allow mutation in closure
 
-    _mode_colors = {"chat": "ansigreen", "goal": "ansiyellow", "submit": "ansiblue"}
+    _mode_colors = {"plan": "ansigreen", "goal": "ansiyellow"}
     _mode_labels = {
-        "chat": "chat",
+        "plan": "plan",
         "goal": "goal (autonomous)",
-        "submit": "background",
     }
 
     def _get_prompt():
@@ -1093,34 +1170,35 @@ def main(config_path: str | None, tier: str | None, goal_text: str | None,
 
             mode = _modes[_mode_index[0]]
             try:
+                import signal
+
+                def _cancel_repl(signum, frame):
+                    console.print("\n[yellow]Canceling...[/yellow]")
+                    agent.cancel()
+
                 start = time.monotonic()
+                old_handler = signal.signal(signal.SIGINT, _cancel_repl)
 
-                if mode == "chat":
-                    input_queue.start()
-                    for event in agent.run_stream(user_input):
-                        display.handle(event)
-                    input_queue.stop()
-                    console.print(f"\n[dim]({time.monotonic() - start:.1f}s)[/dim]\n")
+                try:
+                    if mode == "plan":
+                        input_queue.start()
+                        for event in agent.run_stream(user_input):
+                            display.handle(event)
+                        input_queue.stop()
+                        console.print(f"\n[dim]({time.monotonic() - start:.1f}s)[/dim]\n")
 
-                elif mode == "goal":
-                    if _task_queue and _task_queue.is_busy():
-                        console.print("[yellow]Warning: a background task is running. "
-                                      "LLM requests may queue.[/yellow]")
-                    input_queue.start()
-                    for event in agent.run_goal(user_input):
-                        display.handle(event)
-                    input_queue.stop()
-                    console.print(f"\n[dim]Goal completed in {time.monotonic() - start:.1f}s[/dim]\n")
-
-                elif mode == "submit":
-                    # submit returns immediately, no need for input queuing
-                    if not _task_queue:
-                        console.print("[red]Task queue not initialized.[/red]")
-                        continue
-                    task = _task_queue.submit(user_input)
-                    console.print(f"[green]Task {task.id} queued: {task.goal[:60]}[/green]")
-                    console.print(f"[dim]Log: {task.log_path}[/dim]")
-                    console.print(f"[dim]Check: /tasks | /result {task.id}[/dim]")
+                    elif mode == "goal":
+                        if _task_queue and _task_queue.is_busy():
+                            console.print("[yellow]Warning: a background task is running. "
+                                          "LLM requests may queue.[/yellow]")
+                        input_queue.start()
+                        for event in agent.run_goal(user_input):
+                            display.handle(event)
+                        input_queue.stop()
+                        console.print(f"\n[dim]Goal completed in {time.monotonic() - start:.1f}s[/dim]\n")
+                finally:
+                    signal.signal(signal.SIGINT, old_handler)
+                    agent._cancel_event.clear()
 
             except Exception as e:
                 input_queue.stop()
@@ -1134,6 +1212,9 @@ def main(config_path: str | None, tier: str | None, goal_text: str | None,
                 memory.save_session(_session_id)
             except Exception:
                 pass
+        if _session_logger:
+            _session_logger.log_session_end({"mode": "interactive"})
+            _session_logger.close()
         agent.close()  # finish session checkpoint (merge git changes)
         if _task_queue:
             _task_queue.shutdown()

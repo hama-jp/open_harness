@@ -6,10 +6,30 @@ Screen {
     height: 1fr;
 }
 
-#output {
+#output-area {
     width: 3fr;
+}
+
+#step-progress {
+    height: 1;
+    display: none;
+    margin: 0 1;
+}
+
+#output {
+    height: 1fr;
     border: solid $primary-darken-2;
     padding: 0 1;
+    scrollbar-gutter: stable;
+}
+
+#agent-panel {
+    height: auto;
+    max-height: 12;
+    border: solid $secondary;
+    padding: 0 1;
+    display: none;
+    scrollbar-gutter: stable;
 }
 
 #sidebar {
@@ -17,16 +37,22 @@ Screen {
     min-width: 24;
     max-width: 40;
     border: solid $primary-darken-2;
+    padding: 0;
 }
 
-#plan-content, #queue-content, #tasks-content, #stats-content {
-    padding: 1;
-    height: 100%;
-    overflow-y: auto;
+#history-list {
+    height: auto;
+    max-height: 16;
+}
+
+#plan-content, #queue-content, #agents-content, #tasks-content, #stats-content {
+    padding: 0 1;
 }
 
 #user-input {
     dock: bottom;
     margin: 0;
-    padding: 0 1;
+    padding: 0;
+    min-height: 3;
+    max-height: 7;
 }
