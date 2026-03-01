@@ -37,6 +37,7 @@ class DragHandle(Static):
     DEFAULT_CSS = """
     DragHandle {
         width: 1;
+        height: 100%;
         background: $primary-darken-2;
     }
     DragHandle:hover {
