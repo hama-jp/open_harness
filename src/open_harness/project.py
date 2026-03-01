@@ -161,7 +161,7 @@ class ProjectContext:
 
         cwd = str(self.root)
         r = subprocess.run(
-            ["git", "init"], capture_output=True, text=True, timeout=15, cwd=cwd,
+            ["git", "init"], capture_output=True, text=True, timeout=30, cwd=cwd,
         )
         if r.returncode != 0:
             msg = f"git init failed: {r.stderr.strip()}"
@@ -169,11 +169,11 @@ class ProjectContext:
             return msg
 
         subprocess.run(
-            ["git", "add", "-A"], capture_output=True, text=True, timeout=15, cwd=cwd,
+            ["git", "add", "-A"], capture_output=True, text=True, timeout=60, cwd=cwd,
         )
         commit = subprocess.run(
             ["git", "commit", "-m", "Initial commit (auto-created by Open Harness)"],
-            capture_output=True, text=True, timeout=15, cwd=cwd,
+            capture_output=True, text=True, timeout=60, cwd=cwd,
         )
         if commit.returncode != 0:
             # Initial commit failed (e.g. no git identity configured).

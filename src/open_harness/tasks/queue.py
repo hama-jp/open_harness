@@ -231,18 +231,22 @@ class TaskQueueManager:
             target=self._run, daemon=True, name="task-worker")
         self._worker.start()
 
-    def shutdown(self, timeout: float = 30):
+    def shutdown(self, timeout: float = 30) -> bool:
         """Stop the worker thread gracefully.
 
         Waits for the current task to finish (up to timeout seconds).
         Any remaining queued tasks stay in DB for next startup.
+
+        Returns True if the worker stopped cleanly, False on timeout.
         """
         self._stop.set()
         self._queue.put("")  # wake up the worker
         if self._worker:
             self._worker.join(timeout=timeout)
             if self._worker.is_alive():
-                logger.warning("Worker thread did not stop within timeout")
+                logger.warning("Worker thread did not stop within %ds", timeout)
+                return False
+        return True
 
     def submit(self, goal: str) -> TaskRecord:
         """Submit a goal for background execution."""
@@ -346,8 +350,8 @@ class TaskQueueManager:
                     agent.router.close()
                     agent.memory.close()
                     agent.project_memory_store.close()
-                except Exception:
-                    pass
+                except (OSError, Exception) as e:
+                    logger.debug("Error cleaning up agent for task %s: %s", task_id, e)
 
             with self._lock:
                 self._current_task_id = None
@@ -357,5 +361,5 @@ class TaskQueueManager:
             if updated and self._on_complete:
                 try:
                     self._on_complete(updated)
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.warning("on_complete callback failed for task %s: %s", task_id, e)

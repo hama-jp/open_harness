@@ -101,7 +101,12 @@ class CheckpointEngine:
         if branch.returncode != 0:
             # Branch might exist, try with suffix
             self._work_branch = f"harness/goal-{ts}-retry"
-            _git(["checkout", "-b", self._work_branch], self.cwd)
+            retry = _git(["checkout", "-b", self._work_branch], self.cwd)
+            if retry.returncode != 0:
+                logger.warning("Failed to create work branch: %s", retry.stderr.strip())
+                self._active = False
+                self._work_branch = None
+                return f"branch creation failed: {retry.stderr.strip()[:80]}"
 
         parts = []
         if self._stashed:

@@ -434,7 +434,7 @@ class Agent:
                         f"Replanned: {new_plan.summary()}")
                     yield from self._run_planned_goal(
                         goal, new_plan, ckpt,
-                        completed=completed,
+                        completed=list(completed),  # copy to prevent corruption on failure
                         _replan_depth=_replan_depth + 1,
                     )
                     return

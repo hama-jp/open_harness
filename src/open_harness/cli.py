@@ -316,6 +316,7 @@ def _expand_at_references(text: str, project_root: Path, max_size: int = 50_000)
         try:
             p.relative_to(project_root)
         except ValueError:
+            logging.getLogger(__name__).warning("Blocked @%s: outside project root", ref)
             continue
         if p.is_file():
             try:
@@ -368,6 +369,10 @@ class InputQueue:
             self._queue.put(item)
 
     def _reader(self):
+        if sys.platform == "win32":
+            # select.select() doesn't support stdin on Windows
+            self._reader_win32()
+            return
         while self._active:
             try:
                 readable, _, _ = select.select([sys.stdin], [], [], 0.5)
@@ -380,6 +385,28 @@ class InputQueue:
                             console.print(f"\n[yellow]⏩ Queued: {line[:60]}[/yellow]")
             except (OSError, ValueError):
                 # stdin closed or invalid fd — stop reading
+                break
+
+    def _reader_win32(self):
+        """Fallback reader for Windows where select() doesn't work on stdin."""
+        import msvcrt
+        buf = ""
+        while self._active:
+            try:
+                if msvcrt.kbhit():
+                    ch = msvcrt.getwch()
+                    if ch in ("\r", "\n"):
+                        line = buf.strip()
+                        buf = ""
+                        if line:
+                            self._queue.put(line)
+                            console.print(f"\n[yellow]⏩ Queued: {line[:60]}[/yellow]")
+                    else:
+                        buf += ch
+                else:
+                    import time as _time
+                    _time.sleep(0.1)
+            except (OSError, ValueError):
                 break
 
 

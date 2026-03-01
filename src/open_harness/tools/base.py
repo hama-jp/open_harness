@@ -126,5 +126,5 @@ class ToolRegistry:
             return ToolResult(
                 success=False,
                 output="",
-                error=f"Tool execution failed: {type(e).__name__}: {e}",
+                error=f"Tool '{tool_name}' execution failed: {type(e).__name__}: {e}",
             )

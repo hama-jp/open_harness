@@ -456,10 +456,10 @@ class LLMClient:
                 finish_reason="error",
                 latency_ms=latency,
             )
-        except Exception as e:
+        except (json.JSONDecodeError, ValueError, OSError) as e:
             latency = (time.monotonic() - start) * 1000
             return LLMResponse(
-                content=f"[LLM Stream Error: {e}]",
+                content=f"[LLM Stream Error: {type(e).__name__}: {e}]",
                 finish_reason="error",
                 latency_ms=latency,
             )
