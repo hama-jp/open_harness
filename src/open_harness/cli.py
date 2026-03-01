@@ -505,7 +505,19 @@ def main(config_path: str | None, tier: str | None, goal_text: str | None,
     try:
         model_cfg = config.llm.models.get(config.llm.default_tier)
         if model_cfg:
-            console.print(f"[dim]Model: {model_cfg.model} ({config.llm.default_tier})[/dim]")
+            provider_cfg = config.llm.providers.get(model_cfg.provider)
+            location = ""
+            if provider_cfg:
+                from urllib.parse import urlparse
+                host = urlparse(provider_cfg.base_url).hostname or ""
+                if host in ("localhost", "127.0.0.1", "::1"):
+                    location = " (local)"
+                else:
+                    location = f" ({host})"
+            console.print(
+                f"[dim]Model: {model_cfg.model} ({config.llm.default_tier})"
+                f" @ {model_cfg.provider}{location}[/dim]"
+            )
     except Exception:
         pass
 
