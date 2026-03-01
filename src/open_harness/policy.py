@@ -218,6 +218,14 @@ class PolicyEngine:
             if violation:
                 return violation
 
+        # CWD checks for tools that accept a working directory
+        if tool_name in ("shell", "git_diff", "git_commit", "git_log", "run_tests"):
+            cwd = args.get("cwd", "")
+            if cwd:
+                violation = self._check_cwd(cwd, tool_name, category)
+                if violation:
+                    return violation
+
         return None
 
     def record(self, tool_name: str):
@@ -359,6 +367,22 @@ class PolicyEngine:
                     f"{f' ({self._project_root})' if self._project_root else ''}. {hint}",
             tool=tool_name, category=category,
         )
+
+    def _check_cwd(self, cwd: str, tool_name: str, category: str) -> PolicyViolation | None:
+        """Check that a working directory is within the project root."""
+        resolved = Path(cwd).expanduser().resolve()
+        if self._project_root:
+            try:
+                resolved.relative_to(self._project_root)
+                return None
+            except ValueError:
+                return PolicyViolation(
+                    rule="cwd_outside_project",
+                    message=f"Working directory '{cwd}' is outside project root "
+                            f"({self._project_root}). Use a path within the project.",
+                    tool=tool_name, category=category,
+                )
+        return None
 
     def _check_shell(self, command: str, tool_name: str, category: str) -> PolicyViolation | None:
         cmd_lower = command.lower().strip()

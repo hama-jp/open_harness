@@ -33,7 +33,8 @@ from open_harness.tasks.queue import TaskQueueManager, TaskRecord, TaskStatus, T
 from open_harness.tools.base import ToolRegistry
 from open_harness.tools.external import ClaudeCodeTool, CodexTool, GeminiCliTool
 from open_harness.tools.file_ops import (
-    EditFileTool, ListDirectoryTool, ReadFileTool, SearchFilesTool, WriteFileTool,
+    AskUserTool, EditFileTool, ListDirectoryTool, ProjectTreeTool,
+    ReadFileTool, SearchFilesTool, WriteFileTool,
 )
 from open_harness.tools.git_tools import (
     GitBranchTool, GitCommitTool, GitDiffTool, GitLogTool, GitStatusTool,
@@ -125,7 +126,11 @@ def self_update() -> bool:
     return True
 
 
-def setup_tools(config: HarnessConfig, project: ProjectContext) -> ToolRegistry:
+def setup_tools(
+    config: HarnessConfig,
+    project: ProjectContext,
+    user_input_fn=None,
+) -> ToolRegistry:
     registry = ToolRegistry()
 
     # Core
@@ -135,6 +140,8 @@ def setup_tools(config: HarnessConfig, project: ProjectContext) -> ToolRegistry:
     registry.register(EditFileTool())
     registry.register(ListDirectoryTool())
     registry.register(SearchFilesTool())
+    registry.register(ProjectTreeTool())
+    registry.register(AskUserTool(user_input_fn))
 
     # Testing
     test_cmd = project.info.get("test_command") or "python -m pytest"
@@ -166,7 +173,7 @@ def setup_tools(config: HarnessConfig, project: ProjectContext) -> ToolRegistry:
 def create_agent_factory(config: HarnessConfig, project: ProjectContext):
     """Factory that creates isolated Agent instances for background tasks."""
     def factory() -> Agent:
-        tools = setup_tools(config, project)
+        tools = setup_tools(config, project)  # no user_input_fn for bg tasks
         memory = MemoryStore(
             config.memory.db_path,
             max_turns=config.memory.max_conversation_turns,
@@ -502,10 +509,18 @@ def handle_command(cmd: str, agent: Agent, config: HarnessConfig, display: Strea
         start = time.monotonic()
         if _input_queue:
             _input_queue.start()
+        import signal
+
+        def _cancel_goal(signum, frame):
+            console.print("\n[yellow]Canceling goal...[/yellow]")
+            agent.cancel()
+
+        old_sig = signal.signal(signal.SIGINT, _cancel_goal)
         try:
             for event in agent.run_goal(arg):
                 display.handle(event)
         finally:
+            signal.signal(signal.SIGINT, old_sig)
             if _input_queue:
                 _input_queue.stop()
         elapsed = time.monotonic() - start
@@ -680,6 +695,28 @@ def _has_user_config() -> bool:
     return False
 
 
+def _load_config_safe(config_path: str | None):
+    """Load config with error handling (Issue 8)."""
+    try:
+        return load_config(config_path)
+    except FileNotFoundError as e:
+        console.print(f"[red]Config file not found: {e}[/red]")
+        sys.exit(1)
+    except Exception as e:
+        ename = type(e).__name__
+        # pydantic ValidationError
+        if "ValidationError" in ename:
+            console.print(f"[red]Config validation failed:[/red]")
+            console.print(f"[red]{e}[/red]")
+            sys.exit(1)
+        # YAML syntax errors
+        if "YAMLError" in ename or "ScannerError" in ename:
+            console.print(f"[red]Config file has syntax errors:[/red]")
+            console.print(f"[red]{e}[/red]")
+            sys.exit(1)
+        raise
+
+
 def init_harness(
     config_path: str | None,
     tier: str | None,
@@ -697,13 +734,13 @@ def init_harness(
 
     version = get_version()
 
-    config, config_file = load_config(config_path)
+    config, config_file = _load_config_safe(config_path)
     if config_path is None and not _has_user_config():
         console.print("[yellow]No open_harness.yaml found.[/yellow]")
         if click.confirm("Run setup wizard to create one?", default=True):
             from open_harness.setup_wizard import run_setup_wizard
             created = run_setup_wizard()
-            config, config_file = load_config(str(created))
+            config, config_file = _load_config_safe(str(created))
         else:
             console.print("[dim]Using defaults. Create open_harness.yaml manually later.[/dim]")
     if tier:
@@ -733,9 +770,10 @@ def init_harness(
 @click.option("--goal", "-g", "goal_text", default=None, help="Run a goal non-interactively and exit")
 @click.option("--update", "-u", "do_update", is_flag=True, help="Update Open Harness to latest version and exit")
 @click.option("--tui", is_flag=True, help="Launch Textual TUI")
+@click.option("--fresh", is_flag=True, help="Start fresh without restoring previous session")
 @click.option("--verbose", "-v", is_flag=True, help="Verbose logging")
 def main(config_path: str | None, tier: str | None, goal_text: str | None,
-         do_update: bool, tui: bool, verbose: bool):
+         do_update: bool, tui: bool, fresh: bool, verbose: bool):
     """Open Harness - self-driving AI agent for local LLMs."""
     global _task_queue, _input_queue
 
@@ -815,13 +853,13 @@ def main(config_path: str | None, tier: str | None, goal_text: str | None,
         "  [dim]Type /help for commands, /goal <task> for autonomous mode[/dim]\n"
     )
 
-    config, config_file = load_config(config_path)
+    config, config_file = _load_config_safe(config_path)
     if config_path is None and not goal_text and not _has_user_config():
         console.print("[yellow]No open_harness.yaml found.[/yellow]")
         if click.confirm("Run setup wizard to create one?", default=True):
             from open_harness.setup_wizard import run_setup_wizard
             created = run_setup_wizard()
-            config, config_file = load_config(str(created))
+            config, config_file = _load_config_safe(str(created))
         else:
             console.print("[dim]Using defaults. Create open_harness.yaml manually later.[/dim]")
     if config_file:
@@ -864,10 +902,25 @@ def main(config_path: str | None, tier: str | None, goal_text: str | None,
         except (KeyError, ValueError) as e:
             logging.getLogger(__name__).debug("Model display error: %s", e)
 
+    # User input callback for ask_user tool
+    def _ask_user_cli(question: str) -> str:
+        return click.prompt(f"\n[Agent asks] {question}")
+
     # Main agent for interactive use
-    tools = setup_tools(config, project)
+    tools = setup_tools(config, project, user_input_fn=_ask_user_cli)
     memory = MemoryStore(config.memory.db_path, max_turns=config.memory.max_conversation_turns)
-    agent = Agent(config, tools, memory, project)
+
+    # Issue 10: Restore previous session (unless --fresh or --goal)
+    _session_id = "interactive"
+    if not fresh and not goal_text:
+        try:
+            memory.load_session(_session_id)
+            if memory.get_messages():
+                console.print(f"[dim]Session: restored {len(memory.get_messages())} messages[/dim]")
+        except Exception:
+            pass  # no previous session
+
+    agent = Agent(config, tools, memory, project, user_input_fn=_ask_user_cli)
     display = StreamingDisplay(console)
 
     tool_names = [t.name for t in tools.list_tools()]
@@ -884,9 +937,19 @@ def main(config_path: str | None, tier: str | None, goal_text: str | None,
 
     # Non-interactive goal mode
     if goal_text:
+        import signal
+
+        def _cancel_handler(signum, frame):
+            console.print("\n[yellow]Canceling goal...[/yellow]")
+            agent.cancel()
+
+        old_handler = signal.signal(signal.SIGINT, _cancel_handler)
         start = time.monotonic()
-        for event in agent.run_goal(goal_text):
-            display.handle(event)
+        try:
+            for event in agent.run_goal(goal_text):
+                display.handle(event)
+        finally:
+            signal.signal(signal.SIGINT, old_handler)
         console.print(f"\n[dim]({time.monotonic() - start:.1f}s)[/dim]")
         _task_queue.shutdown()
         task_store.close()
@@ -1014,6 +1077,11 @@ def main(config_path: str | None, tier: str | None, goal_text: str | None,
                 if verbose:
                     console.print_exception()
     finally:
+        # Issue 10: Persist session for next startup
+        try:
+            memory.save_session(_session_id)
+        except Exception:
+            pass
         agent.close()  # finish session checkpoint (merge git changes)
         if _task_queue:
             _task_queue.shutdown()

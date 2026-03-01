@@ -4,12 +4,13 @@ from __future__ import annotations
 
 import json
 import logging
+import threading
 from dataclasses import dataclass, field
-from typing import Any, Generator
+from typing import Any, Callable, Generator
 
 from open_harness.checkpoint import CheckpointEngine
 from open_harness.config import HarnessConfig
-from open_harness.llm.client import LLMResponse
+from open_harness.llm.client import LLMResponse, ToolCall, _extract_balanced_json, _parse_tool_calls_from_text
 from open_harness.llm.compensator import (
     Compensator,
     build_autonomous_prompt,
@@ -162,11 +163,13 @@ class Agent:
         tools: ToolRegistry,
         memory: MemoryStore,
         project: ProjectContext | None = None,
+        user_input_fn: Callable[[str], str] | None = None,
     ):
         self.config = config
         self.tools = tools
         self.memory = memory
         self.project = project or ProjectContext()
+        self.user_input_fn = user_input_fn
         self.router = ModelRouter(config)
         self.compensator = Compensator(config.compensation)
         self.policy = PolicyEngine(load_policy(config.policy))
@@ -191,6 +194,8 @@ class Agent:
         self._interactive_prompt: str | None = None
         self._autonomous_prompt: str | None = None
         self._interaction_count: int = 0
+        # Cancellation support (Issue 2)
+        self._cancel_event = threading.Event()
 
     @property
     def interactive_prompt(self) -> str:
@@ -226,6 +231,10 @@ class Agent:
         """Call after tools or project context change."""
         self._interactive_prompt = None
         self._autonomous_prompt = None
+
+    def cancel(self):
+        """Signal the agent to stop after the current step."""
+        self._cancel_event.set()
 
     def close(self):
         """Finish the session checkpoint (merge changes back)."""
@@ -297,6 +306,7 @@ class Agent:
         ckpt_status = ckpt.begin()
         yield AgentEvent("status", f"Checkpoint: {ckpt_status}")
 
+        goal_succeeded = False
         try:
             # Phase 1: Try to create a plan
             yield AgentEvent("status", "Planning...")
@@ -326,10 +336,15 @@ class Agent:
                 yield from self._tracked_goal(
                     self._run_direct_goal(goal, ckpt), tracker)
 
+            goal_succeeded = True
+
         finally:
+            self._cancel_event.clear()
             yield AgentEvent("status", f"Budget: {self.policy.budget.summary()}")
-            finish_status = ckpt.finish(keep_changes=True)
+            finish_status = ckpt.finish(keep_changes=goal_succeeded)
             if finish_status:
+                if not goal_succeeded:
+                    yield AgentEvent("compensation", "Changes rolled back due to error")
                 yield AgentEvent("status", f"Finish: {finish_status}")
 
             # Emit goal summary
@@ -526,6 +541,81 @@ class Agent:
         )
 
     # ------------------------------------------------------------------
+    # Context window management (Issue 1)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _estimate_tokens(messages: list[dict[str, Any]]) -> int:
+        """Rough token estimate: ~4 chars per token."""
+        return sum(len(m.get("content", "")) for m in messages) // 4
+
+    @staticmethod
+    def _trim_messages(
+        messages: list[dict[str, Any]],
+        max_tokens: int = 12000,
+    ) -> list[dict[str, Any]]:
+        """Trim old tool_call/tool_result pairs when context grows too large.
+
+        Keeps: system message (first), last 5 user/assistant turns.
+        Compresses older tool exchanges into short summaries.
+        """
+        est = Agent._estimate_tokens(messages)
+        if est <= max_tokens:
+            return messages
+
+        # Protect system prompt (index 0) and last 10 messages
+        protected_tail = 10
+        if len(messages) <= protected_tail + 1:
+            return messages
+
+        head = messages[:1]  # system prompt
+        tail = messages[-protected_tail:]
+        middle = messages[1:-protected_tail]
+
+        # Compress the middle: replace adjacent tool pairs with summaries
+        compressed: list[dict[str, Any]] = []
+        i = 0
+        while i < len(middle):
+            msg = middle[i]
+            content = msg.get("content", "")
+            # Detect tool call pattern (assistant) followed by tool result (user)
+            if (msg.get("role") == "assistant"
+                    and content.startswith("{")
+                    and i + 1 < len(middle)
+                    and middle[i + 1].get("role") == "user"
+                    and "[Tool Result" in middle[i + 1].get("content", "")):
+                # Summarize the pair
+                try:
+                    tc_data = json.loads(content)
+                    tool_name = tc_data.get("tool", "unknown")
+                except (json.JSONDecodeError, AttributeError):
+                    tool_name = "unknown"
+                result_content = middle[i + 1].get("content", "")
+                success = "FAIL" not in result_content[:100]
+                status = "success" if success else "fail"
+                compressed.append({
+                    "role": "user",
+                    "content": f"[Earlier: used {tool_name} → {status}]",
+                })
+                i += 2
+            else:
+                compressed.append(msg)
+                i += 1
+
+        return head + compressed + tail
+
+    # ------------------------------------------------------------------
+    # Tool call recovery (Issue 12)
+    # ------------------------------------------------------------------
+
+    def _recover_tool_call(self, content: str) -> ToolCall | None:
+        """Try to extract a valid tool call from malformed LLM output."""
+        calls = _parse_tool_calls_from_text(content)
+        if calls:
+            return calls[0]
+        return None
+
+    # ------------------------------------------------------------------
     # Shared agent loop
     # ------------------------------------------------------------------
 
@@ -543,6 +633,15 @@ class Agent:
 
         while step < max_steps:
             step += 1
+
+            # Issue 2: Check for cancellation
+            if self._cancel_event.is_set():
+                yield AgentEvent("done", "[Canceled by user]")
+                return
+
+            # Issue 1: Trim context window
+            messages = self._trim_messages(messages)
+
             yield AgentEvent("status", f"[{step}/{max_steps}] {tier}")
 
             response = yield from self._stream_llm(messages, tier)
@@ -562,115 +661,120 @@ class Agent:
                 yield AgentEvent("done", response.content)
                 return
 
-            # Tool call
+            # Tool call(s) — Issue 4: process ALL tool calls
             if response.has_tool_call:
-                tc = response.tool_calls[0]
+                for tc in response.tool_calls:
+                    # --- Rate-limit pre-check: swap to fallback before execution ---
+                    actual_tool = tc.name
+                    fallback_reason: str | None = None
+                    if tc.name in _EXTERNAL_AGENT_TOOLS:
+                        actual_tool, fallback_reason = self.rate_limiter.get_best_agent(tc.name)
+                        if fallback_reason:
+                            yield AgentEvent("compensation", fallback_reason)
 
-                # --- Rate-limit pre-check: swap to fallback before execution ---
-                actual_tool = tc.name
-                fallback_reason: str | None = None
-                if tc.name in _EXTERNAL_AGENT_TOOLS:
-                    actual_tool, fallback_reason = self.rate_limiter.get_best_agent(tc.name)
-                    if fallback_reason:
-                        yield AgentEvent("compensation", fallback_reason)
+                    yield AgentEvent("tool_call", actual_tool, {"tool": actual_tool, "args": tc.arguments})
 
-                yield AgentEvent("tool_call", actual_tool, {"tool": actual_tool, "args": tc.arguments})
-
-                # Policy check before execution
-                violation = self.policy.check(actual_tool, tc.arguments)
-                if violation:
-                    result = ToolResult(
-                        success=False, output="",
-                        error=f"[Policy: {violation.rule}] {violation.message}",
-                    )
-                else:
-                    result = self.tools.execute(actual_tool, tc.arguments)
-                    self.policy.record(actual_tool)
-
-                # --- Rate-limit post-check: detect limit hit in output ---
-                if (actual_tool in _EXTERNAL_AGENT_TOOLS
-                        and not result.success
-                        and AgentRateLimiter.is_rate_limit_error(result.to_message())):
-                    entry = self.rate_limiter.record_rate_limit(
-                        actual_tool, result.to_message())
-                    yield AgentEvent("compensation",
-                        f"{actual_tool} rate-limited (cooldown {entry.human_remaining()})")
-
-                    # Try another fallback
-                    retry_agent = self.rate_limiter.get_fallback(actual_tool)
-                    if retry_agent:
-                        yield AgentEvent("compensation",
-                            f"Retrying with {retry_agent}")
-                        yield AgentEvent("tool_call", retry_agent,
-                            {"tool": retry_agent, "args": tc.arguments})
-                        result = self.tools.execute(retry_agent, tc.arguments)
-                        self.policy.record(retry_agent)
-                        actual_tool = retry_agent
-
-                        # Check if retry also hit rate limit
-                        if (not result.success
-                                and AgentRateLimiter.is_rate_limit_error(result.to_message())):
-                            self.rate_limiter.record_rate_limit(
-                                retry_agent, result.to_message())
-                            yield AgentEvent("compensation",
-                                f"{retry_agent} also rate-limited")
-                    else:
-                        # All external agents are rate-limited — tell the LLM
-                        # so it can try a different approach instead of looping
-                        cooldown_info = self.rate_limiter.status_summary()
+                    # Policy check before execution
+                    violation = self.policy.check(actual_tool, tc.arguments)
+                    if violation:
                         result = ToolResult(
                             success=False, output="",
-                            error=(
-                                f"All external agents are rate-limited. "
-                                f"{cooldown_info} "
-                                f"Use local tools (shell, read_file, write_file, "
-                                f"edit_file) to proceed without external agents."
-                            ),
+                            error=f"[Policy: {violation.rule}] {violation.message}",
                         )
+                    else:
+                        result = self.tools.execute(actual_tool, tc.arguments)
+                        self.policy.record(actual_tool)
+
+                    # --- Rate-limit post-check: detect limit hit in output ---
+                    if (actual_tool in _EXTERNAL_AGENT_TOOLS
+                            and not result.success
+                            and AgentRateLimiter.is_rate_limit_error(result.to_message())):
+                        entry = self.rate_limiter.record_rate_limit(
+                            actual_tool, result.to_message())
                         yield AgentEvent("compensation",
-                            "All external agents rate-limited — falling back to local tools")
+                            f"{actual_tool} rate-limited (cooldown {entry.human_remaining()})")
 
-                output = truncate_tool_output(result.to_message(), 8000)
-                yield AgentEvent("tool_result", output,
-                                 {"success": result.success, "tool": actual_tool})
+                        retry_agent = self.rate_limiter.get_fallback(actual_tool)
+                        if retry_agent:
+                            yield AgentEvent("compensation",
+                                f"Retrying with {retry_agent}")
+                            yield AgentEvent("tool_call", retry_agent,
+                                {"tool": retry_agent, "args": tc.arguments})
+                            result = self.tools.execute(retry_agent, tc.arguments)
+                            self.policy.record(retry_agent)
+                            actual_tool = retry_agent
 
-                # Auto-learn from tool usage
-                self.project_memory.on_tool_result(
-                    actual_tool, tc.arguments, result.success, output)
+                            if (not result.success
+                                    and AgentRateLimiter.is_rate_limit_error(result.to_message())):
+                                self.rate_limiter.record_rate_limit(
+                                    retry_agent, result.to_message())
+                                yield AgentEvent("compensation",
+                                    f"{retry_agent} also rate-limited")
+                        else:
+                            cooldown_info = self.rate_limiter.status_summary()
+                            result = ToolResult(
+                                success=False, output="",
+                                error=(
+                                    f"All external agents are rate-limited. "
+                                    f"{cooldown_info} "
+                                    f"Use local tools (shell, read_file, write_file, "
+                                    f"edit_file) to proceed without external agents."
+                                ),
+                            )
+                            yield AgentEvent("compensation",
+                                "All external agents rate-limited — falling back to local tools")
 
-                # Auto-snapshot after file writes (every 5 writes)
-                if checkpoint and actual_tool in ("write_file", "edit_file") and result.success:
-                    _writes_since_snapshot += 1
-                    if _writes_since_snapshot >= 5:
-                        snap = checkpoint.snapshot(f"after {_writes_since_snapshot} writes (step {step})")
-                        if snap:
-                            yield AgentEvent("status", f"Snapshot: {snap.commit_hash}")
-                        _writes_since_snapshot = 0
+                    output = truncate_tool_output(result.to_message(), 8000)
+                    yield AgentEvent("tool_result", output,
+                                     {"success": result.success, "tool": actual_tool})
 
-                # Auto-rollback on test failure (if checkpoint active)
-                if (checkpoint and actual_tool == "run_tests"
-                        and not result.success and checkpoint.snapshots):
-                    yield AgentEvent("compensation",
-                        "Tests failed — rolling back to last snapshot")
-                    rb = checkpoint.rollback(checkpoint.snapshots[-1])
-                    yield AgentEvent("status", f"Rollback: {rb}")
-                    # Tell the LLM about the rollback
+                    # Auto-learn from tool usage
+                    self.project_memory.on_tool_result(
+                        actual_tool, tc.arguments, result.success, output)
+
+                    # Auto-snapshot after file writes (every 5 writes)
+                    if checkpoint and actual_tool in ("write_file", "edit_file") and result.success:
+                        _writes_since_snapshot += 1
+                        if _writes_since_snapshot >= 5:
+                            snap = checkpoint.snapshot(f"after {_writes_since_snapshot} writes (step {step})")
+                            if snap:
+                                yield AgentEvent("status", f"Snapshot: {snap.commit_hash}")
+                            _writes_since_snapshot = 0
+
                     messages.append({"role": "assistant",
                         "content": f'{{"tool": "{actual_tool}", "args": {_safe_json(tc.arguments)}}}'})
                     messages.append({"role": "user",
-                        "content": f"[Tool Result for {actual_tool}]\n{output}\n\n"
-                                   f"[ROLLBACK] Changes have been rolled back to the last "
-                                   f"snapshot. Try a different approach."})
-                    continue
+                        "content": f"[Tool Result for {actual_tool}]\n{output}"})
 
-                messages.append({"role": "assistant",
-                    "content": f'{{"tool": "{actual_tool}", "args": {_safe_json(tc.arguments)}}}'})
-                messages.append({"role": "user",
-                    "content": f"[Tool Result for {actual_tool}]\n{output}"})
+                # Auto-rollback on test failure (after all tool calls processed)
+                last_tc = response.tool_calls[-1]
+                last_tool = last_tc.name
+                if (checkpoint and last_tool == "run_tests"
+                        and checkpoint.snapshots):
+                    # Check if the last tool result was a failure
+                    last_msg = messages[-1].get("content", "")
+                    if "[Tool Error]" in last_msg or "FAIL" in last_msg[:200]:
+                        yield AgentEvent("compensation",
+                            "Tests failed — rolling back to last snapshot")
+                        rb = checkpoint.rollback(checkpoint.snapshots[-1])
+                        yield AgentEvent("status", f"Rollback: {rb}")
+                        # Amend last message to inform LLM of rollback
+                        messages[-1]["content"] += (
+                            "\n\n[ROLLBACK] Changes have been rolled back to the last "
+                            "snapshot. Try a different approach.")
                 continue
 
-            # Malformed tool call
+            # Malformed tool call — Issue 12: try recovery first
             if self._looks_like_failed_tool_call(response.content):
+                recovered_tc = self._recover_tool_call(response.content)
+                if recovered_tc:
+                    yield AgentEvent("compensation", "Recovered malformed tool call")
+                    # Inject recovered tool call into response and re-process
+                    response.tool_calls = [recovered_tc]
+                    # Re-process as a tool call by decrementing step and continuing
+                    step -= 1
+                    continue
+
                 comp = self.compensator.next_strategy(
                     messages, response.content, "Malformed tool call", tier)
                 if comp and comp.success:
