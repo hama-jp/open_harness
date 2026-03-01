@@ -81,7 +81,8 @@ llm:
 
 ## Documentation
 
-See [docs/tutorial.md](docs/tutorial.md) for a comprehensive tutorial with examples.
+- [Tutorial (English)](docs/tutorial.md)
+- [チュートリアル（日本語）](docs/tutorial_ja.md)
 
 ## Requirements
 
