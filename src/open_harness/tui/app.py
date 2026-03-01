@@ -31,6 +31,61 @@ from open_harness.tasks.queue import TaskQueueManager, TaskStatus, TaskStore
 from open_harness.tools.base import ToolRegistry
 
 
+class DragHandle(Static):
+    """Vertical drag handle for resizing panes."""
+
+    DEFAULT_CSS = """
+    DragHandle {
+        width: 1;
+        background: $primary-darken-2;
+    }
+    DragHandle:hover {
+        background: $accent;
+    }
+    DragHandle.-dragging {
+        background: $accent;
+    }
+    """
+
+    def __init__(self) -> None:
+        super().__init__("┃", id="drag-handle")
+        self._dragging = False
+
+    def on_mouse_down(self, event) -> None:
+        self._dragging = True
+        self.add_class("-dragging")
+        self.capture_mouse()
+        event.stop()
+
+    def on_mouse_up(self, event) -> None:
+        if self._dragging:
+            self._dragging = False
+            self.remove_class("-dragging")
+            self.release_mouse()
+            event.stop()
+
+    def on_mouse_move(self, event) -> None:
+        if not self._dragging:
+            return
+        container = self.parent
+        if container is None:
+            return
+        total_width = container.size.width
+        container_x = container.region.x
+        new_output_width = event.screen_x - container_x
+        new_sidebar_width = total_width - new_output_width - 1  # 1 for handle
+
+        # Clamp to reasonable bounds
+        if new_output_width < 30 or new_sidebar_width < 20:
+            return
+
+        output_area = container.query_one("#output-area")
+        sidebar = container.query_one("#sidebar")
+        output_area.styles.width = new_output_width
+        sidebar.styles.width = new_sidebar_width
+        event.stop()
+
+
 class StreamingDisplay:
     """Adaptor: renders AgentEvents to a Console writing to a StringIO."""
 
@@ -121,6 +176,7 @@ class HarnessApp(App):
             with Vertical(id="output-area"):
                 yield RichLog(id="output", highlight=True, markup=True, wrap=True)
                 yield RichLog(id="agent-panel", highlight=True, markup=True, wrap=True)
+            yield DragHandle()
             with VerticalScroll(id="sidebar"):
                 with Collapsible(title="History", collapsed=False):
                     yield OptionList(id="history-list")
@@ -183,7 +239,10 @@ class HarnessApp(App):
 
     def action_toggle_sidebar(self) -> None:
         sidebar = self.query_one("#sidebar")
-        sidebar.display = not sidebar.display
+        handle = self.query_one("#drag-handle")
+        visible = not sidebar.display
+        sidebar.display = visible
+        handle.display = visible
 
     def action_toggle_agent_panel(self) -> None:
         panel = self.query_one("#agent-panel", RichLog)
