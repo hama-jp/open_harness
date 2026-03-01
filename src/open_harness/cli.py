@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import os
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -33,6 +34,68 @@ from open_harness.tools.shell import ShellTool
 from open_harness.tools.testing import TestRunnerTool
 
 console = Console()
+
+# Repository root: <repo>/src/open_harness/cli.py → <repo>
+_REPO_ROOT = Path(__file__).resolve().parent.parent.parent
+
+
+def self_update() -> bool:
+    """Pull latest code from git and reinstall the package.
+
+    Returns True if an update was applied, False if already up-to-date.
+    Exits the process on failure so the caller doesn't continue with stale code.
+    """
+    repo = _REPO_ROOT
+    git_dir = repo / ".git"
+    if not git_dir.is_dir():
+        console.print(f"[red]Not a git repository: {repo}[/red]")
+        return False
+
+    console.print(f"[dim]Updating from {repo} ...[/dim]")
+
+    # 1. git fetch + check
+    fetch = subprocess.run(
+        ["git", "fetch"], cwd=repo, capture_output=True, text=True, timeout=30)
+    if fetch.returncode != 0:
+        console.print(f"[red]git fetch failed: {fetch.stderr.strip()}[/red]")
+        return False
+
+    # Compare local HEAD vs remote
+    local = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=repo, capture_output=True, text=True)
+    remote = subprocess.run(
+        ["git", "rev-parse", "@{u}"], cwd=repo, capture_output=True, text=True)
+
+    if remote.returncode != 0:
+        console.print("[yellow]No upstream branch configured. Trying git pull anyway.[/yellow]")
+    elif local.stdout.strip() == remote.stdout.strip():
+        console.print("[green]Already up-to-date.[/green]")
+        return False
+
+    # 2. git pull
+    console.print("[dim]git pull ...[/dim]")
+    pull = subprocess.run(
+        ["git", "pull", "--ff-only"], cwd=repo, capture_output=True, text=True, timeout=60)
+    if pull.returncode != 0:
+        console.print(f"[red]git pull failed: {pull.stderr.strip()}[/red]")
+        console.print("[dim]Hint: commit or stash local changes first.[/dim]")
+        return False
+
+    # Show what changed
+    if pull.stdout.strip():
+        console.print(f"[dim]{pull.stdout.strip()}[/dim]")
+
+    # 3. pip install -e . (pick up dependency changes)
+    pip_exe = str(Path(sys.executable).parent / "pip")
+    console.print("[dim]pip install -e . ...[/dim]")
+    pip = subprocess.run(
+        [sys.executable, "-m", "pip", "install", "-e", str(repo), "-q"],
+        cwd=repo, capture_output=True, text=True, timeout=120)
+    if pip.returncode != 0:
+        console.print(f"[yellow]pip install warning: {pip.stderr.strip()[:200]}[/yellow]")
+
+    console.print("[green]Update complete. Please restart harness.[/green]")
+    return True
 
 
 def setup_tools(config: HarnessConfig, project: ProjectContext) -> ToolRegistry:
@@ -346,6 +409,10 @@ def handle_command(cmd: str, agent: Agent, config: HarnessConfig, display: Strea
                         console.print(f"    {j}. {step}")
         return True
 
+    elif command == "/update":
+        self_update()
+        return True
+
     elif command == "/help":
         console.print("""
 [bold]Interactive:[/bold]
@@ -363,6 +430,7 @@ def handle_command(cmd: str, agent: Agent, config: HarnessConfig, display: Strea
   /tools           - List available tools
   /project         - Show detected project context
   /memory          - Show learned project memories
+  /update          - Update Open Harness to latest version
   /clear           - Clear conversation
   /quit            - Exit
         """)
@@ -376,8 +444,10 @@ def handle_command(cmd: str, agent: Agent, config: HarnessConfig, display: Strea
               help="Path to open_harness.yaml (auto-detected from CWD, ~/.open_harness/, or repo root)")
 @click.option("--tier", "-t", default=None, help="Model tier")
 @click.option("--goal", "-g", "goal_text", default=None, help="Run a goal non-interactively and exit")
+@click.option("--update", "-u", "do_update", is_flag=True, help="Update Open Harness to latest version and exit")
 @click.option("--verbose", "-v", is_flag=True, help="Verbose logging")
-def main(config_path: str | None, tier: str | None, goal_text: str | None, verbose: bool):
+def main(config_path: str | None, tier: str | None, goal_text: str | None,
+         do_update: bool, verbose: bool):
     """Open Harness - self-driving AI agent for local LLMs."""
     global _task_queue
 
@@ -385,6 +455,10 @@ def main(config_path: str | None, tier: str | None, goal_text: str | None, verbo
         logging.basicConfig(level=logging.DEBUG)
     else:
         logging.basicConfig(level=logging.WARNING)
+
+    if do_update:
+        self_update()
+        return
 
     console.print(Panel(
         "[bold]Open Harness[/bold] v0.2.0\n"
