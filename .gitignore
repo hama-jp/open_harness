@@ -15,3 +15,6 @@ venv/
 .mypy_cache/
 .pytest_cache/
 .ruff_cache/
+
+# Test install clone
+open_harness/
