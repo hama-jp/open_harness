@@ -1,3 +1,3 @@
 """Open Harness - AI agent harness optimized for local LLMs."""
 
-__version__ = "0.5.02"
+__version__ = "0.5.03"
