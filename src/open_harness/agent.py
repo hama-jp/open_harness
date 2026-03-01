@@ -664,6 +664,7 @@ class Agent:
 
             # Tool call(s) — Issue 4: process ALL tool calls
             if response.has_tool_call:
+                _test_failed_in_batch = False
                 for tc in response.tool_calls:
                     # --- Rate-limit pre-check: swap to fallback before execution ---
                     actual_tool = tc.name
@@ -747,16 +748,12 @@ class Agent:
                     messages.append({"role": "user",
                         "content": f"[Tool Result for {actual_tool}]\n{output}"})
 
+                    # Track test failures using ToolResult.success flag
+                    if actual_tool == "run_tests" and not result.success:
+                        _test_failed_in_batch = True
+
                 # Auto-rollback on test failure (check ANY run_tests in this batch)
-                if checkpoint and checkpoint.snapshots:
-                    test_failed = False
-                    for msg in messages[-(len(response.tool_calls) * 2):]:
-                        content = msg.get("content", "")
-                        if "[Tool Result for run_tests]" in content:
-                            if "[Tool Error]" in content or "FAIL" in content[:200]:
-                                test_failed = True
-                                break
-                    if test_failed:
+                if checkpoint and checkpoint.snapshots and _test_failed_in_batch:
                         yield AgentEvent("compensation",
                             "Tests failed — rolling back to last snapshot")
                         rb = checkpoint.rollback(checkpoint.snapshots[-1])

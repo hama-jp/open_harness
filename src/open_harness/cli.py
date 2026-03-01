@@ -1077,11 +1077,12 @@ def main(config_path: str | None, tier: str | None, goal_text: str | None,
                 if verbose:
                     console.print_exception()
     finally:
-        # Issue 10: Persist session for next startup
-        try:
-            memory.save_session(_session_id)
-        except Exception:
-            pass
+        # Issue 10: Persist session for next startup (skip for --goal mode)
+        if not goal_text:
+            try:
+                memory.save_session(_session_id)
+            except Exception:
+                pass
         agent.close()  # finish session checkpoint (merge git changes)
         if _task_queue:
             _task_queue.shutdown()

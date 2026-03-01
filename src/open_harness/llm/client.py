@@ -482,17 +482,17 @@ class LLMClient:
                                 yield event
                     success = True
                     break
-                except httpx.TimeoutException as e:
+                except (httpx.TimeoutException, httpx.TransportError) as e:
                     # If we already yielded chunks, retrying would corrupt output
                     if _chunks_yielded:
                         latency = (time.monotonic() - start) * 1000
                         return LLMResponse(
-                            content="[LLM API Error: stream interrupted after partial output]",
+                            content=f"[LLM API Error: stream interrupted after partial output: {e}]",
                             finish_reason="error",
                             latency_ms=latency,
                         )
                     _logger.warning(
-                        "LLM stream timeout (attempt %d/%d): %s",
+                        "LLM stream error (attempt %d/%d): %s",
                         _attempt + 1, _MAX_RETRIES, e)
                     if _attempt < _MAX_RETRIES - 1:
                         time.sleep(_BACKOFF_BASE * (2 ** _attempt))
@@ -500,7 +500,7 @@ class LLMClient:
                         continue
                     latency = (time.monotonic() - start) * 1000
                     return LLMResponse(
-                        content="[LLM API Error: read timeout — no response from server]",
+                        content=f"[LLM API Error: {e}]",
                         finish_reason="error",
                         latency_ms=latency,
                     )
