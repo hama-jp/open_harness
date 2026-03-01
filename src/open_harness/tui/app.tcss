@@ -14,6 +14,7 @@ Screen {
     height: 1fr;
     border: solid $primary-darken-2;
     padding: 0 1;
+    scrollbar-gutter: stable;
 }
 
 #agent-panel {
@@ -22,6 +23,7 @@ Screen {
     border: solid $secondary;
     padding: 0 1;
     display: none;
+    scrollbar-gutter: stable;
 }
 
 #sidebar {

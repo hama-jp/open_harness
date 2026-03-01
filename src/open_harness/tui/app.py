@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import io
-import re as _re
 import time
 from typing import Any
 
@@ -15,12 +14,8 @@ from textual import work
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical, VerticalScroll
-from textual.screen import ModalScreen
 from textual.timer import Timer
-from textual.widgets import (
-    Collapsible, Footer, Header, Input, OptionList,
-    RichLog, Static, TextArea,
-)
+from textual.widgets import Collapsible, Footer, Header, Input, OptionList, RichLog, Static
 from textual.worker import get_current_worker
 
 from open_harness.agent import Agent, AgentEvent
@@ -34,102 +29,6 @@ from open_harness.memory.store import MemoryStore
 from open_harness.project import ProjectContext
 from open_harness.tasks.queue import TaskQueueManager, TaskStatus, TaskStore
 from open_harness.tools.base import ToolRegistry
-
-_MARKUP_RE = _re.compile(r"\[/?[^\]]*\]")
-
-
-class SelectableLog(RichLog):
-    """RichLog that tracks plain text for copy-mode support."""
-
-    def __init__(self, **kwargs: Any) -> None:
-        super().__init__(**kwargs)
-        self._plain_lines: list[str] = []
-
-    def write(
-        self,
-        content: Any,
-        width: int | None = None,
-        expand: bool = False,
-        shrink: bool = True,
-        scroll_end: bool | None = None,
-    ) -> "SelectableLog":
-        if isinstance(content, str):
-            self._plain_lines.append(_MARKUP_RE.sub("", content))
-        elif isinstance(content, Markdown):
-            self._plain_lines.append(content.markup)
-        elif isinstance(content, Panel):
-            renderable = content.renderable
-            if isinstance(renderable, str):
-                self._plain_lines.append(renderable)
-            else:
-                self._plain_lines.append(str(renderable))
-        else:
-            self._plain_lines.append(str(content))
-        return super().write(  # type: ignore[return-value]
-            content, width=width, expand=expand, shrink=shrink, scroll_end=scroll_end,
-        )
-
-    def get_plain_text(self) -> str:
-        return "\n".join(self._plain_lines)
-
-    def clear(self) -> "SelectableLog":
-        self._plain_lines.clear()
-        return super().clear()  # type: ignore[return-value]
-
-
-class CopyScreen(ModalScreen[None]):
-    """Modal screen for selecting and copying output text."""
-
-    BINDINGS = [
-        Binding("escape", "dismiss", "Close"),
-        Binding("ctrl+c", "copy_selected", "Copy", show=False),
-    ]
-
-    DEFAULT_CSS = """
-    CopyScreen {
-        align: center middle;
-    }
-    CopyScreen #copy-container {
-        width: 90%;
-        height: 85%;
-        border: solid $accent;
-        background: $surface;
-    }
-    CopyScreen #copy-header {
-        dock: top;
-        width: 100%;
-        height: auto;
-        padding: 0 1;
-        background: $boost;
-    }
-    CopyScreen #copy-area {
-        width: 100%;
-        height: 1fr;
-    }
-    """
-
-    def __init__(self, text: str) -> None:
-        super().__init__()
-        self._text = text
-
-    def compose(self) -> ComposeResult:
-        with Vertical(id="copy-container"):
-            yield Static(
-                "[bold]Copy Mode[/bold] — "
-                "Select text with mouse or Shift+arrows, "
-                "Ctrl+C to copy, Escape to close",
-                id="copy-header",
-            )
-            yield TextArea(self._text, read_only=True, id="copy-area")
-
-    def on_mount(self) -> None:
-        self.query_one("#copy-area", TextArea).focus()
-
-    def action_copy_selected(self) -> None:
-        """Copy selected text; fallback if TextArea didn't handle Ctrl+C."""
-        area = self.query_one("#copy-area", TextArea)
-        if area.selected_text:
-            self.app.copy_to_clipboard(area.selected_text)
 
 
 class StreamingDisplay:
@@ -157,7 +56,6 @@ class HarnessApp(App):
         Binding("tab", "cycle_mode", "Mode", show=True),
         Binding("ctrl+s", "toggle_sidebar", "Sidebar", show=True),
         Binding("ctrl+a", "toggle_agent_panel", "Agents", show=True),
-        Binding("ctrl+c", "copy_mode", "Copy", show=True),
         Binding("ctrl+l", "clear_log", "Clear", show=True),
         Binding("f1", "show_help", "Help", show=True),
     ]
@@ -221,7 +119,7 @@ class HarnessApp(App):
         yield Header()
         with Horizontal(id="main-container"):
             with Vertical(id="output-area"):
-                yield SelectableLog(id="output", highlight=True, markup=True, wrap=True)
+                yield RichLog(id="output", highlight=True, markup=True, wrap=True)
                 yield RichLog(id="agent-panel", highlight=True, markup=True, wrap=True)
             with VerticalScroll(id="sidebar"):
                 with Collapsible(title="History", collapsed=False):
@@ -261,6 +159,8 @@ class HarnessApp(App):
         output.write(
             f"[dim]Mode: {self.current_mode} (Tab to cycle)[/dim]\n"
         )
+        # Allow terminal-native text selection on output panels
+        output.auto_scroll = True
         # Agent panel starts hidden
         agent_panel = self.query_one("#agent-panel", RichLog)
         agent_panel.border_title = "Sub-Agent Streaming Output"
@@ -297,14 +197,8 @@ class HarnessApp(App):
                 output = self.query_one("#output", RichLog)
                 output.scroll_to(y=anchor, animate=True)
 
-    def action_copy_mode(self) -> None:
-        output = self.query_one("#output", SelectableLog)
-        text = output.get_plain_text()
-        if text.strip():
-            self.push_screen(CopyScreen(text))
-
     def action_clear_log(self) -> None:
-        self.query_one("#output", SelectableLog).clear()
+        self.query_one("#output", RichLog).clear()
 
     def action_show_help(self) -> None:
         output = self.query_one("#output", RichLog)
@@ -330,7 +224,6 @@ class HarnessApp(App):
             "  Tab        - Cycle mode (when not in input)\n"
             "  Ctrl+S     - Toggle sidebar\n"
             "  Ctrl+A     - Toggle agent panel\n"
-            "  Ctrl+C     - Copy mode (select & copy text)\n"
             "  Ctrl+L     - Clear log\n"
             "  Ctrl+Q     - Quit",
             title="Help",
