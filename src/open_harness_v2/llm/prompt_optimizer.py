@@ -31,6 +31,35 @@ RULES:
 - To respond to the user, just write normal text (no JSON)
 """
 
+_EXTERNAL_AGENT_NAMES = ("claude_code", "codex", "gemini_cli")
+
+_DELEGATION_DIRECTIVE = """\
+## MANDATORY: External Agent Delegation
+
+You are an orchestrator. Your job is to DELEGATE tasks, NOT do them yourself.
+
+When external agent tools (claude_code, codex, gemini_cli) are available, \
+you MUST delegate to them for any task that requires quality or intelligence:
+- Code review, analysis, debugging
+- Writing, editing, or reviewing documents/articles
+- Code generation, refactoring, architecture decisions
+- Explaining, summarizing, or translating content
+- Any task where a more capable model would produce better results
+
+You should ONLY handle these trivial tasks yourself:
+- Listing files (list_dir)
+- Reading a file to pass its contents to an external agent
+- Running simple shell commands (ls, pwd, git status)
+- Combining or formatting results from external agents
+
+WORKFLOW: Use read_file/list_dir to gather context, then IMMEDIATELY call \
+an external agent (claude_code, codex, or gemini_cli) with a detailed prompt \
+that includes the gathered context.
+
+NEVER write your own review, analysis, code, or explanation when an external \
+agent is available. ALWAYS delegate.
+"""
+
 _THINKING_HINTS = {
     "always": "Use <think>...</think> for ALL reasoning before responding.\n",
     "auto": "Use <think>...</think> for complex reasoning. Skip for simple tasks.\n",
@@ -83,6 +112,10 @@ class PromptOptimizerMiddleware:
                 additions.append(
                     f"Available tools: {', '.join(tool_names)}\n"
                 )
+
+            # Inject delegation directive when external agents are present
+            if any(n in _EXTERNAL_AGENT_NAMES for n in tool_names):
+                additions.append(_DELEGATION_DIRECTIVE)
 
         # Extra user-provided instructions
         additions.extend(self.extra_instructions)
