@@ -278,6 +278,11 @@ async def _run_repl(
         "[bold]/quit[/bold] to exit[/dim]\n"
     )
 
+    # Ensure stdin can handle non-ASCII input (e.g. Japanese)
+    import sys
+    if hasattr(sys.stdin, "reconfigure"):
+        sys.stdin.reconfigure(errors="replace")
+
     while True:
         try:
             user_input = await asyncio.get_event_loop().run_in_executor(
