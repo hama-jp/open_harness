@@ -12,7 +12,7 @@ from typing import Any
 
 from open_harness_v2.types import LLMResponse
 
-from .middleware import LLMRequest, Middleware, NextFn
+from .middleware import LLMRequest, NextFn
 
 _logger = logging.getLogger(__name__)
 

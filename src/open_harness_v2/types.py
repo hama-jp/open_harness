@@ -103,6 +103,10 @@ class EventType(enum.Enum):
     # Context events
     CONTEXT_COMPRESSED = "context.compressed"
 
+    # Task queue events
+    TASK_STARTED = "task.started"
+    TASK_COMPLETED = "task.completed"
+
     # Policy events
     POLICY_VIOLATION = "policy.violation"
 

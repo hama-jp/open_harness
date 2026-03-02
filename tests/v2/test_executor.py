@@ -94,6 +94,31 @@ class TestSequentialExecution:
         assert EventType.TOOL_EXECUTING in event_types
         assert EventType.TOOL_EXECUTED in event_types
 
+        # Verify TOOL_EXECUTING uses "args" key (not "arguments")
+        executing_ev = next(e for e in events if e.type == EventType.TOOL_EXECUTING)
+        assert "args" in executing_ev.data
+        assert executing_ev.data["args"] == {"text": "hello"}
+
+        # Verify TOOL_EXECUTED includes success + output
+        executed_ev = next(e for e in events if e.type == EventType.TOOL_EXECUTED)
+        assert executed_ev.data["success"] is True
+        assert "Echo: hello" in executed_ev.data["output"]
+
+    async def test_error_events_emitted(self, registry, event_bus):
+        """TOOL_ERROR events should include success=False and error details."""
+        events = []
+        event_bus.subscribe("*", lambda e: events.append(e))
+
+        executor = Executor(registry, event_bus=event_bus)
+        await executor.execute([
+            ToolCall(name="fail", arguments={}),
+        ])
+
+        error_events = [e for e in events if e.type == EventType.TOOL_ERROR]
+        assert len(error_events) == 1
+        assert error_events[0].data["success"] is False
+        assert "Always fails" in error_events[0].data["error"]
+
 
 class TestPolicyChecks:
     async def test_policy_violation(self, registry, event_bus):

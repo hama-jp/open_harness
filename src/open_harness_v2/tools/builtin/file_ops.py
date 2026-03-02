@@ -170,8 +170,8 @@ class EditFileTool(Tool):
         for i in range(len(norm_text_lines) - window + 1):
             candidate = "\n".join(norm_text_lines[i : i + window])
             if candidate == norm_old:
-                start = sum(len(l) for l in text_lines[:i])
-                end = sum(len(l) for l in text_lines[: i + window])
+                start = sum(len(line) for line in text_lines[:i])
+                end = sum(len(line) for line in text_lines[: i + window])
                 matches.append((start, end))
 
         if len(matches) == 1:

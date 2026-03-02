@@ -99,7 +99,7 @@ class Executor:
             # Execute
             await self._emit(EventType.TOOL_EXECUTING, {
                 "tool": tc.name,
-                "arguments": tc.arguments,
+                "args": tc.arguments,
             })
 
             result = await self._registry.execute(tc.name, tc.arguments)
@@ -111,11 +111,14 @@ class Executor:
             if result.success:
                 await self._emit(EventType.TOOL_EXECUTED, {
                     "tool": tc.name,
+                    "success": True,
+                    "output": result.output,
                     "output_length": len(result.output),
                 })
             else:
                 await self._emit(EventType.TOOL_ERROR, {
                     "tool": tc.name,
+                    "success": False,
                     "error": result.error,
                 })
 
@@ -154,7 +157,7 @@ class Executor:
         async def _run_one(tc: ToolCall) -> tuple[ToolCall, ToolResult]:
             await self._emit(EventType.TOOL_EXECUTING, {
                 "tool": tc.name,
-                "arguments": tc.arguments,
+                "args": tc.arguments,
             })
             result = await self._registry.execute(tc.name, tc.arguments)
             if self._policy:
@@ -175,11 +178,14 @@ class Executor:
             if result.success:
                 await self._emit(EventType.TOOL_EXECUTED, {
                     "tool": tc.name,
+                    "success": True,
+                    "output": result.output,
                     "output_length": len(result.output),
                 })
             else:
                 await self._emit(EventType.TOOL_ERROR, {
                     "tool": tc.name,
+                    "success": False,
                     "error": result.error,
                 })
 

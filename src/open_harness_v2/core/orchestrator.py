@@ -16,12 +16,11 @@ from open_harness_v2.core.context import AgentContext
 from open_harness_v2.core.executor import Executor
 from open_harness_v2.core.reasoner import ActionType, Reasoner
 from open_harness_v2.events.bus import EventBus
-from open_harness_v2.llm.client import AsyncLLMClient
 from open_harness_v2.llm.middleware import LLMRequest, MiddlewarePipeline
 from open_harness_v2.llm.router import ModelRouter
 from open_harness_v2.policy.engine import PolicyEngine
 from open_harness_v2.tools.registry import ToolRegistry
-from open_harness_v2.types import AgentEvent, EventType, LLMResponse
+from open_harness_v2.types import AgentEvent, EventType
 
 _logger = logging.getLogger(__name__)
 
@@ -67,6 +66,7 @@ class Orchestrator:
         self._executor = Executor(registry, policy, self._event_bus)
         self._context_budget = context_budget
         self._cancelled = False
+        self.system_extra: str = ""  # injected by CLI (e.g. project memory)
 
     async def run(self, goal: str, context: AgentContext | None = None) -> str:
         """Run the agent loop until completion or cancellation.
@@ -91,6 +91,8 @@ class Orchestrator:
 
         # Set up context
         ctx = context or AgentContext()
+        if self.system_extra:
+            ctx.system.extra = self.system_extra
         if not ctx.system.tools_description:
             ctx.system.tools_description = self._registry.get_compact_prompt_description()
         ctx.add_user_message(goal)
@@ -108,9 +110,12 @@ class Orchestrator:
                 messages = ctx.to_messages(budget=self._context_budget)
 
                 # 2. Call LLM via pipeline
+                tools = self._registry.get_openai_schemas()
                 request = LLMRequest(
                     messages=messages,
                     model=self._router.current_model,
+                    tools=tools or None,
+                    tool_choice="auto" if tools else None,
                 )
                 response = await self._pipeline.execute(request)
 

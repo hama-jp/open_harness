@@ -104,10 +104,79 @@ llm:
 - **Optimized checkpoints** — Snapshots every 10 writes (was 5), fast no-change detection via `git diff --quiet`
 - **TUI dashboard** — Two-pane Textual UI with sidebar (history, plan, queue, agents, tasks, stats), draggable resize, sub-agent streaming panel, plan step progress bar, multiline input (Shift+Enter), input history navigation (Up/Down), compact/expand tool output (Ctrl+E), dark/light theme (Ctrl+D), real-time elapsed time, toast notifications, and Escape to cancel
 
+## v2.0 (Alpha) — Async-First Rewrite
+
+Open Harness v2 is an async-first modular rewrite, available alongside v1 as a separate `harness2` command.
+
+### Architecture
+
+```
+Orchestrator (thin loop)
+  ├── Reasoner        — interprets LLM output, decides next action
+  ├── Executor        — runs tools with policy checks
+  └── AgentContext    — 4-layer context (system / plan / history / working)
+
+MiddlewarePipeline    — composable LLM call chain
+  ├── PromptOptimizer — weak-model hints
+  ├── ErrorRecovery   — classify & retry
+  └── ResponseParser  — tool call extraction
+
+EventBus              — pub/sub decoupling (agent emits, UI subscribes)
+  └── ConsoleRenderer — Rich-based CLI display
+
+ToolRegistry          — plugin discovery via entry_points
+PolicyEngine          — automatic guardrails (unchanged from v1)
+```
+
+### Install & Run
+
+```bash
+uv pip install -e .
+
+harness2 --help              # show options
+harness2 "Fix the bug"       # one-shot mode
+harness2                     # interactive REPL
+harness2 -v                  # verbose event log
+harness2 --profile api       # switch LLM profile
+```
+
+### v2 REPL Commands
+
+```
+/tools      List available tools (15 built-in)
+/model      Show current model and tier
+/help       Show commands
+/quit       Exit
+Ctrl+C      Cancel running goal
+```
+
+### v2 Config
+
+Same `open_harness.yaml` format with simplified profiles:
+
+```yaml
+profile: local
+
+profiles:
+  local:
+    provider: ollama
+    url: http://localhost:11434/v1
+    models: [qwen3-8b, qwen3-30b]    # order = tier (small → large)
+
+  api:
+    provider: openai
+    api_key: sk-...
+    models: [gpt-4o-mini, gpt-4o]
+
+policy:
+  mode: balanced    # "safe" | "balanced" | "full"
+```
+
 ## Documentation
 
 - [Tutorial (English)](docs/tutorial.md)
 - [チュートリアル（日本語）](docs/tutorial_ja.md)
+- [v2.0 Redesign Plan](docs/redesign_plan.md)
 
 ## Requirements
 
