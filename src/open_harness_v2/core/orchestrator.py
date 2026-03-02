@@ -67,6 +67,7 @@ class Orchestrator:
         self._executor = Executor(registry, policy, self._event_bus)
         self._context_budget = context_budget
         self._cancelled = False
+        self.system_extra: str = ""  # injected by CLI (e.g. project memory)
 
     async def run(self, goal: str, context: AgentContext | None = None) -> str:
         """Run the agent loop until completion or cancellation.
@@ -91,6 +92,8 @@ class Orchestrator:
 
         # Set up context
         ctx = context or AgentContext()
+        if self.system_extra:
+            ctx.system.extra = self.system_extra
         if not ctx.system.tools_description:
             ctx.system.tools_description = self._registry.get_compact_prompt_description()
         ctx.add_user_message(goal)
@@ -108,9 +111,12 @@ class Orchestrator:
                 messages = ctx.to_messages(budget=self._context_budget)
 
                 # 2. Call LLM via pipeline
+                tools = self._registry.get_openai_schemas()
                 request = LLMRequest(
                     messages=messages,
                     model=self._router.current_model,
+                    tools=tools or None,
+                    tool_choice="auto" if tools else None,
                 )
                 response = await self._pipeline.execute(request)
 
