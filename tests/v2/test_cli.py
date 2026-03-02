@@ -64,7 +64,7 @@ def test_version(runner):
     """--version should show version string."""
     result = runner.invoke(main, ["--version"])
     assert result.exit_code == 0
-    assert "harness2" in result.output
+    assert "harness, version" in result.output
 
 
 @patch("open_harness_v2.cli._build_components")

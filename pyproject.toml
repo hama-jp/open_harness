@@ -1,6 +1,6 @@
 [project]
 name = "open-harness"
-version = "0.5.03"
+version = "2.0.0a2"
 description = "AI agent harness optimized for local LLMs with weak-model compensation"
 readme = "README.md"
 requires-python = ">=3.14"
