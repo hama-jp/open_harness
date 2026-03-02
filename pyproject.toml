@@ -23,7 +23,6 @@ dev = ["open-harness[test]"]
 
 [project.scripts]
 harness = "open_harness_v2.cli:main"
-harness2 = "open_harness_v2.cli:main"
 
 [project.entry-points."open_harness.tools"]
 file_ops = "open_harness_v2.tools.builtin.file_ops:ReadFileTool"
