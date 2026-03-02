@@ -278,6 +278,11 @@ async def _run_repl(
         "[bold]/quit[/bold] to exit[/dim]\n"
     )
 
+    # Ensure stdin can handle non-ASCII input (e.g. Japanese)
+    import sys
+    if hasattr(sys.stdin, "reconfigure"):
+        sys.stdin.reconfigure(errors="replace")
+
     while True:
         try:
             user_input = await asyncio.get_event_loop().run_in_executor(
@@ -538,41 +543,36 @@ def main(
     task_manager: TaskManager = orchestrator._task_manager  # type: ignore[attr-defined]
     task_store: TaskStore = orchestrator._task_store  # type: ignore[attr-defined]
 
-    # Inject project memory context into system prompt
-    async def _inject_memory() -> None:
+    # Run everything in a single event loop so that httpx connections,
+    # background tasks, etc. are all cleaned up properly.
+    async def _main_async() -> None:
+        # Inject project memory context into system prompt
         block = await project_memory.build_context_block()
         orchestrator.system_extra = block
 
-    asyncio.run(_inject_memory())
+        # Print startup banner (skip for one-shot mode)
+        if not goal:
+            _print_banner(console, config, config_path, len(registry.list_tools()))
 
-    # Print startup banner (skip for one-shot mode)
-    if not goal:
-        _print_banner(console, config, config_path, len(registry.list_tools()))
-
-    if goal:
-        # One-shot mode
-        asyncio.run(orchestrator.run(goal))
-    else:
-        # REPL mode
-        try:
-            asyncio.run(
-                _run_repl(
-                    orchestrator, event_bus, console,
-                    router, registry, project_memory, task_manager,
-                    session_memory,
-                )
+        if goal:
+            await orchestrator.run(goal)
+        else:
+            await _run_repl(
+                orchestrator, event_bus, console,
+                router, registry, project_memory, task_manager,
+                session_memory,
             )
-        except KeyboardInterrupt:
-            console.print("\n[dim]Bye![/dim]")
 
-    # Cleanup — drain background tasks before closing shared resources
-    async def _cleanup() -> None:
+        # Cleanup — drain background tasks before closing shared resources
         await task_manager.shutdown()
         await router.get_client().close()
         await memory_store.close()
         await task_store.close()
 
-    asyncio.run(_cleanup())
+    try:
+        asyncio.run(_main_async())
+    except KeyboardInterrupt:
+        console.print("\n[dim]Bye![/dim]")
 
 
 @main.command("update")
