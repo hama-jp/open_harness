@@ -3,7 +3,7 @@ name = "open-harness"
 version = "0.5.03"
 description = "AI agent harness optimized for local LLMs with weak-model compensation"
 readme = "README.md"
-requires-python = ">=3.11"
+requires-python = ">=3.14"
 license = "MIT"
 dependencies = [
     "httpx>=0.27",
@@ -16,9 +16,19 @@ dependencies = [
 
 [project.optional-dependencies]
 tui = ["textual>=1.0.0,<2.0"]
+test = ["pytest>=8.0", "pytest-asyncio>=1.0", "pytest-timeout>=2.0"]
+
+[dependency-groups]
+dev = ["open-harness[test]"]
 
 [project.scripts]
 harness = "open_harness.cli:main"
+harness2 = "open_harness_v2.cli:main"
+
+[project.entry-points."open_harness.tools"]
+file_ops = "open_harness_v2.tools.builtin.file_ops:ReadFileTool"
+shell = "open_harness_v2.tools.builtin.shell:ShellTool"
+git = "open_harness_v2.tools.builtin.git_tools:GitStatusTool"
 
 [build-system]
 requires = ["hatchling"]
@@ -29,7 +39,10 @@ packages = ["src/open_harness", "src/open_harness_v2"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
+markers = [
+    "integration: live service tests (Ollama, external agents)",
+]
 
 [tool.ruff]
 line-length = 100
-target-version = "py311"
+target-version = "py314"
