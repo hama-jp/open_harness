@@ -141,15 +141,27 @@ def _print_banner(
         f"[dim]{_find_config_display(config_path)}[/dim]",
     )
 
-    # Detect available external agents
+    # Detect available external agents (verify they actually respond)
     import shutil
+    import subprocess
 
     _ext_agents = [
-        ("claude", "Claude Code"),
-        ("codex", "Codex"),
-        ("gemini", "Gemini CLI"),
+        ("claude", "Claude Code", ["claude", "--version"]),
+        ("codex", "Codex", ["codex", "--version"]),
+        ("gemini", "Gemini CLI", ["gemini", "--version"]),
     ]
-    available = [label for cmd, label in _ext_agents if shutil.which(cmd)]
+    available: list[str] = []
+    for cmd, label, check_cmd in _ext_agents:
+        if shutil.which(cmd) is None:
+            continue
+        try:
+            result = subprocess.run(
+                check_cmd, capture_output=True, timeout=5,
+            )
+            if result.returncode == 0:
+                available.append(label)
+        except (subprocess.TimeoutExpired, OSError):
+            pass  # not working — skip
     if available:
         agents_str = "[bold green]" + "[/bold green], [bold green]".join(available) + "[/bold green]"
     else:
