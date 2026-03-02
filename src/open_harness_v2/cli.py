@@ -84,13 +84,35 @@ def _print_banner(
     else:
         location = host
 
-    # Title line
-    title = Text()
-    title.append("Open Harness", style="bold cyan")
-    title.append(f"  v{__version__}", style="dim")
+    # ASCII art banner with blue-cyan gradient
+    _banner_lines = [
+        r"   ____                      _   _                                ",
+        r"  / __ \                    | | | |                               ",
+        r" | |  | |_ __   ___ _ __   | |_| | __ _ _ __ _ __   ___  ___ ___ ",
+        r" | |  | | '_ \ / _ \ '_ \  |  _  |/ _` | '__| '_ \ / _ \/ __/ __|",
+        r" | |__| | |_) |  __/ | | | | | | | (_| | |  | | | |  __/\__ \__ \\",
+        r"  \____/| .__/ \___|_| |_| |_| |_|\__,_|_|  |_| |_|\___||___/___/",
+        r"        | |                                                       ",
+        r"        |_|                                                       ",
+    ]
+    _gradient = [
+        "bold bright_blue",
+        "bold blue",
+        "bold cyan",
+        "bold bright_cyan",
+        "bold cyan",
+        "bold blue",
+        "bold bright_blue",
+        "bold blue",
+    ]
 
     console.print()
-    console.print(title)
+    for line, style in zip(_banner_lines, _gradient):
+        console.print(f"[{style}]{line}[/{style}]")
+    console.print(
+        f"  [bold bright_white]v{__version__}[/bold bright_white]"
+        "  [dim]Async-first AI agent harness[/dim]"
+    )
     console.print("[dim]─[/dim]" * min(console.width, 50))
 
     # Status grid — two columns, compact
@@ -278,15 +300,27 @@ async def _run_repl(
         "[bold]/quit[/bold] to exit[/dim]\n"
     )
 
-    # Ensure stdin can handle non-ASCII input (e.g. Japanese)
-    import sys
-    if hasattr(sys.stdin, "reconfigure"):
-        sys.stdin.reconfigure(errors="replace")
+    # Set up prompt_toolkit session with persistent history and completion
+    from prompt_toolkit import PromptSession
+    from prompt_toolkit.history import FileHistory
+    from prompt_toolkit.completion import WordCompleter
+
+    history_path = Path.home() / ".cache" / "open_harness" / "repl_history"
+    history_path.parent.mkdir(parents=True, exist_ok=True)
+
+    completer = WordCompleter(
+        list(_REPL_COMMANDS.keys()), sentence=True,
+    )
+    session = PromptSession(
+        history=FileHistory(str(history_path)),
+        completer=completer,
+        complete_while_typing=False,
+    )
 
     while True:
         try:
             user_input = await asyncio.get_event_loop().run_in_executor(
-                None, lambda: input(">>> ")
+                None, lambda: session.prompt(">>> ")
             )
         except (EOFError, KeyboardInterrupt):
             console.print("\n[dim]Bye![/dim]")
