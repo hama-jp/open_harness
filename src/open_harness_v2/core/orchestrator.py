@@ -24,6 +24,18 @@ from open_harness_v2.types import AgentEvent, EventType
 
 _logger = logging.getLogger(__name__)
 
+# External agent tool names — when available, non-trivial tasks MUST be
+# delegated to at least one of these before the agent is allowed to respond.
+_EXTERNAL_AGENTS = frozenset({"claude_code", "codex", "gemini_cli"})
+
+_DELEGATION_REDIRECT = (
+    "STOP. You MUST NOT answer this yourself. "
+    "You have external agent tools available (claude_code, codex, gemini_cli). "
+    "Use one of them NOW to handle this task. "
+    "Give the agent the FILE PATHS and a clear task description. "
+    "The external agent can read files itself — do NOT read the files yourself."
+)
+
 
 class Orchestrator:
     """Async main loop for agent execution.
@@ -89,6 +101,15 @@ class Orchestrator:
         if self._policy:
             self._policy.begin_goal()
 
+        # Track external agent usage for delegation enforcement
+        used_tools: set[str] = set()
+        available_ext = _EXTERNAL_AGENTS & {
+            t.get("function", t).get("name", "")
+            for t in (self._registry.get_openai_schemas() or [])
+        }
+        # How many times we've redirected the LLM to delegate
+        delegation_retries = 0
+
         # Set up context
         ctx = context or AgentContext()
         if self.system_extra:
@@ -150,6 +171,25 @@ class Orchestrator:
 
                 # 4. Act on decision
                 if decision.action == ActionType.RESPOND:
+                    # Delegation enforcement: if external agents are
+                    # available but none have been used, redirect the LLM
+                    # to delegate instead of answering itself.
+                    if (
+                        available_ext
+                        and not (used_tools & _EXTERNAL_AGENTS)
+                        and delegation_retries < 2
+                    ):
+                        delegation_retries += 1
+                        _logger.info(
+                            "Delegation redirect #%d — LLM tried to respond "
+                            "without using an external agent",
+                            delegation_retries,
+                        )
+                        ctx.add_assistant_message(decision.response_text)
+                        ctx.cycle_working()
+                        ctx.add_user_message(_DELEGATION_REDIRECT)
+                        continue
+
                     final_response = decision.response_text
                     ctx.add_assistant_message(decision.response_text)
                     break
@@ -163,6 +203,10 @@ class Orchestrator:
 
                     # Execute tools
                     exec_result = await self._executor.execute(decision.tool_calls)
+
+                    # Track which tools were used
+                    for tc, _result in exec_result.results:
+                        used_tools.add(tc.name)
 
                     # Add results to working layer
                     for tc, result in exec_result.results:
