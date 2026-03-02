@@ -280,7 +280,7 @@ def run_setup_wizard(config_dir: Path | None = None) -> Path:
     api_type = preset.get("api_type", "openai")
 
     # Step 2: Server URL (with connection test)
-    console.print(f"\n[bold]Step 2:[/bold] Server URL")
+    console.print("\n[bold]Step 2:[/bold] Server URL")
     while True:
         if preset["base_url"]:
             base_url = click.prompt("Server URL", default=preset["base_url"])
@@ -330,19 +330,19 @@ def run_setup_wizard(config_dir: Path | None = None) -> Path:
             break
 
     # Step 3: API key
-    console.print(f"\n[bold]Step 3:[/bold] API Key")
+    console.print("\n[bold]Step 3:[/bold] API Key")
     if preset["api_key"]:
         api_key = click.prompt("API key", default=preset["api_key"])
     else:
         api_key = click.prompt("API key", default="no-key")
 
     # Step 4: Model
-    console.print(f"\n[bold]Step 4:[/bold] Model")
+    console.print("\n[bold]Step 4:[/bold] Model")
     model_name = _choose_model(base_url, api_key, api_type)
     console.print(f"[green]Selected: {model_name}[/green]")
 
     # Step 5: External agents
-    console.print(f"\n[bold]Step 5:[/bold] External Agents")
+    console.print("\n[bold]Step 5:[/bold] External Agents")
     detected = _detect_agents()
     any_found = any(found for _, _, _, found in detected)
     agents: dict[str, bool] = {}
@@ -361,7 +361,7 @@ def run_setup_wizard(config_dir: Path | None = None) -> Path:
             agents[key] = False
 
     # Step 6: Policy mode
-    console.print(f"\n[bold]Step 6:[/bold] Policy Mode")
+    console.print("\n[bold]Step 6:[/bold] Policy Mode")
     policy_keys = list(_POLICY_PRESETS.keys())
     for i, key in enumerate(policy_keys, 1):
         desc = _POLICY_PRESETS[key]
@@ -386,7 +386,7 @@ def run_setup_wizard(config_dir: Path | None = None) -> Path:
     )
 
     output_path = output_dir / "open_harness.yaml"
-    console.print(f"\n[bold]Step 7:[/bold] Confirm")
+    console.print("\n[bold]Step 7:[/bold] Confirm")
     console.print(f"Config will be written to: [bold]{output_path}[/bold]\n")
     console.print(Panel(yaml_content, title="open_harness.yaml", border_style="dim"))
 

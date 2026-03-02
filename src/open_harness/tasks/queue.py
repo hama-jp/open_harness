@@ -10,8 +10,6 @@ but the CLI remains responsive while tasks execute.
 
 from __future__ import annotations
 
-import copy
-import json
 import logging
 import queue
 import sqlite3

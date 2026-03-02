@@ -12,7 +12,6 @@ import signal
 import shutil
 import subprocess
 import threading
-import time
 from typing import Any, Callable
 
 from open_harness.tools.base import Tool, ToolParameter, ToolResult
