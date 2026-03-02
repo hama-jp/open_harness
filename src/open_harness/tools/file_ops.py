@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import os
 import re as _re
 from pathlib import Path
 from typing import Any, Callable
@@ -169,8 +168,8 @@ class EditFileTool(Tool):
             candidate = "\n".join(norm_text_lines[i : i + window])
             if candidate == norm_old:
                 # Compute byte offsets in original text
-                start = sum(len(l) for l in text_lines[:i])
-                end = sum(len(l) for l in text_lines[: i + window])
+                start = sum(len(line) for line in text_lines[:i])
+                end = sum(len(line) for line in text_lines[: i + window])
                 matches.append((start, end))
 
         if len(matches) == 1:

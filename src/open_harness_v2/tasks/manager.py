@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from typing import Any, Callable, TYPE_CHECKING
+from typing import Callable, TYPE_CHECKING
 
 from open_harness_v2.tasks.record import TaskRecord, TaskStatus
 from open_harness_v2.tasks.store import TaskStore

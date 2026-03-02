@@ -16,7 +16,6 @@ import subprocess
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
 
 from open_harness_v2.config import PolicySpec
 from open_harness_v2.events.bus import EventBus

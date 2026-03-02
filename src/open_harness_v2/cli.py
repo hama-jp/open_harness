@@ -16,7 +16,6 @@ import hashlib
 import logging
 import os
 import signal
-import sys
 from pathlib import Path
 from typing import Any
 
@@ -531,7 +530,7 @@ def main(
 
     if goal:
         # One-shot mode
-        result = asyncio.run(orchestrator.run(goal))
+        asyncio.run(orchestrator.run(goal))
     else:
         # REPL mode
         try:

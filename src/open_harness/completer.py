@@ -5,6 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from prompt_toolkit.completion import Completer, Completion
+from prompt_toolkit.document import Document
 
 # Directories to skip during completion
 _SKIP_DIRS = frozenset({

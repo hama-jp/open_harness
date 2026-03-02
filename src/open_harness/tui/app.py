@@ -5,12 +5,10 @@ from __future__ import annotations
 import io
 import re
 import time
-from typing import Any
 
 from rich.console import Console
 from rich.markdown import Markdown
 from rich.panel import Panel
-from rich.table import Table
 from textual import work
 from textual.app import App, ComposeResult
 from textual.binding import Binding

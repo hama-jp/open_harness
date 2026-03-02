@@ -14,7 +14,7 @@ from open_harness.checkpoint import CheckpointEngine
 from open_harness.context_compactor import build_context_summary
 from open_harness.config import HarnessConfig
 from open_harness.diagnostics import SessionLogger
-from open_harness.llm.client import LLMResponse, ToolCall, ToolCallParser, _extract_balanced_json, _parse_tool_calls_from_text
+from open_harness.llm.client import LLMResponse, ToolCall, ToolCallParser
 from open_harness.llm.compensator import (
     Compensator,
     build_autonomous_prompt,
@@ -28,7 +28,7 @@ from open_harness.memory.project_memory import (
     build_memory_block,
 )
 from open_harness.memory.store import MemoryStore
-from open_harness.planner import GoalComplexityEstimator, Plan, PlanCritic, PlanStep, Planner, StepResult
+from open_harness.planner import Plan, PlanCritic, PlanStep, Planner, StepResult
 from open_harness.policy import PolicyEngine, load_policy
 from open_harness.project import ProjectContext
 from open_harness.tools.base import ToolRegistry, ToolResult

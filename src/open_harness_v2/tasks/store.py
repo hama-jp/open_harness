@@ -7,7 +7,6 @@ Shares the same DB directory as MemoryStore but uses a separate file
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 import sqlite3
 import threading

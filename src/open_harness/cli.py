@@ -26,7 +26,7 @@ from rich.table import Table
 
 from open_harness.agent import Agent, AgentEvent
 from open_harness.completer import AtFileCompleter
-from open_harness.config import CONFIG_FILENAME, HarnessConfig, _CONFIG_NAMES, load_config
+from open_harness.config import HarnessConfig, _CONFIG_NAMES, load_config
 from open_harness.diagnostics import SessionLogger
 from open_harness.memory.store import MemoryStore
 from open_harness.project import ProjectContext
@@ -806,12 +806,12 @@ def _load_config_safe(config_path: str | None):
         ename = type(e).__name__
         # pydantic ValidationError
         if "ValidationError" in ename:
-            console.print(f"[red]Config validation failed:[/red]")
+            console.print("[red]Config validation failed:[/red]")
             console.print(f"[red]{e}[/red]")
             sys.exit(1)
         # YAML syntax errors
         if "YAMLError" in ename or "ScannerError" in ename:
-            console.print(f"[red]Config file has syntax errors:[/red]")
+            console.print("[red]Config file has syntax errors:[/red]")
             console.print(f"[red]{e}[/red]")
             sys.exit(1)
         raise
@@ -984,7 +984,7 @@ def main(config_path: str | None, tier: str | None, goal_text: str | None,
     # Ensure project is under git so file edits can be reverted
     git_status = project.ensure_git()
     if git_status == "auto-initialized git":
-        console.print(f"[yellow]Git: auto-initialized (to allow safe file editing)[/yellow]")
+        console.print("[yellow]Git: auto-initialized (to allow safe file editing)[/yellow]")
     else:
         console.print(f"[dim]Git: {git_status}[/dim]")
 
@@ -1057,7 +1057,7 @@ def main(config_path: str | None, tier: str | None, goal_text: str | None,
     _task_queue = TaskQueueManager(
         task_store, agent_factory, on_complete=_on_task_complete)
     _task_queue.start()
-    console.print(f"[dim]Task queue: ready[/dim]")
+    console.print("[dim]Task queue: ready[/dim]")
     console.print()
 
     # Non-interactive goal mode

@@ -16,12 +16,11 @@ from open_harness_v2.core.context import AgentContext
 from open_harness_v2.core.executor import Executor
 from open_harness_v2.core.reasoner import ActionType, Reasoner
 from open_harness_v2.events.bus import EventBus
-from open_harness_v2.llm.client import AsyncLLMClient
 from open_harness_v2.llm.middleware import LLMRequest, MiddlewarePipeline
 from open_harness_v2.llm.router import ModelRouter
 from open_harness_v2.policy.engine import PolicyEngine
 from open_harness_v2.tools.registry import ToolRegistry
-from open_harness_v2.types import AgentEvent, EventType, LLMResponse
+from open_harness_v2.types import AgentEvent, EventType
 
 _logger = logging.getLogger(__name__)
 
