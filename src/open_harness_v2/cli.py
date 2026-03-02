@@ -23,7 +23,6 @@ from typing import Any
 import click
 from rich.console import Console
 from rich.table import Table
-from rich.text import Text
 
 from open_harness_v2 import __version__
 from open_harness_v2.config import HarnessConfig, _SEARCH_PATHS, load_config
