@@ -140,6 +140,22 @@ def _print_banner(
         "config",
         f"[dim]{_find_config_display(config_path)}[/dim]",
     )
+
+    # Detect available external agents
+    import shutil
+
+    _ext_agents = [
+        ("claude", "Claude Code"),
+        ("codex", "Codex"),
+        ("gemini", "Gemini CLI"),
+    ]
+    available = [label for cmd, label in _ext_agents if shutil.which(cmd)]
+    if available:
+        agents_str = "[bold green]" + "[/bold green], [bold green]".join(available) + "[/bold green]"
+    else:
+        agents_str = "[dim]none[/dim]"
+    grid.add_row("agents", agents_str, "", "")
+
     console.print(grid)
     console.print()
 
