@@ -2,11 +2,12 @@
 
 Usage::
 
-    harness2                         # interactive REPL
-    harness2 "Fix the bug"           # one-shot (positional argument)
-    harness2 --config path.yaml      # config file
-    harness2 --profile api           # profile switch
-    harness2 -v                      # verbose event log
+    harness                          # interactive REPL
+    harness "Fix the bug"            # one-shot (positional argument)
+    harness --config path.yaml       # config file
+    harness --profile api            # profile switch
+    harness -v                       # verbose event log
+    harness update                   # self-update via git pull
 """
 
 from __future__ import annotations
@@ -243,6 +244,7 @@ _REPL_COMMANDS: dict[str, str] = {
     "/tasks": "List background tasks",
     "/result": "Show task result: /result <id>",
     "/cancel": "Cancel a task: /cancel <id>",
+    "/update": "Self-update (git pull + reinstall)",
     "/quit": "Exit the REPL",
     "/help": "Show this help",
 }
@@ -415,6 +417,10 @@ async def _run_repl(
                 else:
                     console.print("  [dim]Task manager not available[/dim]")
                 continue
+            elif cmd == "/update":
+                from open_harness_v2.update import self_update
+                self_update(console)
+                continue
             else:
                 console.print(f"[yellow]Unknown command: {cmd}[/yellow]")
                 continue
@@ -470,13 +476,18 @@ async def _run_repl(
 # Click entry point
 # ------------------------------------------------------------------
 
-@click.command(context_settings={"help_option_names": ["-h", "--help"]})
+@click.group(
+    invoke_without_command=True,
+    context_settings={"help_option_names": ["-h", "--help"]},
+)
 @click.argument("goal", required=False, default=None)
 @click.option("--config", "config_path", default=None, help="Path to config YAML.")
 @click.option("--profile", default=None, help="Profile name to use.")
 @click.option("-v", "--verbose", is_flag=True, help="Show detailed event log.")
-@click.version_option(version=__version__, prog_name="harness2")
+@click.version_option(version=__version__, prog_name="harness")
+@click.pass_context
 def main(
+    ctx: click.Context,
     goal: str | None,
     config_path: str | None,
     profile: str | None,
@@ -486,6 +497,16 @@ def main(
 
     Run with a GOAL argument for one-shot mode, or without for interactive REPL.
     """
+    # If a subcommand was invoked (e.g. "harness update"), skip the default logic.
+    if ctx.invoked_subcommand is not None:
+        return
+
+    # Click consumes the first positional token as GOAL before checking
+    # subcommands.  Detect this and redirect.
+    if goal and goal in main.commands:
+        ctx.invoke(main.commands[goal])
+        return
+
     # Configure logging
     log_level = logging.DEBUG if verbose else logging.WARNING
     logging.basicConfig(
@@ -552,6 +573,15 @@ def main(
         await task_store.close()
 
     asyncio.run(_cleanup())
+
+
+@main.command("update")
+def update_cmd() -> None:
+    """Self-update: git pull + reinstall."""
+    from open_harness_v2.update import self_update
+
+    console = Console()
+    self_update(console)
 
 
 if __name__ == "__main__":
