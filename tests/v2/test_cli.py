@@ -112,7 +112,10 @@ def test_config_and_profile_passed(mock_build, runner):
         "hello",
     ])
     assert result.exit_code == 0
-    mock_build.assert_called_once_with("/tmp/test.yaml", "api", False)
+    mock_build.assert_called_once_with(
+        "/tmp/test.yaml", "api", False,
+        approval_override=None, sandbox_override=None, non_interactive=False,
+    )
 
 
 @patch("open_harness_v2.cli._build_components")
@@ -134,4 +137,7 @@ def test_verbose_flag(mock_build, runner):
 
     result = runner.invoke(main, ["-v", "test"])
     assert result.exit_code == 0
-    mock_build.assert_called_once_with(None, None, True)
+    mock_build.assert_called_once_with(
+        None, None, True,
+        approval_override=None, sandbox_override=None, non_interactive=False,
+    )
