@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -102,7 +103,9 @@ class Executor:
                 "args": tc.arguments,
             })
 
+            start = time.monotonic()
             result = await self._registry.execute(tc.name, tc.arguments)
+            elapsed_ms = (time.monotonic() - start) * 1000
 
             # Record in policy budget
             if self._policy:
@@ -114,12 +117,14 @@ class Executor:
                     "success": True,
                     "output": result.output,
                     "output_length": len(result.output),
+                    "elapsed_ms": elapsed_ms,
                 })
             else:
                 await self._emit(EventType.TOOL_ERROR, {
                     "tool": tc.name,
                     "success": False,
                     "error": result.error,
+                    "elapsed_ms": elapsed_ms,
                 })
 
             exec_result.results.append((tc, result))
@@ -154,26 +159,41 @@ class Executor:
             return exec_result
 
         # Execute concurrently
-        async def _run_one(tc: ToolCall) -> tuple[ToolCall, ToolResult]:
+        async def _run_one(tc: ToolCall) -> tuple[ToolCall, ToolResult, float]:
             await self._emit(EventType.TOOL_EXECUTING, {
                 "tool": tc.name,
                 "args": tc.arguments,
             })
+            start = time.monotonic()
             result = await self._registry.execute(tc.name, tc.arguments)
+            elapsed_ms = (time.monotonic() - start) * 1000
             if self._policy:
                 self._policy.record(tc.name)
-            return tc, result
+            return tc, result, elapsed_ms
 
         pairs = await asyncio.gather(
             *[_run_one(tc) for tc in to_run],
             return_exceptions=True,
         )
 
-        for item in pairs:
+        for i, item in enumerate(pairs):
             if isinstance(item, Exception):
                 _logger.error("Concurrent tool execution failed: %s", item)
+                # Emit error event with the original tool call info
+                tc = to_run[i]
+                error_result = ToolResult(
+                    success=False,
+                    output="",
+                    error=f"Execution exception: {type(item).__name__}: {item}",
+                )
+                exec_result.results.append((tc, error_result))
+                await self._emit(EventType.TOOL_ERROR, {
+                    "tool": tc.name,
+                    "success": False,
+                    "error": error_result.error,
+                })
                 continue
-            tc, result = item
+            tc, result, elapsed_ms = item
             exec_result.results.append((tc, result))
             if result.success:
                 await self._emit(EventType.TOOL_EXECUTED, {
@@ -181,12 +201,14 @@ class Executor:
                     "success": True,
                     "output": result.output,
                     "output_length": len(result.output),
+                    "elapsed_ms": elapsed_ms,
                 })
             else:
                 await self._emit(EventType.TOOL_ERROR, {
                     "tool": tc.name,
                     "success": False,
                     "error": result.error,
+                    "elapsed_ms": elapsed_ms,
                 })
 
         return exec_result

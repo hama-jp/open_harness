@@ -151,11 +151,12 @@ class HistoryLayer:
                 and i + 1 < len(messages)
                 and messages[i + 1].get("role") == "user"
             ):
-                next_content = messages[i + 1].get("content", "") or ""
-                if "[Tool Result" in str(next_content):
+                next_content = str(messages[i + 1].get("content", "") or "")
+                if "[Tool Result" in next_content or "[Tool Error" in next_content:
                     # Summarize the pair
-                    tool_name = _extract_tool_name(content)
-                    status = "OK" if "success" in str(next_content).lower() or "[Tool Result" in str(next_content) else "error"
+                    tool_name = _extract_tool_name(content or next_content)
+                    is_error = "[Tool Error" in next_content
+                    status = "ERROR" if is_error else "OK"
                     summary = f"[Tool: {tool_name} → {status}]"
                     result.append({
                         "role": "user",
@@ -300,10 +301,29 @@ class AgentContext:
 # ---------------------------------------------------------------------------
 
 def _extract_tool_name(text: str) -> str:
-    """Try to extract a tool name from an assistant message."""
-    # Look for {"tool": "name"...}
+    """Try to extract a tool name from an assistant message.
+
+    Checks multiple patterns:
+    1. ``{"tool": "name"...}`` (text-based tool calls)
+    2. ``[Tool Result for name]`` markers
+    3. ``> name`` execution lines
+    """
     import re
-    m = re.search(r'"tool"\s*:\s*"([^"]+)"', str(text))
+    text_str = str(text)
+
+    # Pattern 1: JSON tool call
+    m = re.search(r'"tool"\s*:\s*"([^"]+)"', text_str)
     if m:
         return m.group(1)
+
+    # Pattern 2: Tool result marker
+    m = re.search(r'\[Tool Result for (\w+)\]', text_str)
+    if m:
+        return m.group(1)
+
+    # Pattern 3: Native function call name
+    m = re.search(r'"name"\s*:\s*"([^"]+)"', text_str)
+    if m:
+        return m.group(1)
+
     return "unknown"

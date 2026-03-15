@@ -140,27 +140,19 @@ def _print_banner(
         f"[dim]{_find_config_display(config_path)}[/dim]",
     )
 
-    # Detect available external agents (verify they actually respond)
+    # Detect available external agents (quick shutil.which check only;
+    # actually running --version is slow and blocks startup).
     import shutil
-    import subprocess
 
     _ext_agents = [
-        ("claude", "Claude Code", ["claude", "--version"]),
-        ("codex", "Codex", ["codex", "--version"]),
-        ("gemini", "Gemini CLI", ["gemini", "--version"]),
+        ("claude", "Claude Code"),
+        ("codex", "Codex"),
+        ("gemini", "Gemini CLI"),
     ]
     available: list[str] = []
-    for cmd, label, check_cmd in _ext_agents:
-        if shutil.which(cmd) is None:
-            continue
-        try:
-            result = subprocess.run(
-                check_cmd, capture_output=True, timeout=5,
-            )
-            if result.returncode == 0:
-                available.append(label)
-        except (subprocess.TimeoutExpired, OSError):
-            pass  # not working — skip
+    for cmd, label in _ext_agents:
+        if shutil.which(cmd) is not None:
+            available.append(label)
     if available:
         agents_str = "[bold green]" + "[/bold green], [bold green]".join(available) + "[/bold green]"
     else:
@@ -286,6 +278,7 @@ def _build_components(
 _REPL_COMMANDS: dict[str, str] = {
     "/tools": "List available tools",
     "/model": "Show current model and tier",
+    "/status": "Show current session status (budget, memory, tasks)",
     "/remember": "Save a fact: /remember <key> <value>",
     "/forget": "Remove a fact: /forget <key>",
     "/memories": "List all project memories",
@@ -297,6 +290,20 @@ _REPL_COMMANDS: dict[str, str] = {
     "/quit": "Exit the REPL",
     "/help": "Show this help",
 }
+
+
+def _suggest_command(cmd: str) -> str | None:
+    """Suggest the closest matching REPL command for a typo."""
+    cmd_lower = cmd.lower()
+    # Check prefix matches first
+    matches = [c for c in _REPL_COMMANDS if c.startswith(cmd_lower)]
+    if len(matches) == 1:
+        return matches[0]
+    # Check substring matches
+    matches = [c for c in _REPL_COMMANDS if cmd_lower[1:] in c]
+    if len(matches) == 1:
+        return matches[0]
+    return None
 
 
 async def _run_repl(
@@ -388,6 +395,29 @@ async def _run_repl(
                     )
                 else:
                     console.print("  [dim]Router not available[/dim]")
+                continue
+            elif cmd == "/status":
+                # Session overview: model, policy budget, memory count, tasks
+                if router:
+                    console.print(
+                        f"  model: [bold]{router.current_model}[/bold]  "
+                        f"tier: {router.current_tier}"
+                    )
+                pol = orchestrator._policy
+                if pol:
+                    console.print(
+                        f"  budget: {pol.budget.summary()}"
+                    )
+                if project_memory:
+                    facts = await project_memory.list_all()
+                    console.print(f"  memories: {len(facts)} fact(s)")
+                console.print(f"  session history: {len(session_messages)} message(s)")
+                if task_manager:
+                    tasks = task_manager.list_tasks()
+                    running = sum(1 for t in tasks if t.status.value == "running")
+                    console.print(
+                        f"  tasks: {len(tasks)} total, {running} running"
+                    )
                 continue
             elif cmd == "/remember":
                 parts = text.split(maxsplit=2)
@@ -488,7 +518,17 @@ async def _run_repl(
                 self_update(console)
                 continue
             else:
-                console.print(f"[yellow]Unknown command: {cmd}[/yellow]")
+                suggestion = _suggest_command(cmd)
+                if suggestion:
+                    console.print(
+                        f"[yellow]Unknown command: {cmd}[/yellow]  "
+                        f"[dim]Did you mean [bold]{suggestion}[/bold]?[/dim]"
+                    )
+                else:
+                    console.print(
+                        f"[yellow]Unknown command: {cmd}[/yellow]  "
+                        f"[dim]Type /help for available commands[/dim]"
+                    )
                 continue
 
         # Run the goal — Ctrl+C cancels the current goal
