@@ -121,11 +121,25 @@ class Orchestrator:
         await self._emit(EventType.AGENT_STARTED, {"goal": goal})
 
         final_response = ""
+        consecutive_empty = 0  # guard against empty response loops
 
         try:
             while not self._cancelled:
                 # Yield to event loop so cancellation can be detected
                 await asyncio.sleep(0)
+
+                # Warn when approaching step limit
+                steps_used = self._reasoner.step_count
+                max_steps = self._reasoner._max_steps
+                if steps_used > 0 and steps_used == max_steps - 5:
+                    _logger.warning(
+                        "Approaching step limit: %d/%d steps used",
+                        steps_used, max_steps,
+                    )
+                    ctx.add_user_message(
+                        f"[System] You are approaching the step limit "
+                        f"({steps_used}/{max_steps}). Wrap up your work soon."
+                    )
 
                 # 1. Build messages from context
                 messages = ctx.to_messages(budget=self._context_budget)
@@ -145,6 +159,7 @@ class Orchestrator:
                     "has_tool_calls": response.has_tool_calls,
                     "content_length": len(response.content),
                     "latency_ms": response.latency_ms,
+                    "usage": response.usage,
                 })
 
                 # Track token usage
@@ -215,7 +230,23 @@ class Orchestrator:
                     # Continue the loop for the next LLM call
 
                 elif decision.action == ActionType.ERROR:
-                    final_response = decision.error or "Agent encountered an error"
+                    error_msg = decision.error or "Agent encountered an error"
+
+                    # Guard: treat consecutive empty responses as recoverable
+                    # before giving up — try escalating the model first.
+                    if "Empty response" in error_msg:
+                        consecutive_empty += 1
+                        if consecutive_empty < 3:
+                            _logger.warning(
+                                "Empty response #%d — escalating model",
+                                consecutive_empty,
+                            )
+                            self._router.escalate()
+                            continue
+                    else:
+                        consecutive_empty = 0
+
+                    final_response = error_msg
                     await self._emit(EventType.AGENT_ERROR, {
                         "error": final_response,
                     })
@@ -223,6 +254,7 @@ class Orchestrator:
 
                 else:
                     # CONTINUE or unknown — keep going
+                    consecutive_empty = 0
                     ctx.add_assistant_message(response.content)
 
         except asyncio.CancelledError:

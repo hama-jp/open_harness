@@ -205,12 +205,22 @@ class ErrorRecoveryMiddleware:
     # ------------------------------------------------------------------
 
     def _needs_recovery(self, response: LLMResponse) -> bool:
-        """Decide whether the response should trigger recovery."""
+        """Decide whether the response should trigger recovery.
+
+        Recovery is triggered when:
+        - LLM returned an explicit error
+        - Response is completely empty (no content, no tool calls)
+        - Content starts with ``[LLM API Error`` or ``[Ollama`` (error wrapper)
+        """
         if response.finish_reason == "error":
             return True
         if response.has_tool_calls:
             return False
         if not response.content or not response.content.strip():
+            return True
+        # Detect error-wrapper messages from the client layer
+        stripped = response.content.strip()
+        if stripped.startswith("[LLM API Error") or stripped.startswith("[Ollama"):
             return True
         return False
 
