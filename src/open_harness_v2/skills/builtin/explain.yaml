@@ -1,0 +1,12 @@
+name: explain
+description: "Explain how code works in detail"
+args: required
+args_description: "File path, function name, or code concept to explain"
+prompt: |
+  Explain the specified code clearly and thoroughly.
+  Cover:
+  1. What it does (high-level purpose)
+  2. How it works (step by step)
+  3. Key design decisions and trade-offs
+  4. Dependencies and interactions with other parts of the codebase
+  Keep the explanation concise but complete.

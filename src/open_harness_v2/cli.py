@@ -28,6 +28,8 @@ from open_harness_v2 import __version__
 from open_harness_v2.config import HarnessConfig, _SEARCH_PATHS, load_config
 from open_harness_v2.core.orchestrator import Orchestrator
 from open_harness_v2.events.bus import EventBus
+from open_harness_v2.hooks import HookEngine
+from open_harness_v2.hooks.engine import load_hooks
 from open_harness_v2.llm.error_recovery import ErrorRecoveryMiddleware
 from open_harness_v2.llm.middleware import MiddlewarePipeline
 from open_harness_v2.llm.prompt_optimizer import PromptOptimizerMiddleware
@@ -35,7 +37,10 @@ from open_harness_v2.llm.router import ModelRouter
 from open_harness_v2.checkpoint import CheckpointEngine
 from open_harness_v2.memory import MemoryStore, ProjectMemory, SessionMemory
 from open_harness_v2.policy.engine import PolicyEngine
+from open_harness_v2.project_instructions import load_project_instructions
+from open_harness_v2.skills import SkillRegistry
 from open_harness_v2.tasks import TaskManager, TaskStore
+from open_harness_v2.todo import TodoManager
 from open_harness_v2.tools.builtin import register_builtins
 from open_harness_v2.tools.registry import ToolRegistry
 from open_harness_v2.ui.renderer import ConsoleRenderer
@@ -72,6 +77,9 @@ def _print_banner(
     config: HarnessConfig,
     config_path: str | None,
     num_tools: int,
+    num_skills: int = 0,
+    has_hooks: bool = False,
+    has_instructions: bool = False,
 ) -> None:
     """Print a compact startup banner with status info."""
     from urllib.parse import urlparse
@@ -140,6 +148,17 @@ def _print_banner(
         f"[dim]{_find_config_display(config_path)}[/dim]",
     )
 
+    # Show skills, hooks, and project instructions status
+    extras: list[str] = []
+    if num_skills > 0:
+        extras.append(f"[bold green]{num_skills} skills[/bold green]")
+    if has_hooks:
+        extras.append("[bold green]hooks[/bold green]")
+    if has_instructions:
+        extras.append("[bold green]HARNESS.md[/bold green]")
+    if extras:
+        grid.add_row("extras", ", ".join(extras), "", "")
+
     # Detect available external agents (quick shutil.which check only;
     # actually running --version is slow and blocks startup).
     import shutil
@@ -204,6 +223,23 @@ def _build_components(
     # Wire memory to EventBus
     session_memory.attach(event_bus)
 
+    # Skills — discover from builtin, user, and project dirs
+    skill_registry = SkillRegistry()
+    skill_registry.discover(project_root=Path.cwd())
+
+    # Hooks — merge config-level hooks with project-level .harness/hooks.yaml
+    hooks_config = config.hooks
+    if hooks_config is None:
+        hooks_config = load_hooks(project_root=Path.cwd())
+    hook_engine = HookEngine(hooks_config)
+    hook_engine.attach(event_bus)
+
+    # Project instructions (HARNESS.md)
+    project_instructions = load_project_instructions(project_root=Path.cwd())
+
+    # Todo manager (session-scoped task tracking)
+    todo_manager = TodoManager()
+
     # UI
     console = Console()
     renderer = ConsoleRenderer(console, verbose=verbose)
@@ -267,6 +303,10 @@ def _build_components(
     orchestrator._memory_store = store  # type: ignore[attr-defined]
     orchestrator._task_manager = task_manager  # type: ignore[attr-defined]
     orchestrator._task_store = task_store  # type: ignore[attr-defined]
+    orchestrator._skill_registry = skill_registry  # type: ignore[attr-defined]
+    orchestrator._hook_engine = hook_engine  # type: ignore[attr-defined]
+    orchestrator._todo_manager = todo_manager  # type: ignore[attr-defined]
+    orchestrator._project_instructions = project_instructions  # type: ignore[attr-defined]
 
     return orchestrator, event_bus, renderer, console, config
 
@@ -277,11 +317,15 @@ def _build_components(
 
 _REPL_COMMANDS: dict[str, str] = {
     "/tools": "List available tools",
+    "/skills": "List available skills (slash commands)",
     "/model": "Show current model and tier",
-    "/status": "Show current session status (budget, memory, tasks)",
+    "/status": "Show current session status (budget, memory, tasks, todos)",
     "/remember": "Save a fact: /remember <key> <value>",
     "/forget": "Remove a fact: /forget <key>",
     "/memories": "List all project memories",
+    "/todo": "Add a todo: /todo <description>",
+    "/done": "Complete a todo: /done <id>",
+    "/todos": "List all todos",
     "/submit": "Run goal in background: /submit <goal>",
     "/tasks": "List background tasks",
     "/result": "Show task result: /result <id>",
@@ -315,6 +359,8 @@ async def _run_repl(
     project_memory: ProjectMemory | None = None,
     task_manager: TaskManager | None = None,
     session_memory: SessionMemory | None = None,
+    skill_registry: SkillRegistry | None = None,
+    todo_manager: TodoManager | None = None,
 ) -> None:
     """Run the interactive REPL loop."""
     # Session continuity: load previous conversation and bind for auto-save
@@ -342,9 +388,12 @@ async def _run_repl(
     history_path = Path.home() / ".cache" / "open_harness" / "repl_history"
     history_path.parent.mkdir(parents=True, exist_ok=True)
 
-    completer = WordCompleter(
-        list(_REPL_COMMANDS.keys()), sentence=True,
-    )
+    # Build completion list: REPL commands + skill slash commands
+    completion_words = list(_REPL_COMMANDS.keys())
+    if skill_registry:
+        for name in skill_registry.skill_names():
+            completion_words.append(f"/{name}")
+    completer = WordCompleter(completion_words, sentence=True)
     session = PromptSession(
         history=FileHistory(str(history_path)),
         completer=completer,
@@ -417,6 +466,12 @@ async def _run_repl(
                     running = sum(1 for t in tasks if t.status.value == "running")
                     console.print(
                         f"  tasks: {len(tasks)} total, {running} running"
+                    )
+                if todo_manager and todo_manager.list_all():
+                    console.print(f"  todos: {todo_manager.summary()}")
+                if skill_registry:
+                    console.print(
+                        f"  skills: {len(skill_registry.list_skills())} loaded"
                     )
                 continue
             elif cmd == "/remember":
@@ -513,23 +568,120 @@ async def _run_repl(
                 else:
                     console.print("  [dim]Task manager not available[/dim]")
                 continue
+            elif cmd == "/skills":
+                if skill_registry:
+                    skills = skill_registry.list_skills()
+                    if skills:
+                        for skill in skills:
+                            args_hint = ""
+                            if skill.args == "required":
+                                args_hint = " <args> (required)"
+                            elif skill.args == "optional":
+                                args_hint = " [args]"
+                            console.print(
+                                f"  [bold]/{skill.name:<14}[/bold] "
+                                f"{skill.description}{args_hint}"
+                                f"  [dim]({skill.source})[/dim]"
+                            )
+                    else:
+                        console.print("  [dim]No skills loaded[/dim]")
+                else:
+                    console.print("  [dim]Skill registry not available[/dim]")
+                continue
+            elif cmd == "/todo":
+                parts = text.split(maxsplit=1)
+                if len(parts) < 2:
+                    console.print("  [yellow]Usage: /todo <description>[/yellow]")
+                elif todo_manager:
+                    item = todo_manager.add(parts[1])
+                    console.print(f"  Added: {item.to_display()}")
+                else:
+                    console.print("  [dim]Todo manager not available[/dim]")
+                continue
+            elif cmd == "/done":
+                parts = text.split(maxsplit=1)
+                if len(parts) < 2:
+                    console.print("  [yellow]Usage: /done <id>[/yellow]")
+                elif todo_manager:
+                    try:
+                        item_id = int(parts[1])
+                    except ValueError:
+                        console.print("  [yellow]Invalid ID[/yellow]")
+                        continue
+                    if todo_manager.complete(item_id):
+                        console.print(f"  Completed: #{item_id}")
+                    else:
+                        console.print(f"  [yellow]Todo not found: #{item_id}[/yellow]")
+                else:
+                    console.print("  [dim]Todo manager not available[/dim]")
+                continue
+            elif cmd == "/todos":
+                if todo_manager:
+                    items = todo_manager.list_all()
+                    if items:
+                        for item in items:
+                            style = "dim" if item.status.value == "completed" else ""
+                            display = item.to_display()
+                            if style:
+                                console.print(f"  [{style}]{display}[/{style}]")
+                            else:
+                                console.print(f"  {display}")
+                        console.print(f"  [dim]{todo_manager.summary()}[/dim]")
+                    else:
+                        console.print("  [dim]No todos[/dim]")
+                else:
+                    console.print("  [dim]Todo manager not available[/dim]")
+                continue
             elif cmd == "/update":
                 from open_harness_v2.update import self_update
                 self_update(console)
                 continue
             else:
-                suggestion = _suggest_command(cmd)
-                if suggestion:
-                    console.print(
-                        f"[yellow]Unknown command: {cmd}[/yellow]  "
-                        f"[dim]Did you mean [bold]{suggestion}[/bold]?[/dim]"
-                    )
+                # Check if it's a skill invocation (e.g., /commit, /review)
+                skill_name = cmd.lstrip("/")
+                if skill_registry:
+                    skill = skill_registry.get(skill_name)
+                    if skill:
+                        # Extract args after the command
+                        skill_args = text[len(cmd):].strip()
+                        if skill.args == "required" and not skill_args:
+                            console.print(
+                                f"  [yellow]/{skill_name} requires arguments: "
+                                f"{skill.args_description}[/yellow]"
+                            )
+                            continue
+                        # Expand skill into a goal and run it
+                        text = skill.expand(skill_args)
+                        console.print(
+                            f"  [dim]Running skill: [bold]/{skill_name}[/bold][/dim]"
+                        )
+                        # Fall through to the goal execution below
+                    else:
+                        suggestion = _suggest_command(cmd)
+                        if suggestion:
+                            console.print(
+                                f"[yellow]Unknown command: {cmd}[/yellow]  "
+                                f"[dim]Did you mean [bold]{suggestion}[/bold]?[/dim]"
+                            )
+                        else:
+                            console.print(
+                                f"[yellow]Unknown command: {cmd}[/yellow]  "
+                                f"[dim]Type /help for commands, /skills for skills[/dim]"
+                            )
+                        continue
                 else:
-                    console.print(
-                        f"[yellow]Unknown command: {cmd}[/yellow]  "
-                        f"[dim]Type /help for available commands[/dim]"
-                    )
-                continue
+                    suggestion = _suggest_command(cmd)
+                    if suggestion:
+                        console.print(
+                            f"[yellow]Unknown command: {cmd}[/yellow]  "
+                            f"[dim]Did you mean [bold]{suggestion}[/bold]?[/dim]"
+                        )
+                    else:
+                        console.print(
+                            f"[yellow]Unknown command: {cmd}[/yellow]  "
+                            f"[dim]Type /help for commands[/dim]"
+                        )
+                    continue
 
         # Run the goal — Ctrl+C cancels the current goal
         task: asyncio.Task[str] | None = None
@@ -643,17 +795,29 @@ def main(
     memory_store: MemoryStore = orchestrator._memory_store  # type: ignore[attr-defined]
     task_manager: TaskManager = orchestrator._task_manager  # type: ignore[attr-defined]
     task_store: TaskStore = orchestrator._task_store  # type: ignore[attr-defined]
+    skill_registry: SkillRegistry = orchestrator._skill_registry  # type: ignore[attr-defined]
+    hook_engine: HookEngine = orchestrator._hook_engine  # type: ignore[attr-defined]
+    todo_manager: TodoManager = orchestrator._todo_manager  # type: ignore[attr-defined]
+    project_instructions_text: str = orchestrator._project_instructions  # type: ignore[attr-defined]
 
     # Run everything in a single event loop so that httpx connections,
     # background tasks, etc. are all cleaned up properly.
     async def _main_async() -> None:
-        # Inject project memory context into system prompt
+        # Inject project memory + project instructions into system prompt
         block = await project_memory.build_context_block()
+        if project_instructions_text:
+            block = f"{project_instructions_text}\n\n{block}" if block else project_instructions_text
         orchestrator.system_extra = block
 
         # Print startup banner (skip for one-shot mode)
         if not goal:
-            _print_banner(console, config, config_path, len(registry.list_tools()))
+            _print_banner(
+                console, config, config_path,
+                len(registry.list_tools()),
+                num_skills=len(skill_registry.list_skills()),
+                has_hooks=hook_engine.has_hooks,
+                has_instructions=bool(project_instructions_text),
+            )
 
         if goal:
             await orchestrator.run(goal)
@@ -661,7 +825,7 @@ def main(
             await _run_repl(
                 orchestrator, event_bus, console,
                 router, registry, project_memory, task_manager,
-                session_memory,
+                session_memory, skill_registry, todo_manager,
             )
 
         # Cleanup — drain background tasks before closing shared resources

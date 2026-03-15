@@ -1,0 +1,20 @@
+name: review
+description: "Review code changes for bugs, style, and improvements"
+args: optional
+args_description: "File path or git ref to review (default: staged/unstaged changes)"
+prompt: |
+  Review the current code changes (git diff) thoroughly.
+  Check for:
+  1. Bugs and logic errors
+  2. Security vulnerabilities (injection, XSS, etc.)
+  3. Performance issues
+  4. Code style and readability
+  5. Missing error handling
+  6. Test coverage gaps
+
+  Provide a structured review with severity levels:
+  - CRITICAL: Must fix before merge
+  - WARNING: Should fix, potential issues
+  - INFO: Suggestions for improvement
+
+  Be specific — reference file names and line numbers.

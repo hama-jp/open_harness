@@ -1,0 +1,17 @@
+name: refactor
+description: "Refactor code for better quality without changing behavior"
+args: required
+args_description: "File path or description of what to refactor"
+prompt: |
+  Refactor the specified code to improve quality.
+  Goals:
+  1. Improve readability and maintainability
+  2. Reduce duplication (DRY)
+  3. Better naming and structure
+  4. Simplify complex logic
+
+  Rules:
+  - Do NOT change external behavior
+  - Run tests before and after to verify no regressions
+  - Keep changes minimal and focused
+  - Explain what you changed and why

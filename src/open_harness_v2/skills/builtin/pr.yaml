@@ -1,0 +1,19 @@
+name: pr
+description: "Create a pull request with summary from current branch changes"
+args: optional
+args_description: "Target branch (default: main)"
+prompt: |
+  Create a pull request for the current branch.
+  Steps:
+  1. Check git log for all commits on this branch vs the target branch
+  2. Review the full diff to understand all changes
+  3. Draft a clear PR title (under 70 chars) and description
+  4. Include a summary of changes and test plan
+  5. Push the branch and create the PR using `gh pr create`
+
+  PR description format:
+  ## Summary
+  - bullet points of key changes
+
+  ## Test plan
+  - how to verify the changes work

@@ -124,6 +124,9 @@ class HarnessConfig:
     # Agent loop
     max_steps: int = 50
 
+    # Hooks config (populated from YAML or .harness/hooks.yaml)
+    hooks: Any = None
+
     @property
     def active_profile(self) -> ProfileSpec:
         return self.profiles.get(self.profile, ProfileSpec())
@@ -205,6 +208,11 @@ def load_config(path: str | Path | None = None) -> HarnessConfig:
     if not profiles:
         profiles["local"] = ProfileSpec()
 
+    # Parse hooks config
+    from open_harness_v2.hooks.engine import parse_hooks_config
+
+    hooks_config = parse_hooks_config(raw.get("hooks"))
+
     return HarnessConfig(
         profile=raw.get("profile", "local"),
         profiles=profiles,
@@ -212,4 +220,5 @@ def load_config(path: str | Path | None = None) -> HarnessConfig:
         max_retries=raw.get("max_retries", 3),
         thinking_mode=raw.get("thinking_mode", "auto"),
         max_steps=raw.get("max_steps", 50),
+        hooks=hooks_config,
     )

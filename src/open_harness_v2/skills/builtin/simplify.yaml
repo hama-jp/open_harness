@@ -1,0 +1,13 @@
+name: simplify
+description: "Review changed code for reuse, quality, and efficiency, then fix issues"
+args: optional
+args_description: "File path or scope to simplify (default: recent changes)"
+prompt: |
+  Review the recently changed code (or specified scope) for:
+  1. Unnecessary complexity — simplify where possible
+  2. Code reuse opportunities — extract shared logic
+  3. Dead code — remove unused functions, variables, imports
+  4. Over-engineering — remove premature abstractions
+  5. Performance — identify obvious inefficiencies
+
+  Apply fixes directly. Keep it simple. Less code is better code.
