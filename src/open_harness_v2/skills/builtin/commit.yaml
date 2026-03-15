@@ -1,0 +1,10 @@
+name: commit
+description: "Stage and commit changes with a descriptive message"
+args: optional
+args_description: "Optional commit message override"
+prompt: |
+  Review the current git status and diff carefully.
+  Stage the appropriate files and create a commit with a clear, descriptive message.
+  Follow conventional commit format (e.g., feat:, fix:, refactor:, docs:, test:).
+  Focus the message on WHY the change was made, not just WHAT changed.
+  Do NOT push to remote unless explicitly asked.

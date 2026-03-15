@@ -1,0 +1,13 @@
+name: test
+description: "Run tests and fix any failures"
+args: optional
+args_description: "Test file or pattern (default: run all tests)"
+prompt: |
+  Run the project's test suite.
+  If tests fail:
+  1. Analyze the failure output carefully
+  2. Identify the root cause
+  3. Fix the failing code (not the tests, unless the tests are wrong)
+  4. Re-run to verify the fix
+
+  If all tests pass, report a summary of results.
