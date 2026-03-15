@@ -106,16 +106,44 @@ policy:
   #   - "/tmp/*"
   #   - "~/other-project/*"
 
+# Approval mode (from Codex) — controls when the agent asks for confirmation
+# Modes: suggest (ask for everything except reads),
+#         auto-edit (auto-approve reads + writes, ask for shell/git),
+#         full-auto (never ask)
+approval_mode: "full-auto"
+
+# Sandbox mode (from Codex) — OS-level isolation for shell commands
+# Modes: read-only (shell commands can only read),
+#         workspace (writes limited to project dir),
+#         full-access (no restrictions)
+sandbox_mode: "workspace"
+
+# Effort level (from Claude Code) — controls LLM thinking effort
+# Levels: low (no thinking), medium (auto), high (always think), auto
+effort: "auto"
+
+# Non-interactive mode (from Codex) — output JSONL for CI/automation
+# Set to true for headless/pipeline usage
+non_interactive: false
+
 # Hooks — shell commands that run in response to agent events
+# Pre-tool hooks support decision control via exit codes:
+#   exit 0 = allow, exit 1 = deny, exit 2 = ask user
 # See docs or .harness/hooks.yaml for project-level hooks
 # hooks:
 #   pre_goal:
 #     - "echo 'Starting: {{goal}}'"
 #   post_goal:
 #     - "echo 'Done'"
+#   pre_tool:
+#     - command: "./scripts/lint-check.sh {{tool_name}}"
+#       match_tools: ["write_file", "edit_file"]
 #   post_tool:
 #     - command: "notify-send 'Tool: {{tool_name}}'"
 #       match_tools: ["git_commit", "shell"]
+#     - command: "./scripts/on-failure.sh {{tool_name}}"
+#       match_tools: ["shell"]
+#       on_failure: true
 #   on_error:
 #     - "./scripts/on-error.sh"
 

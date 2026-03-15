@@ -68,6 +68,9 @@ class Orchestrator:
         pipeline: MiddlewarePipeline | None = None,
         max_steps: int = 50,
         context_budget: int = 0,
+        approval_engine: Any = None,
+        hook_engine: Any = None,
+        sandbox_engine: Any = None,
     ) -> None:
         self._router = router
         self._registry = registry
@@ -75,7 +78,12 @@ class Orchestrator:
         self._event_bus = event_bus or EventBus()
         self._pipeline = pipeline or MiddlewarePipeline(router.get_client())
         self._reasoner = Reasoner(max_steps=max_steps)
-        self._executor = Executor(registry, policy, self._event_bus)
+        self._executor = Executor(
+            registry, policy, self._event_bus,
+            approval_engine=approval_engine,
+            hook_engine=hook_engine,
+            sandbox_engine=sandbox_engine,
+        )
         self._context_budget = context_budget
         self._cancelled = False
         self.system_extra: str = ""  # injected by CLI (e.g. project memory)

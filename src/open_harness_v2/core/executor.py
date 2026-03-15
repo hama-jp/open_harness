@@ -1,4 +1,10 @@
-"""Executor — runs tool calls with policy checks.
+"""Executor — runs tool calls with policy checks, approval, hooks, and sandbox.
+
+Integrates:
+- Policy engine (budget/path guardrails)
+- Approval system (interactive human-in-the-loop, from Codex)
+- Hook decision control (pre-tool allow/deny/ask, from Claude Code)
+- Sandbox wrapping (OS-level isolation for shell commands, from Codex)
 
 Supports both sequential and concurrent tool execution.
 """
@@ -35,7 +41,7 @@ class ExecutionResult:
 
 
 class Executor:
-    """Runs tool calls through policy checks and the tool registry.
+    """Runs tool calls through policy checks, approval, hooks, and the tool registry.
 
     Usage::
 
@@ -48,10 +54,16 @@ class Executor:
         registry: ToolRegistry,
         policy: PolicyEngine | None = None,
         event_bus: EventBus | None = None,
+        approval_engine: Any = None,  # ApprovalEngine
+        hook_engine: Any = None,  # HookEngine
+        sandbox_engine: Any = None,  # SandboxEngine
     ) -> None:
         self._registry = registry
         self._policy = policy
         self._event_bus = event_bus
+        self._approval = approval_engine
+        self._hook_engine = hook_engine
+        self._sandbox = sandbox_engine
 
     async def execute(
         self,
@@ -71,40 +83,132 @@ class Executor:
             return await self._execute_concurrent(tool_calls)
         return await self._execute_sequential(tool_calls)
 
+    async def _check_pre_execution(
+        self, tc: ToolCall
+    ) -> ToolResult | None:
+        """Run pre-execution checks (policy, hooks, approval).
+
+        Returns a ToolResult if the call should be blocked, or None to proceed.
+        """
+        # 1. Policy check
+        if self._policy:
+            violation = self._policy.check(tc.name, tc.arguments)
+            if violation:
+                await self._emit(EventType.POLICY_VIOLATION, {
+                    "tool": tc.name,
+                    "rule": violation.rule,
+                    "message": violation.message,
+                })
+                return ToolResult(
+                    success=False,
+                    output="",
+                    error=f"Policy violation: {violation.message}",
+                )
+
+        # 2. Hook decision control (pre-tool hooks)
+        if self._hook_engine:
+            from open_harness_v2.hooks.engine import HookDecision
+            hook_result = await self._hook_engine.check_pre_tool(
+                tc.name, tc.arguments
+            )
+            if hook_result.decision == HookDecision.DENY:
+                _logger.info(
+                    "Hook denied tool call: %s — %s",
+                    tc.name, hook_result.message,
+                )
+                return ToolResult(
+                    success=False,
+                    output="",
+                    error=f"Hook denied: {hook_result.message}",
+                )
+            elif hook_result.decision == HookDecision.ASK:
+                # Hook wants user confirmation — delegate to approval
+                if self._approval:
+                    from open_harness_v2.approval import (
+                        ApprovalDecision,
+                        ApprovalRequest,
+                    )
+                    request = ApprovalRequest(
+                        tool_name=tc.name,
+                        arguments=tc.arguments,
+                        reason=hook_result.message or f"Hook requires confirmation for {tc.name}",
+                        category="hook",
+                    )
+                    decision = await self._approval.request_approval(request)
+                    if decision == ApprovalDecision.DENIED:
+                        return ToolResult(
+                            success=False,
+                            output="",
+                            error="User denied hook-requested approval",
+                        )
+                else:
+                    _logger.warning(
+                        "Hook requested user confirmation but no approval "
+                        "engine available; allowing: %s",
+                        tc.name,
+                    )
+
+        # 3. Approval check
+        if self._approval:
+            from open_harness_v2.approval import ApprovalDecision
+            request = self._approval.needs_approval(tc.name, tc.arguments)
+            if request:
+                decision = await self._approval.request_approval(request)
+                if decision == ApprovalDecision.DENIED:
+                    return ToolResult(
+                        success=False,
+                        output="",
+                        error="User denied approval for this action",
+                    )
+
+        return None  # All checks passed
+
+    def _maybe_sandbox_args(self, tc: ToolCall) -> dict[str, Any]:
+        """Apply sandbox wrapping to shell tool arguments if applicable."""
+        if not self._sandbox or tc.name != "shell":
+            return tc.arguments
+
+        if not self._sandbox.is_restricted:
+            return tc.arguments
+
+        command = tc.arguments.get("command", "")
+        if not command:
+            return tc.arguments
+
+        wrapped = self._sandbox.wrap_command(command)
+        if wrapped != command:
+            _logger.debug("Sandbox wrapped command: %s", wrapped[:100])
+            return {**tc.arguments, "command": wrapped}
+
+        return tc.arguments
+
     async def _execute_sequential(
         self, tool_calls: list[ToolCall]
     ) -> ExecutionResult:
         exec_result = ExecutionResult()
         for tc in tool_calls:
-            # Policy check
-            if self._policy:
-                violation = self._policy.check(tc.name, tc.arguments)
-                if violation:
-                    exec_result.violations.append((tc, violation))
-                    await self._emit(EventType.POLICY_VIOLATION, {
-                        "tool": tc.name,
-                        "rule": violation.rule,
-                        "message": violation.message,
-                    })
-                    # Return violation as a failed ToolResult so the agent can adapt
-                    exec_result.results.append((
-                        tc,
-                        ToolResult(
-                            success=False,
-                            output="",
-                            error=f"Policy violation: {violation.message}",
-                        ),
-                    ))
-                    continue
+            # Pre-execution checks (policy + hooks + approval)
+            block_result = await self._check_pre_execution(tc)
+            if block_result:
+                if self._policy:
+                    # Check if it was a policy violation for tracking
+                    violation = self._policy.check(tc.name, tc.arguments)
+                    if violation:
+                        exec_result.violations.append((tc, violation))
+                exec_result.results.append((tc, block_result))
+                continue
+
+            # Apply sandbox wrapping for shell commands
+            effective_args = self._maybe_sandbox_args(tc)
 
             # Execute
             await self._emit(EventType.TOOL_EXECUTING, {
                 "tool": tc.name,
-                "args": tc.arguments,
+                "args": tc.arguments,  # Show original args in events
             })
 
             start = time.monotonic()
-            result = await self._registry.execute(tc.name, tc.arguments)
+            result = await self._registry.execute(tc.name, effective_args)
             elapsed_ms = (time.monotonic() - start) * 1000
 
             # Record in policy budget
@@ -137,22 +241,17 @@ class Executor:
         """Execute all tool calls concurrently."""
         exec_result = ExecutionResult()
 
-        # First, check all policies
+        # First, check all pre-execution (policies + hooks + approval)
         to_run: list[ToolCall] = []
         for tc in tool_calls:
-            if self._policy:
-                violation = self._policy.check(tc.name, tc.arguments)
-                if violation:
-                    exec_result.violations.append((tc, violation))
-                    exec_result.results.append((
-                        tc,
-                        ToolResult(
-                            success=False,
-                            output="",
-                            error=f"Policy violation: {violation.message}",
-                        ),
-                    ))
-                    continue
+            block_result = await self._check_pre_execution(tc)
+            if block_result:
+                if self._policy:
+                    violation = self._policy.check(tc.name, tc.arguments)
+                    if violation:
+                        exec_result.violations.append((tc, violation))
+                exec_result.results.append((tc, block_result))
+                continue
             to_run.append(tc)
 
         if not to_run:
@@ -160,12 +259,13 @@ class Executor:
 
         # Execute concurrently
         async def _run_one(tc: ToolCall) -> tuple[ToolCall, ToolResult, float]:
+            effective_args = self._maybe_sandbox_args(tc)
             await self._emit(EventType.TOOL_EXECUTING, {
                 "tool": tc.name,
                 "args": tc.arguments,
             })
             start = time.monotonic()
-            result = await self._registry.execute(tc.name, tc.arguments)
+            result = await self._registry.execute(tc.name, effective_args)
             elapsed_ms = (time.monotonic() - start) * 1000
             if self._policy:
                 self._policy.record(tc.name)
@@ -179,7 +279,6 @@ class Executor:
         for i, item in enumerate(pairs):
             if isinstance(item, Exception):
                 _logger.error("Concurrent tool execution failed: %s", item)
-                # Emit error event with the original tool call info
                 tc = to_run[i]
                 error_result = ToolResult(
                     success=False,
