@@ -22,6 +22,6 @@ Example configuration::
         - command: "./scripts/lint-check.sh"
 """
 
-from open_harness_v2.hooks.engine import HookEngine, HookSpec
+from open_harness_v2.hooks.engine import HookDecision, HookEngine, HookResult, HookSpec
 
-__all__ = ["HookEngine", "HookSpec"]
+__all__ = ["HookDecision", "HookEngine", "HookResult", "HookSpec"]

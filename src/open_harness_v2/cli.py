@@ -7,6 +7,9 @@ Usage::
     harness --config path.yaml       # config file
     harness --profile api            # profile switch
     harness -v                       # verbose event log
+    harness --full-auto              # Codex-style full autonomy
+    harness --suggest                # Codex-style approval for all mutations
+    harness --non-interactive        # CI/automation mode (JSONL output)
     harness update                   # self-update via git pull
 """
 
@@ -25,6 +28,7 @@ from rich.console import Console
 from rich.table import Table
 
 from open_harness_v2 import __version__
+from open_harness_v2.approval import ApprovalEngine
 from open_harness_v2.config import HarnessConfig, _SEARCH_PATHS, load_config
 from open_harness_v2.core.orchestrator import Orchestrator
 from open_harness_v2.events.bus import EventBus
@@ -38,6 +42,7 @@ from open_harness_v2.checkpoint import CheckpointEngine
 from open_harness_v2.memory import MemoryStore, ProjectMemory, SessionMemory
 from open_harness_v2.policy.engine import PolicyEngine
 from open_harness_v2.project_instructions import load_project_instructions
+from open_harness_v2.sandbox import SandboxEngine
 from open_harness_v2.skills import SkillRegistry
 from open_harness_v2.tasks import TaskManager, TaskStore
 from open_harness_v2.todo import TodoManager
@@ -147,6 +152,20 @@ def _print_banner(
         "config",
         f"[dim]{_find_config_display(config_path)}[/dim]",
     )
+    # Show approval and sandbox modes
+    grid.add_row(
+        "approval",
+        config.approval_mode,
+        "sandbox",
+        config.sandbox_mode,
+    )
+    # Show effort level
+    grid.add_row(
+        "effort",
+        config.effort,
+        "",
+        "",
+    )
 
     # Show skills, hooks, and project instructions status
     extras: list[str] = []
@@ -190,6 +209,9 @@ def _build_components(
     config_path: str | None,
     profile: str | None,
     verbose: bool,
+    approval_override: str | None = None,
+    sandbox_override: str | None = None,
+    non_interactive: bool = False,
 ) -> tuple[Orchestrator, EventBus, ConsoleRenderer, Console, HarnessConfig]:
     """Wire up all components and return the orchestrator + UI pieces."""
     config = load_config(config_path)
@@ -197,6 +219,14 @@ def _build_components(
     # Override profile if specified on CLI
     if profile:
         config.profile = profile
+
+    # CLI overrides for approval/sandbox modes
+    if approval_override:
+        config.approval_mode = approval_override
+    if sandbox_override:
+        config.sandbox_mode = sandbox_override
+    if non_interactive:
+        config.non_interactive = True
 
     # Auto-start Ollama if the active profile uses it
     if config.active_profile.api_type == "ollama":
@@ -240,10 +270,35 @@ def _build_components(
     # Todo manager (session-scoped task tracking)
     todo_manager = TodoManager()
 
-    # UI
+    # UI — use JSONL renderer for non-interactive mode
     console = Console()
-    renderer = ConsoleRenderer(console, verbose=verbose)
-    renderer.attach(event_bus)
+    if config.non_interactive:
+        from open_harness_v2.ui.jsonl_renderer import JSONLRenderer
+        jsonl_renderer = JSONLRenderer()
+        jsonl_renderer.attach(event_bus)
+        renderer = ConsoleRenderer(console, verbose=False)
+    else:
+        renderer = ConsoleRenderer(console, verbose=verbose)
+        renderer.attach(event_bus)
+
+    # Approval engine (from Codex)
+    approval_mode = ApprovalEngine.from_string(config.approval_mode)
+    approval_engine = ApprovalEngine(
+        mode=approval_mode,
+        console=console if not config.non_interactive else None,
+    )
+
+    # Sandbox engine (from Codex)
+    sandbox = SandboxEngine.from_policy_mode(
+        config.sandbox_mode
+        if config.sandbox_mode != "workspace"
+        else config.policy.mode,
+        workspace_root=Path.cwd(),
+        extra_writable=[
+            Path(p).expanduser()
+            for p in config.policy.writable_paths
+        ],
+    )
 
     # LLM middleware pipeline
     pipeline = MiddlewarePipeline(router.get_client())
@@ -263,6 +318,9 @@ def _build_components(
         event_bus=event_bus,
         pipeline=pipeline,
         max_steps=config.max_steps,
+        approval_engine=approval_engine,
+        hook_engine=hook_engine,
+        sandbox_engine=sandbox,
     )
 
     # Checkpoint — EventBus subscriber, only active in git repos with non-full policy
@@ -307,6 +365,7 @@ def _build_components(
     orchestrator._hook_engine = hook_engine  # type: ignore[attr-defined]
     orchestrator._todo_manager = todo_manager  # type: ignore[attr-defined]
     orchestrator._project_instructions = project_instructions  # type: ignore[attr-defined]
+    orchestrator._config = config  # type: ignore[attr-defined]
 
     return orchestrator, event_bus, renderer, console, config
 
@@ -330,6 +389,11 @@ _REPL_COMMANDS: dict[str, str] = {
     "/tasks": "List background tasks",
     "/result": "Show task result: /result <id>",
     "/cancel": "Cancel a task: /cancel <id>",
+    "/compact": "Compress context: /compact [focus instructions]",
+    "/clear": "Clear session history and start fresh",
+    "/rewind": "Rewind to N turns ago: /rewind [n]",
+    "/effort": "Set effort level: /effort <low|medium|high|auto>",
+    "/approval": "Set approval mode: /approval <suggest|auto-edit|full-auto>",
     "/update": "Self-update (git pull + reinstall)",
     "/quit": "Exit the REPL",
     "/help": "Show this help",
@@ -354,6 +418,7 @@ async def _run_repl(
     orchestrator: Orchestrator,
     event_bus: EventBus,
     console: Console,
+    config: HarnessConfig,
     router: ModelRouter | None = None,
     registry: ToolRegistry | None = None,
     project_memory: ProjectMemory | None = None,
@@ -421,7 +486,7 @@ async def _run_repl(
                 break
             elif cmd == "/help":
                 for name, desc in _REPL_COMMANDS.items():
-                    console.print(f"  [bold]{name:<10}[/bold] {desc}")
+                    console.print(f"  [bold]{name:<12}[/bold] {desc}")
                 continue
             elif cmd == "/tools":
                 if registry:
@@ -457,6 +522,11 @@ async def _run_repl(
                     console.print(
                         f"  budget: {pol.budget.summary()}"
                     )
+                console.print(
+                    f"  approval: [bold]{config.approval_mode}[/bold]  "
+                    f"sandbox: [bold]{config.sandbox_mode}[/bold]  "
+                    f"effort: [bold]{config.effort}[/bold]"
+                )
                 if project_memory:
                     facts = await project_memory.list_all()
                     console.print(f"  memories: {len(facts)} fact(s)")
@@ -632,6 +702,121 @@ async def _run_repl(
                 else:
                     console.print("  [dim]Todo manager not available[/dim]")
                 continue
+
+            # --- New commands from Claude Code / Codex ---
+
+            elif cmd == "/compact":
+                # Context compression with optional focus instructions
+                focus = text[len("/compact"):].strip()
+                before = len(session_messages)
+                if before <= 4:
+                    console.print("  [dim]History too short to compact[/dim]")
+                    continue
+                # Keep last 4 messages, compress the rest
+                keep = session_messages[-4:]
+                removed = before - len(keep)
+                summary_msg = f"[Context compacted: {removed} messages summarized"
+                if focus:
+                    summary_msg += f", focus: {focus}"
+                summary_msg += "]"
+                session_messages.clear()
+                session_messages.append({
+                    "role": "user", "content": summary_msg,
+                })
+                session_messages.extend(keep)
+                if session_memory:
+                    await session_memory.save(session_id, session_messages)
+                console.print(
+                    f"  [green]Compacted: {removed} messages removed, "
+                    f"{len(session_messages)} remaining[/green]"
+                )
+                continue
+
+            elif cmd == "/clear":
+                # Clear all session history
+                session_messages.clear()
+                if session_memory:
+                    await session_memory.save(session_id, session_messages)
+                console.print("  [green]Session cleared[/green]")
+                continue
+
+            elif cmd == "/rewind":
+                # Rewind conversation by N turns
+                parts = text.split(maxsplit=1)
+                n = 2  # default: rewind 2 messages (1 user + 1 assistant)
+                if len(parts) > 1:
+                    try:
+                        n = int(parts[1]) * 2  # turns = user + assistant pairs
+                    except ValueError:
+                        console.print("  [yellow]Usage: /rewind [n][/yellow]")
+                        continue
+                if not session_messages:
+                    console.print("  [dim]Nothing to rewind[/dim]")
+                    continue
+                actual = min(n, len(session_messages))
+                for _ in range(actual):
+                    session_messages.pop()
+                if session_memory:
+                    await session_memory.save(session_id, session_messages)
+                console.print(
+                    f"  [green]Rewound {actual} messages, "
+                    f"{len(session_messages)} remaining[/green]"
+                )
+                continue
+
+            elif cmd == "/effort":
+                parts = text.split(maxsplit=1)
+                if len(parts) < 2:
+                    console.print(
+                        f"  effort: [bold]{config.effort}[/bold]  "
+                        f"[dim](low|medium|high|auto)[/dim]"
+                    )
+                else:
+                    level = parts[1].strip().lower()
+                    if level in ("low", "medium", "high", "auto"):
+                        config.effort = level
+                        # Map effort to thinking_mode
+                        effort_map = {
+                            "low": "never",
+                            "medium": "auto",
+                            "high": "always",
+                            "auto": "auto",
+                        }
+                        config.thinking_mode = effort_map[level]
+                        console.print(
+                            f"  [green]Effort set to: [bold]{level}[/bold][/green]"
+                        )
+                    else:
+                        console.print(
+                            "  [yellow]Valid levels: low, medium, high, auto[/yellow]"
+                        )
+                continue
+
+            elif cmd == "/approval":
+                parts = text.split(maxsplit=1)
+                if len(parts) < 2:
+                    console.print(
+                        f"  approval: [bold]{config.approval_mode}[/bold]  "
+                        f"[dim](suggest|auto-edit|full-auto)[/dim]"
+                    )
+                else:
+                    mode = parts[1].strip().lower()
+                    if mode in ("suggest", "auto-edit", "full-auto"):
+                        config.approval_mode = mode
+                        # Update the approval engine
+                        new_mode = ApprovalEngine.from_string(mode)
+                        if hasattr(orchestrator, '_executor'):
+                            if orchestrator._executor._approval:
+                                orchestrator._executor._approval.mode = new_mode
+                        console.print(
+                            f"  [green]Approval mode set to: [bold]{mode}[/bold][/green]"
+                        )
+                    else:
+                        console.print(
+                            "  [yellow]Valid modes: suggest, auto-edit, full-auto[/yellow]"
+                        )
+                continue
+
             elif cmd == "/update":
                 from open_harness_v2.update import self_update
                 self_update(console)
@@ -742,6 +927,32 @@ async def _run_repl(
 @click.option("--config", "config_path", default=None, help="Path to config YAML.")
 @click.option("--profile", default=None, help="Profile name to use.")
 @click.option("-v", "--verbose", is_flag=True, help="Show detailed event log.")
+@click.option(
+    "--full-auto", "approval_mode", flag_value="full-auto",
+    help="Run without approval prompts (Codex-style).",
+)
+@click.option(
+    "--suggest", "approval_mode", flag_value="suggest",
+    help="Require approval for all mutations (Codex-style).",
+)
+@click.option(
+    "--auto-edit", "approval_mode", flag_value="auto-edit",
+    help="Auto-approve file edits, ask for shell/git (Codex-style).",
+)
+@click.option(
+    "--non-interactive", is_flag=True, default=False,
+    help="Output events as JSONL for CI/automation (Codex-style).",
+)
+@click.option(
+    "--effort", "effort_level", default=None,
+    type=click.Choice(["low", "medium", "high", "auto"]),
+    help="Set thinking effort level (Claude Code-style).",
+)
+@click.option(
+    "--sandbox", "sandbox_mode", default=None,
+    type=click.Choice(["read-only", "workspace", "full-access"]),
+    help="Sandbox isolation level for shell commands (Codex-style).",
+)
 @click.version_option(version=__version__, prog_name="harness")
 @click.pass_context
 def main(
@@ -750,10 +961,18 @@ def main(
     config_path: str | None,
     profile: str | None,
     verbose: bool,
+    approval_mode: str | None,
+    non_interactive: bool,
+    effort_level: str | None,
+    sandbox_mode: str | None,
 ) -> None:
     """Open Harness v2 — async-first AI agent harness.
 
     Run with a GOAL argument for one-shot mode, or without for interactive REPL.
+
+    Integrates the best features from Codex CLI (sandbox, approval modes,
+    non-interactive output) and Claude Code (hooks, effort control, context
+    management, project memory).
     """
     # If a subcommand was invoked (e.g. "harness update"), skip the default logic.
     if ctx.invoked_subcommand is not None:
@@ -785,7 +1004,21 @@ def main(
 
     orchestrator, event_bus, renderer, console, config = _build_components(
         config_path, profile, verbose,
+        approval_override=approval_mode,
+        sandbox_override=sandbox_mode,
+        non_interactive=non_interactive,
     )
+
+    # Apply effort level override
+    if effort_level:
+        config.effort = effort_level
+        effort_map = {
+            "low": "never",
+            "medium": "auto",
+            "high": "always",
+            "auto": "auto",
+        }
+        config.thinking_mode = effort_map[effort_level]
 
     # Extract components from orchestrator internals for REPL commands
     router = orchestrator._router
@@ -809,8 +1042,8 @@ def main(
             block = f"{project_instructions_text}\n\n{block}" if block else project_instructions_text
         orchestrator.system_extra = block
 
-        # Print startup banner (skip for one-shot mode)
-        if not goal:
+        # Print startup banner (skip for one-shot and non-interactive modes)
+        if not goal and not config.non_interactive:
             _print_banner(
                 console, config, config_path,
                 len(registry.list_tools()),
@@ -823,7 +1056,7 @@ def main(
             await orchestrator.run(goal)
         else:
             await _run_repl(
-                orchestrator, event_bus, console,
+                orchestrator, event_bus, console, config,
                 router, registry, project_memory, task_manager,
                 session_memory, skill_registry, todo_manager,
             )

@@ -127,6 +127,18 @@ class HarnessConfig:
     # Hooks config (populated from YAML or .harness/hooks.yaml)
     hooks: Any = None
 
+    # Approval mode (from Codex): "suggest" | "auto-edit" | "full-auto"
+    approval_mode: str = "full-auto"
+
+    # Sandbox mode (from Codex): "read-only" | "workspace" | "full-access"
+    sandbox_mode: str = "workspace"
+
+    # Effort level (from Claude Code): "low" | "medium" | "high" | "auto"
+    effort: str = "auto"
+
+    # Non-interactive mode (from Codex): output JSONL instead of Rich UI
+    non_interactive: bool = False
+
     @property
     def active_profile(self) -> ProfileSpec:
         return self.profiles.get(self.profile, ProfileSpec())
@@ -221,4 +233,8 @@ def load_config(path: str | Path | None = None) -> HarnessConfig:
         thinking_mode=raw.get("thinking_mode", "auto"),
         max_steps=raw.get("max_steps", 50),
         hooks=hooks_config,
+        approval_mode=raw.get("approval_mode", "full-auto"),
+        sandbox_mode=raw.get("sandbox_mode", "workspace"),
+        effort=raw.get("effort", "auto"),
+        non_interactive=raw.get("non_interactive", False),
     )
