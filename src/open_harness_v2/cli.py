@@ -29,7 +29,7 @@ from open_harness_v2.config import HarnessConfig, _SEARCH_PATHS, load_config
 from open_harness_v2.core.orchestrator import Orchestrator
 from open_harness_v2.events.bus import EventBus
 from open_harness_v2.hooks import HookEngine
-from open_harness_v2.hooks.engine import load_hooks, parse_hooks_config
+from open_harness_v2.hooks.engine import load_hooks
 from open_harness_v2.llm.error_recovery import ErrorRecoveryMiddleware
 from open_harness_v2.llm.middleware import MiddlewarePipeline
 from open_harness_v2.llm.prompt_optimizer import PromptOptimizerMiddleware
