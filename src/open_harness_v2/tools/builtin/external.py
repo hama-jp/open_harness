@@ -3,13 +3,18 @@
 Each tool delegates a task to an external CLI agent via
 asyncio.create_subprocess_exec, with timeout handling and
 process-tree cleanup.
+
+Results are parsed into a structured format with standard fields:
+summary, changed_files, tests, risks.
 """
 
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
+import re
 import signal
 import shutil
 from typing import Any
@@ -21,6 +26,126 @@ _logger = logging.getLogger(__name__)
 
 # Default timeout (seconds) for external agent calls.
 _DEFAULT_TIMEOUT = 600
+
+
+# ---------------------------------------------------------------------------
+# Structured result parsing
+# ---------------------------------------------------------------------------
+
+def _extract_structured_result(raw_output: str) -> dict[str, Any]:
+    """Extract structured fields from external agent output.
+
+    Attempts to find JSON blocks in the output first. If none found,
+    uses heuristics to extract summary, changed files, test results,
+    and potential risks.
+
+    Returns a dict with standard keys: summary, changed_files, tests, risks.
+    """
+    result: dict[str, Any] = {
+        "summary": "",
+        "changed_files": [],
+        "tests": {"passed": None, "failed": None, "details": ""},
+        "risks": [],
+        "raw_length": len(raw_output),
+    }
+
+    if not raw_output:
+        return result
+
+    # 1. Try to find an embedded JSON block
+    json_match = re.search(r"```json\s*\n(.*?)\n\s*```", raw_output, re.DOTALL)
+    if json_match:
+        try:
+            parsed = json.loads(json_match.group(1))
+            if isinstance(parsed, dict):
+                for key in ("summary", "changed_files", "tests", "risks"):
+                    if key in parsed:
+                        result[key] = parsed[key]
+                return result
+        except json.JSONDecodeError:
+            pass
+
+    # 2. Heuristic extraction from plain text
+
+    # Summary: first non-empty paragraph or first 3 sentences
+    lines = raw_output.strip().split("\n")
+    summary_lines: list[str] = []
+    for line in lines:
+        stripped = line.strip()
+        if not stripped:
+            if summary_lines:
+                break
+            continue
+        summary_lines.append(stripped)
+        if len(summary_lines) >= 3:
+            break
+    result["summary"] = " ".join(summary_lines)[:500]
+
+    # Changed files: look for file path patterns
+    file_patterns = re.findall(
+        r"(?:^|\s)([\w./\-]+\.(?:py|js|ts|tsx|jsx|rs|go|java|rb|yaml|yml|json|toml|md|txt|css|html|sh))\b",
+        raw_output,
+    )
+    # Deduplicate preserving order
+    seen: set[str] = set()
+    for fp in file_patterns:
+        if fp not in seen and not fp.startswith("http"):
+            seen.add(fp)
+            result["changed_files"].append(fp)
+
+    # Test results: look for common test output patterns
+    test_match = re.search(
+        r"(\d+)\s+(?:tests?\s+)?passed", raw_output, re.I
+    )
+    if test_match:
+        result["tests"]["passed"] = int(test_match.group(1))
+    fail_match = re.search(
+        r"(\d+)\s+(?:tests?\s+)?failed", raw_output, re.I
+    )
+    if fail_match:
+        result["tests"]["failed"] = int(fail_match.group(1))
+
+    # Risks: look for warning/risk indicators
+    risk_patterns = [
+        re.compile(r"(?:warning|caution|risk|breaking change|deprecated)[:\s]+(.*)", re.I),
+        re.compile(r"(?:TODO|FIXME|HACK|XXX)[:\s]+(.*)", re.I),
+    ]
+    for pat in risk_patterns:
+        for match in pat.finditer(raw_output):
+            risk_text = match.group(1).strip()[:200]
+            if risk_text:
+                result["risks"].append(risk_text)
+
+    return result
+
+
+def _format_structured_output(raw_output: str, structured: dict[str, Any]) -> str:
+    """Format the raw output with appended structured metadata."""
+    parts = [raw_output.rstrip()]
+
+    metadata_parts: list[str] = []
+    if structured.get("summary"):
+        metadata_parts.append(f"Summary: {structured['summary']}")
+    if structured.get("changed_files"):
+        files_str = ", ".join(structured["changed_files"][:20])
+        metadata_parts.append(f"Changed files: {files_str}")
+    tests = structured.get("tests", {})
+    if tests.get("passed") is not None or tests.get("failed") is not None:
+        test_parts = []
+        if tests.get("passed") is not None:
+            test_parts.append(f"{tests['passed']} passed")
+        if tests.get("failed") is not None:
+            test_parts.append(f"{tests['failed']} failed")
+        metadata_parts.append(f"Tests: {', '.join(test_parts)}")
+    if structured.get("risks"):
+        metadata_parts.append(f"Risks: {'; '.join(structured['risks'][:5])}")
+
+    if metadata_parts:
+        parts.append("\n--- Structured Result ---")
+        for mp in metadata_parts:
+            parts.append(mp)
+
+    return "\n".join(parts)
 
 
 async def _run_external(
@@ -74,11 +199,20 @@ async def _run_external(
         output += f"\n[stderr]\n{stderr_text}" if output else stderr_text
 
     returncode = proc.returncode or 0
+    raw_output = output.strip()
+
+    # Parse structured result from raw output
+    structured = _extract_structured_result(raw_output)
+    formatted_output = _format_structured_output(raw_output, structured)
+
     return ToolResult(
         success=returncode == 0,
-        output=output.strip(),
+        output=formatted_output,
         error="" if returncode == 0 else f"Exit code: {returncode}",
-        metadata={"returncode": returncode},
+        metadata={
+            "returncode": returncode,
+            "structured": structured,
+        },
     )
 
 
