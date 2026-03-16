@@ -41,6 +41,7 @@ from open_harness_v2.llm.router import ModelRouter
 from open_harness_v2.checkpoint import CheckpointEngine
 from open_harness_v2.memory import MemoryStore, ProjectMemory, SessionMemory
 from open_harness_v2.policy.engine import PolicyEngine
+from open_harness_v2.metrics import MetricsCollector
 from open_harness_v2.project_instructions import load_project_instructions
 from open_harness_v2.sandbox import SandboxEngine
 from open_harness_v2.skills import SkillRegistry
@@ -253,6 +254,10 @@ def _build_components(
     # Wire memory to EventBus
     session_memory.attach(event_bus)
 
+    # Metrics collector — subscribe to events for KPI tracking
+    metrics_collector = MetricsCollector()
+    metrics_collector.attach(event_bus)
+
     # Skills — discover from builtin, user, and project dirs
     skill_registry = SkillRegistry()
     skill_registry.discover(project_root=Path.cwd())
@@ -366,6 +371,7 @@ def _build_components(
     orchestrator._todo_manager = todo_manager  # type: ignore[attr-defined]
     orchestrator._project_instructions = project_instructions  # type: ignore[attr-defined]
     orchestrator._config = config  # type: ignore[attr-defined]
+    orchestrator._metrics_collector = metrics_collector  # type: ignore[attr-defined]
 
     return orchestrator, event_bus, renderer, console, config
 
@@ -511,7 +517,7 @@ async def _run_repl(
                     console.print("  [dim]Router not available[/dim]")
                 continue
             elif cmd == "/status":
-                # Session overview: model, policy budget, memory count, tasks
+                # Session overview: model, policy budget, memory count, tasks, KPIs
                 if router:
                     console.print(
                         f"  model: [bold]{router.current_model}[/bold]  "
@@ -527,6 +533,14 @@ async def _run_repl(
                     f"sandbox: [bold]{config.sandbox_mode}[/bold]  "
                     f"effort: [bold]{config.effort}[/bold]"
                 )
+                # KPI metrics
+                metrics_col: MetricsCollector | None = getattr(
+                    orchestrator, "_metrics_collector", None
+                )
+                if metrics_col and metrics_col.session.total_goals > 0:
+                    console.print(
+                        f"  [bold]KPIs:[/bold] {metrics_col.summary()}"
+                    )
                 if project_memory:
                     facts = await project_memory.list_all()
                     console.print(f"  memories: {len(facts)} fact(s)")

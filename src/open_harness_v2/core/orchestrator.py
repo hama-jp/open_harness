@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 from typing import Any
 
 from open_harness_v2.core.context import AgentContext
@@ -35,6 +36,66 @@ _DELEGATION_REDIRECT = (
     "Give the agent the FILE PATHS and a clear task description. "
     "The external agent can read files itself — do NOT read the files yourself."
 )
+
+# ---------------------------------------------------------------------------
+# Goal complexity classification
+# ---------------------------------------------------------------------------
+
+class GoalComplexity:
+    """Classifies goal text into complexity tiers for delegation decisions."""
+
+    LIGHT = "light"
+    MEDIUM = "medium"
+    HEAVY = "heavy"
+
+    # Patterns that indicate a lightweight / quick task
+    _LIGHT_PATTERNS: list[re.Pattern[str]] = [
+        re.compile(r"\b(what|who|where|when|why|how)\b.*\?$", re.I),
+        re.compile(r"\b(explain|describe|list|show|tell me|summarize)\b", re.I),
+        re.compile(r"\b(status|version|help|info)\b", re.I),
+    ]
+
+    # Patterns that indicate a heavyweight / complex task
+    _HEAVY_PATTERNS: list[re.Pattern[str]] = [
+        re.compile(r"\b(refactor|rewrite|migrate|redesign|implement|build)\b", re.I),
+        re.compile(r"\b(fix.+bug|debug|investigate.+issue)\b", re.I),
+        re.compile(r"\bmulti.?file\b", re.I),
+        re.compile(r"\b(across|all files|entire|whole|codebase)\b", re.I),
+        re.compile(r"\b(add feature|new feature|create.+module)\b", re.I),
+        re.compile(r"\b(test suite|write tests|add tests)\b", re.I),
+    ]
+
+    @classmethod
+    def classify(cls, goal: str) -> str:
+        """Classify a goal string into LIGHT, MEDIUM, or HEAVY.
+
+        - LIGHT: Questions, explanations, status checks — no delegation needed.
+        - MEDIUM: Moderate tasks — delegation optional, self-solve first.
+        - HEAVY: Complex multi-step tasks — delegation recommended.
+        """
+        text = goal.strip()
+
+        # Short goals are usually lightweight
+        if len(text) < 30:
+            for pat in cls._LIGHT_PATTERNS:
+                if pat.search(text):
+                    return cls.LIGHT
+
+        # Check for heavy indicators
+        heavy_score = sum(1 for pat in cls._HEAVY_PATTERNS if pat.search(text))
+        if heavy_score >= 2:
+            return cls.HEAVY
+
+        # Check for light indicators
+        light_score = sum(1 for pat in cls._LIGHT_PATTERNS if pat.search(text))
+        if light_score > 0 and heavy_score == 0:
+            return cls.LIGHT
+
+        # Single heavy indicator → medium
+        if heavy_score == 1:
+            return cls.MEDIUM
+
+        return cls.MEDIUM
 
 
 class Orchestrator:
@@ -118,6 +179,10 @@ class Orchestrator:
         # How many times we've redirected the LLM to delegate
         delegation_retries = 0
 
+        # Classify goal complexity for staged delegation
+        goal_complexity = GoalComplexity.classify(goal)
+        _logger.info("Goal complexity: %s", goal_complexity)
+
         # Set up context
         ctx = context or AgentContext()
         if self.system_extra:
@@ -194,19 +259,29 @@ class Orchestrator:
 
                 # 4. Act on decision
                 if decision.action == ActionType.RESPOND:
-                    # Delegation enforcement: if external agents are
-                    # available but none have been used, redirect the LLM
-                    # to delegate instead of answering itself.
-                    if (
+                    # Staged delegation enforcement:
+                    # - LIGHT goals: never force delegation (answer directly)
+                    # - MEDIUM goals: allow self-solve, delegate only on retry
+                    # - HEAVY goals: force delegation before answering
+                    should_delegate = (
                         available_ext
                         and not (used_tools & _EXTERNAL_AGENTS)
                         and delegation_retries < 2
-                    ):
+                        and (
+                            goal_complexity == GoalComplexity.HEAVY
+                            or (
+                                goal_complexity == GoalComplexity.MEDIUM
+                                and delegation_retries >= 1
+                            )
+                        )
+                    )
+                    if should_delegate:
                         delegation_retries += 1
                         _logger.info(
-                            "Delegation redirect #%d — LLM tried to respond "
-                            "without using an external agent",
+                            "Delegation redirect #%d (complexity=%s) — "
+                            "LLM tried to respond without using an external agent",
                             delegation_retries,
+                            goal_complexity,
                         )
                         ctx.add_assistant_message(decision.response_text)
                         ctx.cycle_working()
