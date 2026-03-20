@@ -149,7 +149,6 @@ class Reflector:
         recent = self._outcomes[-5:]
         total = len(self._outcomes)
         successes = sum(1 for o in self._outcomes if o.success)
-        failures = total - successes
 
         lines = [
             f"## Progress Status (step {total})",
