@@ -278,3 +278,103 @@ class TestOllamaChat:
         payload = mock_post.call_args[1]["json"]
         assert payload["options"]["num_ctx"] == 32768
         await client.close()
+
+
+# ---------------------------------------------------------------------------
+# Tests: Sakura AI Engine (OpenAI-compatible) — Kimi K2.5
+# ---------------------------------------------------------------------------
+
+@pytest.fixture
+def sakura_profile() -> ProfileSpec:
+    return ProfileSpec(
+        provider="sakura",
+        url="https://api.ai.sakura.ad.jp/v1",
+        api_key="test-sakura-token",
+        api_type="openai",
+        models=["preview/Kimi-K2.5"],
+    )
+
+
+class TestSakuraKimiK25Chat:
+    """Unit tests for Kimi K2.5 via Sakura AI Engine (mocked)."""
+
+    async def test_basic_chat(self, sakura_profile: ProfileSpec):
+        client = AsyncLLMClient(sakura_profile)
+        mock_resp = _mock_response(
+            _make_openai_response(content="HELLO", model="preview/Kimi-K2.5"),
+        )
+
+        with patch.object(client._client, "post", new_callable=AsyncMock) as mock_post:
+            mock_post.return_value = mock_resp
+            result = await client.chat(
+                messages=[{"role": "user", "content": "Reply with exactly: HELLO"}],
+                model="preview/Kimi-K2.5",
+            )
+
+        assert result.content == "HELLO"
+        assert result.finish_reason == "stop"
+        assert result.model == "preview/Kimi-K2.5"
+        # Verify OpenAI-compatible endpoint
+        call_args = mock_post.call_args
+        assert call_args[0][0] == "/chat/completions"
+        await client.close()
+
+    async def test_tool_calls(self, sakura_profile: ProfileSpec):
+        tc_data = [
+            {
+                "function": {
+                    "name": "get_weather",
+                    "arguments": '{"location": "Tokyo"}',
+                },
+            }
+        ]
+        client = AsyncLLMClient(sakura_profile)
+        mock_resp = _mock_response(
+            _make_openai_response(
+                content="", tool_calls=tc_data, model="preview/Kimi-K2.5",
+            ),
+        )
+
+        with patch.object(client._client, "post", new_callable=AsyncMock) as mock_post:
+            mock_post.return_value = mock_resp
+            result = await client.chat(
+                messages=[{"role": "user", "content": "Weather in Tokyo?"}],
+                model="preview/Kimi-K2.5",
+            )
+
+        assert result.has_tool_calls
+        assert result.tool_calls[0].name == "get_weather"
+        assert result.tool_calls[0].arguments == {"location": "Tokyo"}
+        await client.close()
+
+    async def test_authorization_header(self, sakura_profile: ProfileSpec):
+        """Verify Bearer token is set correctly for Sakura API."""
+        client = AsyncLLMClient(sakura_profile)
+        assert client._client.headers["authorization"] == "Bearer test-sakura-token"
+        await client.close()
+
+    async def test_extra_params_forwarded(self):
+        """Verify extra_params are merged into the request payload."""
+        profile = ProfileSpec(
+            provider="sakura",
+            url="https://api.ai.sakura.ad.jp/v1",
+            api_key="test-token",
+            api_type="openai",
+            models=["preview/Kimi-K2.5"],
+            extra_params={"top_p": 0.9},
+        )
+        client = AsyncLLMClient(profile)
+        mock_resp = _mock_response(
+            _make_openai_response(model="preview/Kimi-K2.5"),
+        )
+
+        with patch.object(client._client, "post", new_callable=AsyncMock) as mock_post:
+            mock_post.return_value = mock_resp
+            await client.chat(
+                messages=[{"role": "user", "content": "Hi"}],
+                model="preview/Kimi-K2.5",
+            )
+
+        payload = mock_post.call_args[1]["json"]
+        assert payload["top_p"] == 0.9
+        await client.close()

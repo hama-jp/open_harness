@@ -31,6 +31,12 @@ _PROVIDERS = {
         "api_key": "lm-studio",
         "api_type": "openai",
     },
+    "sakura": {
+        "label": "Sakura AI Engine (さくらのクラウド)",
+        "base_url": "https://api.ai.sakura.ad.jp/v1",
+        "api_key": "",
+        "api_type": "openai",
+    },
     "other": {
         "label": "Other (OpenAI-compatible)",
         "base_url": "",
