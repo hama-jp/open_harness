@@ -230,6 +230,50 @@ class WorkingLayer:
 # Main context
 # ---------------------------------------------------------------------------
 
+@dataclass
+class GoalState:
+    """Tracks the current goal and autonomous execution state.
+
+    Injected into context to give the LLM awareness of its progress,
+    current strategy, and any recovery guidance.
+    """
+
+    goal: str = ""
+    plan_block: str = ""       # From ExecutionPlan.to_context_block()
+    strategy_hint: str = ""    # From StrategyManager.get_system_hint()
+    progress_block: str = ""   # From Reflector.get_context_injection()
+    recovery_hint: str = ""    # From StuckDetector diagnosis
+    step_number: int = 0
+    max_steps: int = 50
+
+    def to_messages(self) -> list[dict[str, Any]]:
+        """Generate goal-state context messages."""
+        parts: list[str] = []
+
+        if self.plan_block:
+            parts.append(self.plan_block)
+
+        if self.strategy_hint:
+            parts.append(f"## Strategy\n{self.strategy_hint}")
+
+        if self.progress_block:
+            parts.append(self.progress_block)
+
+        if self.recovery_hint:
+            parts.append(
+                f"## IMPORTANT Recovery Guidance\n{self.recovery_hint}"
+            )
+
+        if self.step_number > 0:
+            parts.append(
+                f"[Step {self.step_number}/{self.max_steps}]"
+            )
+
+        if not parts:
+            return []
+        return [{"role": "system", "content": "\n\n".join(parts)}]
+
+
 class AgentContext:
     """Structured context with layer-specific compression.
 
@@ -245,6 +289,7 @@ class AgentContext:
     def __init__(self) -> None:
         self.system = SystemLayer()
         self.plan = PlanLayer()
+        self.goal_state = GoalState()
         self.history = HistoryLayer()
         self.working = WorkingLayer()
 
@@ -259,22 +304,30 @@ class AgentContext:
         """
         system_msgs = self.system.to_messages()
         plan_msgs = self.plan.to_messages()
+        goal_state_msgs = self.goal_state.to_messages()
         working_msgs = self.working.to_messages()
 
         if budget <= 0:
             # No budget constraint — return everything
-            return system_msgs + plan_msgs + self.history.messages + working_msgs
+            return (
+                system_msgs + plan_msgs + goal_state_msgs
+                + self.history.messages + working_msgs
+            )
 
         # Calculate remaining budget for history
         fixed_tokens = (
             _estimate_messages_tokens(system_msgs)
             + _estimate_messages_tokens(plan_msgs)
+            + _estimate_messages_tokens(goal_state_msgs)
             + _estimate_messages_tokens(working_msgs)
         )
         history_budget = max(0, budget - fixed_tokens)
         history_msgs = self.history.to_messages(budget=history_budget)
 
-        return system_msgs + plan_msgs + history_msgs + working_msgs
+        return (
+            system_msgs + plan_msgs + goal_state_msgs
+            + history_msgs + working_msgs
+        )
 
     def add_user_message(self, content: str) -> None:
         """Add a user message to history."""
