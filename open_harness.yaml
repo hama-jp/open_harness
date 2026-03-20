@@ -52,6 +52,18 @@ llm:
   # Default model tier
   default_tier: "medium"
 
+# v2 profile examples (used by ProfileSpec-based config)
+# Uncomment and set your API key to use Sakura AI Engine
+# profile: sakura
+# profiles:
+#   sakura:
+#     provider: sakura
+#     url: "https://api.ai.sakura.ad.jp/v1"
+#     api_key: "YOUR_SAKURA_TOKEN"
+#     api_type: openai
+#     models:
+#       - "preview/Kimi-K2.5"
+
 # Compensation engine settings
 compensation:
   max_retries: 3
