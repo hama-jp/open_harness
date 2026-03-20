@@ -110,6 +110,29 @@ class EventType(enum.Enum):
     # Policy events
     POLICY_VIOLATION = "policy.violation"
 
+    # Planning events
+    PLAN_CREATED = "plan.created"
+    PLAN_STEP_STARTED = "plan.step_started"
+    PLAN_STEP_COMPLETED = "plan.step_completed"
+    PLAN_STEP_FAILED = "plan.step_failed"
+    PLAN_REVISED = "plan.revised"
+
+    # Reflection events
+    REFLECTION_RESULT = "reflection.result"
+    PROGRESS_UPDATE = "progress.update"
+
+    # Stuck detection events
+    STUCK_DETECTED = "stuck.detected"
+    RECOVERY_APPLIED = "recovery.applied"
+
+    # Verification events
+    VERIFICATION_RESULT = "verification.result"
+
+    # Strategy events
+    STRATEGY_INITIALIZED = "strategy.initialized"
+    STRATEGY_SWITCHED = "strategy.switched"
+    STRATEGY_EXHAUSTED = "strategy.exhausted"
+
 
 @dataclass
 class AgentEvent:
